@@ -1,0 +1,66 @@
+.job-workspace { display: flex; flex-direction: column; gap: 14px; }
+.job-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.job-summary { min-height: 98px; display: flex; flex-direction: column; gap: 6px; padding: 15px; }
+.job-summary > span, .job-summary small { color: var(--text-muted); font-size: 10px; }
+.job-summary strong { color: var(--text); font-size: 16px; }
+.job-summary small { font-size: 9px; }
+.coverage-overview { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 15px 12px; }
+.coverage-overview span { padding: 6px 8px; border: 1px solid var(--border-soft); border-radius: 5px; color: var(--text-secondary); font-size: 9px; }
+.coverage-list { display: flex; flex-direction: column; }
+.coverage-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(160px, 1fr) minmax(180px, 1.2fr) minmax(150px, 1fr); align-items: center; gap: 10px; padding: 10px 15px; border-top: 1px solid var(--border-soft); color: var(--text-secondary); font-size: 9px; }
+.coverage-row > div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.coverage-row strong { color: var(--text); font-size: 10px; }
+.coverage-row code, .coverage-row small { overflow-wrap: anywhere; color: var(--text-muted); font: 8px var(--mono); }
+.coverage-warning { color: var(--amber); }
+.usage-list { display: flex; flex-direction: column; }
+.usage-row { display: grid; grid-template-columns: minmax(130px, 1fr) 90px minmax(110px, 1fr) 75px; align-items: center; gap: 10px; padding: 7px 15px; border-top: 1px solid var(--border-soft); color: var(--text-muted); font-size: 8px; }
+.usage-row .badge { justify-self: start; }
+.coverage-footnote { display: block; padding: 10px 15px; border-top: 1px solid var(--border-soft); color: var(--text-muted); font-size: 9px; }
+.candidate-fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 16px; }
+.candidate-field, .job-preferences-row label { display: flex; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 10px; }
+.candidate-field small { color: var(--text-muted); }
+.candidate-field input, .company-add-row input, .job-preferences-row input, .job-preferences-row select { min-width: 0; height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: var(--surface-raised); font-size: 10px; }
+.company-list { display: flex; flex-direction: column; padding: 6px 15px; }
+.company-row { display: grid; grid-template-columns: minmax(100px, .5fr) 1fr 30px; align-items: center; gap: 12px; min-height: 41px; border-bottom: 1px solid var(--border-soft); font-size: 10px; }
+.company-row > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.company-row code { overflow: hidden; color: var(--text-secondary); font: 9px var(--mono); text-overflow: ellipsis; }
+.company-row small { color: var(--text-muted); font: 8px var(--mono); overflow-wrap: anywhere; }
+.company-add-row, .job-preferences-row { display: flex; flex-wrap: wrap; align-items: end; gap: 9px; padding: 12px 15px; border-top: 1px solid var(--border-soft); }
+.company-add-row input:first-child { flex: 0 1 170px; }
+.company-add-row input:not(:first-child) { flex: 1 1 220px; }
+.job-preferences-row label { flex: 1 1 150px; }
+.job-preferences-row input, .job-preferences-row select { width: 100%; }
+.job-filter-tabs { display: flex; gap: 4px; }
+.job-filter-tabs button { padding: 6px 8px; border: 1px solid transparent; border-radius: 5px; color: var(--text-muted); background: transparent; font-size: 9px; cursor: pointer; }
+.job-filter-tabs button.selected { border-color: rgba(135,120,255,.2); color: #b0a8ff; background: rgba(110,96,245,.12); }
+.tracked-jobs { display: flex; flex-direction: column; }
+.tracked-job { padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
+.tracked-job:last-child { border-bottom: 0; }
+.tracked-job-main { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.tracked-job-main > div { display: flex; flex-direction: column; gap: 4px; }
+.tracked-job-main strong { color: var(--text); font-size: 12px; }
+.tracked-job-main span, .tracked-job-meta { color: var(--text-muted); font-size: 9px; }
+.tracked-job > p { margin: 10px 0; color: var(--text-secondary); font-size: 10px; line-height: 1.6; }
+.tracked-job-meta { display: flex; flex-wrap: wrap; gap: 12px; }
+.tracked-job-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.tracked-job-actions a, .tracked-job-actions button { display: inline-flex; align-items: center; gap: 5px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-secondary); background: var(--surface-raised); text-decoration: none; font-size: 9px; cursor: pointer; }
+.tracked-job-actions a:hover, .tracked-job-actions button:hover { color: var(--text); border-color: rgba(135,120,255,.4); }
+.run-history { padding: 8px 15px; }
+.run-history-row { display: grid; grid-template-columns: 90px 130px minmax(130px,1fr) 150px; align-items: center; gap: 10px; min-height: 38px; border-bottom: 1px solid var(--border-soft); color: var(--text-secondary); font-size: 9px; }
+.run-history-row small { grid-column: 2 / -1; color: var(--amber); }
+.job-empty { display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 70px; padding: 14px; color: var(--text-muted); text-align: center; font-size: 10px; }
+.job-error { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid rgba(250,119,125,.22); border-radius: 7px; color: var(--red); background: rgba(250,119,125,.07); font-size: 10px; }
+.job-error button { margin-left: auto; border: 0; color: inherit; background: transparent; cursor: pointer; font-size: 9px; }
+
+@media (max-width: 900px) {
+  .candidate-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 600px) {
+  .job-summary-grid { grid-template-columns: 1fr; }
+  .candidate-fields { grid-template-columns: 1fr; }
+  .run-history-row { grid-template-columns: 1fr 1fr; }
+  .coverage-row { grid-template-columns: 1fr; }
+  .usage-row { grid-template-columns: 1fr 1fr; }
+  .job-filter-tabs { flex-wrap: wrap; }
+}

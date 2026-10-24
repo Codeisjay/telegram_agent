@@ -1,0 +1,52 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      AGENTFLOW_HOST: 0.0.0.0
+      AGENTFLOW_PORT: 3001
+      AGENTFLOW_DATA_DIR: /data
+      AGENTFLOW_USERNAME: ${AGENTFLOW_USERNAME:?Set AGENTFLOW_USERNAME in .env}
+      AGENTFLOW_PASSWORD: ${AGENTFLOW_PASSWORD:?Set a 16+ character AGENTFLOW_PASSWORD in .env}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      TAVILY_SEARCH_KEY: ${TAVILY_SEARCH_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    volumes:
+      - agentflow-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    expose:
+      - "3001"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      AGENTFLOW_DOMAIN: ${AGENTFLOW_DOMAIN:?Set AGENTFLOW_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  agentflow-data:
+  caddy-data:
+  caddy-config:
