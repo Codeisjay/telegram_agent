@@ -133,15 +133,28 @@ function App() {
       })
       .catch(() => {
         setSecretServiceReady(false)
-        setToast('Start the AgentFlow server to manage credentials securely')
+        setToast('AgentFlow API is missing from this deployment. Deploy the backend before using dashboard features.')
       })
   }, [])
 
   useEffect(() => {
     let active = true
+    let timer
     const refresh = async () => {
       try {
         const response = await fetch('/api/agent/status')
+        if (response.status === 404) {
+          if (!active) return
+          setSecretServiceReady(false)
+          setAgentStatus({
+            running: false,
+            status: 'error',
+            message: 'Backend API is not deployed.',
+          })
+          setToast('This Vercel deployment serves the dashboard only; its backend API routes are not deployed.')
+          window.clearInterval(timer)
+          return
+        }
         if (!response.ok) return
         const result = await response.json()
         if (!active) return
@@ -152,7 +165,7 @@ function App() {
       }
     }
     refresh()
-    const timer = window.setInterval(refresh, 2500)
+    timer = window.setInterval(refresh, 2500)
     return () => { active = false; window.clearInterval(timer) }
   }, [])
 
