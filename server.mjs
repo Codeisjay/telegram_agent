@@ -11,7 +11,7 @@ import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAu
 
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
-const port = Number(process.env.AGENTFLOW_PORT || 3001)
+const port = Number(process.env.AGENTFLOW_PORT || process.env.PORT || 3001)
 const dashboardUsername = process.env.AGENTFLOW_USERNAME || ''
 const dashboardPassword = process.env.AGENTFLOW_PASSWORD || ''
 if (production && (

@@ -117,9 +117,27 @@ dashboard/API access uses HTTP Basic Auth, so only access it through the
 provided HTTPS proxy or another trusted TLS-terminating reverse proxy. If you
 deploy behind a different platform, set `NODE_ENV=production`,
 `AGENTFLOW_USERNAME`, `AGENTFLOW_PASSWORD` (16+ characters),
-`AGENTFLOW_HOST=0.0.0.0`, `AGENTFLOW_PORT`, and a persistent
-`AGENTFLOW_DATA_DIR`; route HTTPS to that internal port and keep it off the
-public network.
+`AGENTFLOW_HOST=0.0.0.0`, and a persistent `AGENTFLOW_DATA_DIR`. The service
+uses `AGENTFLOW_PORT` when set, otherwise it uses the platform-provided `PORT`
+and falls back to `3001` for local use.
+
+## Deploy on Render
+
+Create a **Web Service** from this repository and use its Dockerfile (do not
+deploy it as a Static Site). In the service's Environment settings, add:
+
+- `AGENTFLOW_USERNAME`: dashboard login name; do not include a colon.
+- `AGENTFLOW_PASSWORD`: a unique random password of at least 16 characters.
+- `AGENTFLOW_DATA_DIR`: `/data`.
+- Any provider or Telegram credentials you want available, such as
+  `GEMINI_API_KEY`, `GROQ_API_KEY`, `TAVILY_SEARCH_KEY`, or
+  `TELEGRAM_BOT_TOKEN`.
+
+Render supplies `PORT`; leave `AGENTFLOW_PORT` unset so the app listens on
+Render's assigned port. Configure the health check path as `/api/health`.
+Attach a persistent disk mounted at `/data` to retain the SQLite database and
+credentials saved from the dashboard across deploys. After deployment, open the
+service URL and sign in using the configured dashboard credentials.
 
 ## Credentials
 

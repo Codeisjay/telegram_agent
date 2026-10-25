@@ -18,7 +18,11 @@ function makeTestEnvironment(overrides = {}) {
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
   for (const key of [...secretKeys, 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
-  return { ...environment, ...overrides }
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete environment[key]
+    else environment[key] = value
+  }
+  return environment
 }
 
 function startTestBackend(overrides) {
@@ -70,6 +74,20 @@ test('health endpoint reports status without returning credential values', async
   assert.equal(health.service, 'agentflow-api')
   assert.equal(Object.hasOwn(health, 'secrets'), false)
   assert.equal(Object.hasOwn(health, 'credentials'), false)
+})
+
+test('uses the platform PORT when AGENTFLOW_PORT is not configured', async () => {
+  const backend = startTestBackend({ AGENTFLOW_PORT: undefined, PORT: '0' })
+  try {
+    const url = await backend.started
+    const response = await fetch(`${url}/api/health`)
+    assert.equal(response.status, 200)
+  } finally {
+    if (backend.child.exitCode === null) {
+      backend.child.kill()
+      await new Promise((resolve) => backend.child.once('exit', resolve))
+    }
+  }
 })
 
 test('local credential override can clear a project .env credential', async () => {

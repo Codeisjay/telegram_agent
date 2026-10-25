@@ -11,7 +11,6 @@ FROM node:22-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
     AGENTFLOW_HOST=0.0.0.0 \
-    AGENTFLOW_PORT=3001 \
     AGENTFLOW_DATA_DIR=/data
 
 WORKDIR /app
