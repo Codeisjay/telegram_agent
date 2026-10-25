@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Activity, AlertTriangle, BriefcaseBusiness, Check, ExternalLink, Globe2, Plus, RefreshCw, Search, X } from 'lucide-react'
 import './jobs.css'
+import { readApiResponse } from './api.js'
 
 function Badge({ children, tone = 'green' }) {
   return <span className={`badge badge-${tone}`}>{children}</span>
@@ -28,7 +29,7 @@ export default function JobsPage({ state, loading, setLoading, onRefresh, onToas
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(profile),
       })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not save candidate profile.')
       onToast('Candidate profile saved')
       await onRefresh()
@@ -44,7 +45,7 @@ export default function JobsPage({ state, loading, setLoading, onRefresh, onToas
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(next),
       })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not save job settings.')
       setSettings(result.settings)
       onToast('Job research settings saved')
@@ -80,7 +81,7 @@ export default function JobsPage({ state, loading, setLoading, onRefresh, onToas
     setError('')
     try {
       const response = await fetch('/api/jobs/run', { method: 'POST' })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Job research failed.')
       onToast(`Research finished: ${result.newJobsCount} new jobs found`)
       await onRefresh()
@@ -94,7 +95,7 @@ export default function JobsPage({ state, loading, setLoading, onRefresh, onToas
   const updateJob = async (job, action) => {
     try {
       const response = await fetch(`/api/jobs/${job.id}/${action}`, { method: 'POST' })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not update listing.')
       await onRefresh()
     } catch (updateError) {

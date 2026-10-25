@@ -9,6 +9,7 @@ import {
   X, Zap,
 } from 'lucide-react'
 import JobsPage from './JobsPage.jsx'
+import { readApiResponse } from './api.js'
 
 const initialLogs = []
 
@@ -94,7 +95,7 @@ function App() {
 
   const refreshJobState = async () => {
     const response = await fetch('/api/jobs/state')
-    const result = await response.json()
+    const result = await readApiResponse(response)
     if (!response.ok) throw new Error(result.error || 'Could not load job intelligence data.')
     setJobState(result)
   }
@@ -105,7 +106,7 @@ function App() {
     const load = async () => {
       try {
         const response = await fetch('/api/jobs/state')
-        const result = await response.json()
+        const result = await readApiResponse(response)
         if (!response.ok) throw new Error(result.error || 'Could not load job intelligence data.')
         if (mounted) setJobState(result)
       } catch (error) {
@@ -125,7 +126,7 @@ function App() {
     fetch('/api/secrets')
       .then(async (response) => {
         if (!response.ok) throw new Error('Credential service is unavailable.')
-        return response.json()
+        return readApiResponse(response)
       })
       .then(({ configured }) => {
         setSecretStatus(configured)
@@ -156,7 +157,7 @@ function App() {
           return
         }
         if (!response.ok) return
-        const result = await response.json()
+        const result = await readApiResponse(response)
         if (!active) return
         setAgentStatus(result)
         if (result.events) setLogs(result.events)
@@ -195,7 +196,7 @@ function App() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ name, value }),
       })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not save credential.')
       setSecretStatus((current) => ({ ...current, [name]: result.configured }))
       setSecretDrafts((current) => ({ ...current, [name]: '' }))
@@ -211,10 +212,10 @@ function App() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(value === undefined ? { name } : { name, value }),
       })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       setToast(result.message || (response.ok ? 'Credential verified' : 'Credential check failed'))
-    } catch {
-      setToast('Could not reach the local credential service')
+    } catch (error) {
+      setToast(error.message || 'Could not reach the AgentFlow API.')
     }
   }
   const toggleAgent = async () => {
@@ -224,7 +225,7 @@ function App() {
         headers: { 'content-type': 'application/json' },
         body: agentStatus.running ? '{}' : JSON.stringify(config),
       })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not change agent status.')
       setAgentStatus((current) => ({ ...current, running: result.running, status: result.running ? 'starting' : 'stopped', message: result.message }))
       setToast(result.message)
@@ -249,7 +250,7 @@ function App() {
           settings: config,
         }),
       })
-      const result = await response.json()
+      const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Agent request failed.')
       setTestResult(result)
     } catch (error) {
