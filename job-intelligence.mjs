@@ -285,7 +285,7 @@ export class JobDatabase {
       CREATE TABLE IF NOT EXISTS job_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         companies_json TEXT NOT NULL DEFAULT '[]',
-        provider TEXT NOT NULL DEFAULT 'gemini',
+        provider TEXT NOT NULL DEFAULT 'openrouter',
         target_graduation_year INTEGER NOT NULL DEFAULT 2027,
         telegram_chat_id TEXT NOT NULL DEFAULT '',
         paused INTEGER NOT NULL DEFAULT 0,
@@ -417,7 +417,7 @@ export class JobDatabase {
       INSERT OR IGNORE INTO candidate_profile(id, data_json, updated_at)
         VALUES (1, '{}', datetime('now'));
       INSERT OR IGNORE INTO job_settings(id, companies_json, provider, target_graduation_year, updated_at)
-        VALUES (1, '[]', 'gemini', 2027, datetime('now'));
+        VALUES (1, '[]', 'openrouter', 2027, datetime('now'));
       INSERT OR IGNORE INTO scheduler_state(id, paused, next_run_at, updated_at)
         VALUES (1, 0, '', datetime('now'));
       INSERT OR IGNORE INTO agent_preferences(id, settings_json, auto_start, updated_at)
@@ -472,6 +472,15 @@ export class JobDatabase {
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'));
     `)
+    if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version = 6').get()) {
+      const updatedAt = new Date().toISOString()
+      this.db.prepare("UPDATE job_settings SET provider = 'openrouter', updated_at = ? WHERE provider = 'gemini'").run(updatedAt)
+      this.db.prepare(`UPDATE agent_preferences
+        SET settings_json = json_set(settings_json, '$.provider', 'openrouter'), updated_at = ?
+        WHERE json_extract(settings_json, '$.provider') = 'gemini'`).run(updatedAt)
+      this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)')
+        .run(updatedAt)
+    }
     const schedule = this.db.prepare('SELECT next_run_at FROM scheduler_state WHERE id = 1').get()
     if (!schedule.next_run_at) {
       this.db.prepare('UPDATE scheduler_state SET next_run_at = ?, updated_at = ? WHERE id = 1')

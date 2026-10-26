@@ -8,7 +8,7 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
   logs, filter log entries, and pause or clear the displayed stream.
 - **Provider selection:** Use Gemini with Google Search grounding, Groq
   `openai/gpt-oss-120b` with Tavily web search, or OpenRouter's Perplexity Sonar
-  route.
+  route. OpenRouter is the default provider for Telegram and job research.
 - **Web research:** Configure Tavily result count for Groq searches. Groq answers
   are instructed to rely on retrieved results, report when claims cannot be
   verified, and cite source links returned by search. If there are no usable
@@ -160,8 +160,8 @@ in the dashboard.
 
 ## Test the live agent
 
-1. Under **LLM & Web Search**, save a Gemini key, or save Groq and Tavily keys
-   and select the Groq provider. OpenRouter uses its Perplexity Sonar route.
+1. Under **LLM & Web Search**, save an OpenRouter key (the default provider),
+   a Gemini key, or Groq and Tavily keys if you choose Groq.
 2. Under **Telegram Settings**, save a Telegram bot token and click **Verify
    bot token**.
 3. Add your Telegram numeric user ID to the whitelist. If your ID is not

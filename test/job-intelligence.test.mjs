@@ -148,8 +148,28 @@ test('database backup can be reopened with jobs and evidence intact', async () =
   const restored = await JobDatabase.open(backupPath)
   assert.equal(restored.listJobs().length, database.listJobs().length)
   assert.ok(restored.listJobs().some((job) => job.sources.length > 0 && job.evidence.length > 0))
-  assert.equal(restored.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 5)
+  assert.equal(restored.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 6)
   restored.close()
+})
+
+test('OpenRouter is the default and migrates saved Gemini defaults once', async () => {
+  const providerDatabasePath = path.join(directory, 'provider-default.sqlite')
+  let providerDatabase = await JobDatabase.open(providerDatabasePath)
+  assert.equal(providerDatabase.getSettings().provider, 'openrouter')
+  providerDatabase.saveSettings({ provider: 'gemini' })
+  providerDatabase.saveAgentPreferences({ provider: 'gemini' }, true)
+  providerDatabase.db.prepare('DELETE FROM schema_migrations WHERE version = 6').run()
+  providerDatabase.close()
+
+  providerDatabase = await JobDatabase.open(providerDatabasePath)
+  assert.equal(providerDatabase.getSettings().provider, 'openrouter')
+  assert.equal(providerDatabase.getAgentPreferences().settings.provider, 'openrouter')
+  providerDatabase.saveSettings({ provider: 'groq' })
+  providerDatabase.close()
+
+  providerDatabase = await JobDatabase.open(providerDatabasePath)
+  assert.equal(providerDatabase.getSettings().provider, 'groq')
+  providerDatabase.close()
 })
 
 test('Telegram whitelist authorization allows approved IDs and rejects others', () => {

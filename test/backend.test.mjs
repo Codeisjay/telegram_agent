@@ -128,6 +128,14 @@ test('live query rejects empty input and reports missing provider credentials', 
   })
   assert.equal(missingKeyResponse.status, 400)
   assert.match((await missingKeyResponse.json()).error, /Save a Gemini API key/)
+
+  const defaultProviderResponse = await fetch(`${baseUrl}/api/agent/test`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: 'backend test', settings: {} }),
+  })
+  assert.equal(defaultProviderResponse.status, 400)
+  assert.match((await defaultProviderResponse.json()).error, /Save an OpenRouter API key/)
 })
 
 test('credential testing rejects malformed draft values without exposing them', async () => {

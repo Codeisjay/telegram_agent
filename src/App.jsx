@@ -30,7 +30,7 @@ const defaults = {
     { name: 'Handle greetings', condition: 'query EQUALS "/start"', action: 'Send welcome message', enabled: false },
   ],
   format: { footer: false, links: true, timestamp: false, maxChars: true },
-  provider: 'gemini',
+  provider: 'openrouter',
   maxResults: 5,
   depth: 'Balanced',
   rateLimit: 30,
@@ -54,6 +54,10 @@ function readSaved() {
     if (!localStorage.getItem('agentflow-public-access-migrated')) {
       saved.access = 'public'
       localStorage.setItem('agentflow-public-access-migrated', 'true')
+    }
+    if (!localStorage.getItem('agentflow-openrouter-primary-migrated')) {
+      saved.provider = 'openrouter'
+      localStorage.setItem('agentflow-openrouter-primary-migrated', 'true')
     }
     return {
       ...defaults,
