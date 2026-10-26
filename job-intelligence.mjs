@@ -399,6 +399,14 @@ export class JobDatabase {
         last_run_id INTEGER,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS agent_preferences (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        settings_json TEXT NOT NULL DEFAULT '{}',
+        auto_start INTEGER NOT NULL DEFAULT 1,
+        auto_start_configured INTEGER NOT NULL DEFAULT 0,
+        access_configured INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -412,6 +420,8 @@ export class JobDatabase {
         VALUES (1, '[]', 'gemini', 2027, datetime('now'));
       INSERT OR IGNORE INTO scheduler_state(id, paused, next_run_at, updated_at)
         VALUES (1, 0, '', datetime('now'));
+      INSERT OR IGNORE INTO agent_preferences(id, settings_json, auto_start, updated_at)
+        VALUES (1, '{}', 1, datetime('now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'));
     `)
     const settingsColumns = new Set(this.db.prepare('PRAGMA table_info(job_settings)').all().map((column) => column.name))
@@ -443,11 +453,24 @@ export class JobDatabase {
     ]) {
       if (!notificationColumns.has(column)) this.db.exec(`ALTER TABLE job_notifications ADD COLUMN ${column} ${declaration}`)
     }
+    const agentPreferenceColumns = new Set(this.db.prepare('PRAGMA table_info(agent_preferences)').all().map((column) => column.name))
+    if (!agentPreferenceColumns.has('auto_start_configured')) {
+      this.db.exec('ALTER TABLE agent_preferences ADD COLUMN auto_start_configured INTEGER NOT NULL DEFAULT 0')
+    }
+    if (!agentPreferenceColumns.has('access_configured')) {
+      this.db.exec('ALTER TABLE agent_preferences ADD COLUMN access_configured INTEGER NOT NULL DEFAULT 0')
+    }
     this.db.exec(`
       UPDATE jobs SET source_url=official_url WHERE source_url='';
       UPDATE jobs SET application_url=official_url WHERE application_url='';
+      UPDATE agent_preferences SET auto_start=1, auto_start_configured=1 WHERE auto_start_configured=0;
+      UPDATE agent_preferences
+        SET settings_json=json_set(settings_json, '$.access', 'public'), access_configured=1
+        WHERE access_configured=0;
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, datetime('now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'));
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'));
+      INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'));
     `)
     const schedule = this.db.prepare('SELECT next_run_at FROM scheduler_state WHERE id = 1').get()
     if (!schedule.next_run_at) {
@@ -531,6 +554,17 @@ export class JobDatabase {
     this.db.prepare('UPDATE scheduler_state SET paused = ?, updated_at = ? WHERE id = 1')
       .run(Number(paused), updatedAt)
     return this.getSettings()
+  }
+
+  getAgentPreferences() {
+    const row = this.db.prepare('SELECT settings_json, auto_start FROM agent_preferences WHERE id = 1').get()
+    return { settings: JSON.parse(row.settings_json), autoStart: Boolean(row.auto_start) }
+  }
+
+  saveAgentPreferences(settings, autoStart) {
+    this.db.prepare('UPDATE agent_preferences SET settings_json = ?, auto_start = ?, auto_start_configured = 1, access_configured = 1, updated_at = ? WHERE id = 1')
+      .run(JSON.stringify(settings), Number(autoStart), new Date().toISOString())
+    return this.getAgentPreferences()
   }
 
   getScheduler() {

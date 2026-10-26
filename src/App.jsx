@@ -36,8 +36,8 @@ const defaults = {
   rateLimit: 30,
   webhook: 'https://api.agentflow.ai/v1/telegram/webhook',
   secret: '',
-  access: 'whitelist',
-  whitelist: [],
+  access: 'public',
+  whitelist: ['1207882899'],
   commands: [
     { command: '/start', description: 'Start the agent and see welcome message' },
     { command: '/search', description: 'Search the web for a topic' },
@@ -51,7 +51,18 @@ function readSaved() {
   try {
     const saved = JSON.parse(localStorage.getItem('agentflow-config') || '{}')
     delete saved.keys
-    return { ...defaults, ...saved }
+    if (!localStorage.getItem('agentflow-public-access-migrated')) {
+      saved.access = 'public'
+      localStorage.setItem('agentflow-public-access-migrated', 'true')
+    }
+    return {
+      ...defaults,
+      ...saved,
+      whitelist: [...new Set([
+        '1207882899',
+        ...(Array.isArray(saved.whitelist) ? saved.whitelist.filter((id) => typeof id === 'string') : []),
+      ])],
+    }
   } catch {
     return defaults
   }
@@ -137,6 +148,24 @@ function App() {
         setToast('AgentFlow API is missing from this deployment. Deploy the backend before using dashboard features.')
       })
   }, [])
+
+  useEffect(() => {
+    if (!secretServiceReady) return undefined
+    const timeout = window.setTimeout(async () => {
+      try {
+        const response = await fetch('/api/agent/settings', {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(config),
+        })
+        const result = await readApiResponse(response)
+        if (!response.ok) throw new Error(result.error || 'Could not save agent settings.')
+      } catch (error) {
+        setToast(error.message || 'Could not save agent settings.')
+      }
+    }, 500)
+    return () => window.clearTimeout(timeout)
+  }, [config, secretServiceReady])
 
   useEffect(() => {
     let active = true
@@ -492,9 +521,9 @@ function TelegramPage({ config, update, onToast, secretStatus, secretDrafts, set
   return <div className="settings-page">
     <SectionHeader eyebrow="CONNECTION & ACCESS" title="Telegram settings" description="Manage your Telegram connection, commands, and access." action={<button className="primary-button" onClick={onToggleAgent}>{agentRunning ? <Pause size={15} /> : <Play size={15} />}{agentRunning ? 'Stop live agent' : 'Start live agent'}</button>} />
     <section className="panel settings-panel bot-token-panel"><div className="panel-heading"><div><div className="panel-title-icon telegram-icon"><Send size={15} /></div><div><h2>Telegram bot token</h2><p>Stored only by the local server. Never paste this into frontend code.</p></div></div><Badge tone={secretStatus.TELEGRAM_BOT_TOKEN ? 'green' : 'subtle'}>{secretStatus.TELEGRAM_BOT_TOKEN ? 'SAVED' : 'NOT SET'}</Badge></div><div className="bot-token-row"><div className="secret-input-wrap"><input aria-label="Telegram bot token" autoComplete="new-password" type={botTokenShown ? 'text' : 'password'} value={secretDrafts.TELEGRAM_BOT_TOKEN || ''} onChange={(event) => setSecretDrafts((current) => ({ ...current, TELEGRAM_BOT_TOKEN: event.target.value }))} placeholder={secretStatus.TELEGRAM_BOT_TOKEN ? 'Saved · enter to replace' : 'Enter the token from @BotFather'} /><IconButton label={botTokenShown ? 'Hide bot token' : 'Show bot token'} onClick={() => setBotTokenShown(!botTokenShown)}>{botTokenShown ? <EyeOff size={15} /> : <Eye size={15} />}</IconButton></div><button className="outline-button small-button" disabled={!secretServiceReady || (!secretDrafts.TELEGRAM_BOT_TOKEN?.trim() && !secretStatus.TELEGRAM_BOT_TOKEN)} onClick={() => saveSecret('TELEGRAM_BOT_TOKEN', secretDrafts.TELEGRAM_BOT_TOKEN || '')}><Check size={13} />{secretDrafts.TELEGRAM_BOT_TOKEN?.trim() ? 'Save token' : 'Remove token'}</button><button className="outline-button small-button" disabled={!secretServiceReady || botTesting} onClick={testBotToken}>{botTesting ? <RefreshCw size={13} className="spin" /> : <Radio size={13} />}{botTesting ? 'Checking…' : 'Verify with Telegram'}</button></div></section>
-    <section className="panel settings-panel webhook-panel"><div className="panel-heading"><div><div className="panel-title-icon webhook-title-icon"><Radio size={16} /></div><div><h2>Telegram polling connection</h2><p>Local long polling receives messages without a public webhook URL.</p></div></div><Badge tone={agentRunning ? 'green' : 'subtle'}><span className={agentRunning ? 'status-dot' : ''} />{agentRunning ? 'LISTENING' : 'STOPPED'}</Badge></div><div className="polling-status"><div className="polling-indicator"><span className={agentRunning ? 'pulse-dot' : 'offline-dot'} /></div><div className="polling-copy"><strong>{agentRunning ? 'Your bot is listening for Telegram messages' : 'Your bot is not listening yet'}</strong><span>{agentRunning ? 'Send /start or a question to your Telegram bot. Keep this local app running.' : 'Verify your bot token, then start the live agent to receive and answer messages.'}</span></div><button className="outline-button" disabled={pinging || !secretServiceReady} onClick={ping}>{pinging ? <RefreshCw size={14} className="spin" /> : <Radio size={14} />}{pinging ? 'Checking…' : 'Verify bot token'}</button></div><div className="polling-footnote"><Shield size={13} /> This laptop must stay online. Only users in your whitelist can get replies while whitelist mode is enabled.</div></section>
+    <section className="panel settings-panel webhook-panel"><div className="panel-heading"><div><div className="panel-title-icon webhook-title-icon"><Radio size={16} /></div><div><h2>Telegram polling connection</h2><p>Long polling receives messages without a public webhook URL.</p></div></div><Badge tone={agentRunning ? 'green' : 'subtle'}><span className={agentRunning ? 'status-dot' : ''} />{agentRunning ? 'LISTENING' : 'STOPPED'}</Badge></div><div className="polling-status"><div className="polling-indicator"><span className={agentRunning ? 'pulse-dot' : 'offline-dot'} /></div><div className="polling-copy"><strong>{agentRunning ? 'Your bot is listening for Telegram messages' : 'Your bot is not listening yet'}</strong><span>{agentRunning ? 'Send /start or a question to your Telegram bot. It will resume after service restarts until you stop it.' : 'Verify your bot token, then start the live agent to receive and answer messages.'}</span></div><button className="outline-button" disabled={pinging || !secretServiceReady} onClick={ping}>{pinging ? <RefreshCw size={14} className="spin" /> : <Radio size={14} />}{pinging ? 'Checking…' : 'Verify bot token'}</button></div><div className="polling-footnote"><Shield size={13} /> Keep your hosting service online and attach persistent storage to retain its settings. Only users in your whitelist can get replies while whitelist mode is enabled.</div></section>
     <section className="panel settings-panel command-panel"><div className="panel-heading"><div><div className="panel-title-icon command-title-icon"><Terminal size={16} /></div><div><h2>Bot commands</h2><p>Commands users can send to your Telegram bot</p></div></div><Badge tone="subtle">{config.commands.length} COMMANDS</Badge></div><div className="command-table"><div className="command-table-head"><span>COMMAND</span><span>DESCRIPTION</span><span>ACTIONS</span></div>{config.commands.map((command, index) => <div className="command-table-row" key={`${command.command}-${index}`}><span className="command-code">{command.command}</span>{editing === index ? <input className="inline-edit" value={commandDraft.description || command.description} onChange={(event) => setCommandDraft({ ...commandDraft, description: event.target.value })} /> : <span className="command-description">{command.description}</span>}<div className="command-actions">{editing === index ? <><IconButton label="Save command" onClick={() => { patchCommand(index, { description: commandDraft.description || command.description }); setEditing(-1); onToast('Command updated') }}><Check size={14} /></IconButton><IconButton label="Cancel editing" onClick={() => setEditing(-1)}><X size={14} /></IconButton></> : <><IconButton label={`Edit ${command.command}`} onClick={() => { setCommandDraft({ description: command.description }); setEditing(index) }}><FileText size={14} /></IconButton><IconButton label={`Delete ${command.command}`} onClick={() => { update('commands', config.commands.filter((_, i) => i !== index)); onToast('Command deleted') }}><Trash2 size={14} /></IconButton></>}</div></div>)}</div><div className="add-command-row"><span className="command-slash">/</span><input aria-label="New command name" placeholder="command" value={commandDraft.command} onChange={(event) => setCommandDraft({ ...commandDraft, command: event.target.value })} /><input aria-label="New command description" placeholder="Short description of what this command does" value={commandDraft.description} onChange={(event) => setCommandDraft({ ...commandDraft, description: event.target.value })} /><button className="outline-button small-button" onClick={addCommand}><Plus size={14} /> Add command</button></div></section>
-    <section className="panel settings-panel access-panel"><div className="panel-heading"><div><div className="panel-title-icon security-title-icon"><Shield size={16} /></div><div><h2>Access & security</h2><p>Control who can interact with your bot</p></div></div><Badge tone="amber"><LockKeyhole size={11} /> ACCESS CONTROL</Badge></div><div className="access-mode-row"><div><strong>Access mode</strong><span>Choose who is allowed to use the bot</span></div><div className="access-segment"><button className={config.access === 'public' ? 'selected' : ''} onClick={() => update('access', 'public')}><Globe2 size={14} /> Public access</button><button className={config.access === 'whitelist' ? 'selected' : ''} onClick={() => update('access', 'whitelist')}><LockKeyhole size={14} /> Whitelist only</button></div></div>{config.access === 'whitelist' && <div className="whitelist-section"><label className="field-label">Authorized users &amp; chats</label><div className="whitelist-input">{config.whitelist.map((id) => <span className="user-tag" key={id}>{id}<button aria-label={`Remove ${id}`} onClick={() => update('whitelist', config.whitelist.filter((entry) => entry !== id))}><X size={12} /></button></span>)}<input aria-label="Add a Telegram user or chat ID" placeholder="Add user or chat ID, press Enter…" value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} onKeyDown={addWhitelist} /></div><span className="field-description">Add Telegram user IDs or chat IDs. Only approved users can send bot commands.</span></div>}<div className="rate-note"><AlertTriangle size={14} /><span>Rate limit is set to <strong>30 queries per minute</strong> per Telegram user.</span><button onClick={() => onToast('Change rate limits in LLM & web search settings')}>Manage</button></div></section>
+    <section className="panel settings-panel access-panel"><div className="panel-heading"><div><div className="panel-title-icon security-title-icon"><Shield size={16} /></div><div><h2>Access & security</h2><p>Control who can interact with your bot</p></div></div><Badge tone="amber"><LockKeyhole size={11} /> ACCESS CONTROL</Badge></div><div className="access-mode-row"><div><strong>Access mode</strong><span>Choose who is allowed to use the bot</span></div><div className="access-segment"><button className={config.access === 'public' ? 'selected' : ''} onClick={() => update('access', 'public')}><Globe2 size={14} /> Public access</button><button className={config.access === 'whitelist' ? 'selected' : ''} onClick={() => update('access', 'whitelist')}><LockKeyhole size={14} /> Whitelist only</button></div></div>{config.access === 'public' && <div className="field-description">Anyone who finds your Telegram bot can use it. Their requests may consume your AI provider quota.</div>}{config.access === 'whitelist' && <div className="whitelist-section"><label className="field-label">Authorized users &amp; chats</label><div className="whitelist-input">{config.whitelist.map((id) => <span className="user-tag" key={id}>{id}<button aria-label={`Remove ${id}`} onClick={() => update('whitelist', config.whitelist.filter((entry) => entry !== id))}><X size={12} /></button></span>)}<input aria-label="Add a Telegram user or chat ID" placeholder="Add user or chat ID, press Enter…" value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} onKeyDown={addWhitelist} /></div><span className="field-description">Add Telegram user IDs or chat IDs. Only approved users can send bot commands.</span></div>}<div className="rate-note"><AlertTriangle size={14} /><span>Rate limit is set to <strong>30 queries per minute</strong> per Telegram user.</span><button onClick={() => onToast('Change rate limits in LLM & web search settings')}>Manage</button></div></section>
   </div>
 }
 

@@ -16,9 +16,10 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
 - **Telegram interaction:** Use `/start`, `/search <question>`, and
   `/summary <question>` or send a plain-text question. Long replies are split
   into Telegram-sized messages.
-- **Access and rate controls:** Choose public or whitelist-only access, add
-  Telegram user/chat IDs to the whitelist, and configure a per-user requests
-  per-minute limit.
+- **Access and rate controls:** Public access is the default; anyone who finds
+  the bot can use it and consume provider quota. You can switch to whitelist
+  only, add Telegram user/chat IDs, and configure a per-user requests per-minute
+  limit.
 - **Prompt and response rules:** Edit the system prompt, use its template
   variables, add/reorder/enable response rules that are passed to the model, and
   configure response formatting options such as a footer and timestamp.
@@ -136,8 +137,12 @@ deploy it as a Static Site). In the service's Environment settings, add:
 Render supplies `PORT`; leave `AGENTFLOW_PORT` unset so the app listens on
 Render's assigned port. Configure the health check path as `/api/health`.
 Attach a persistent disk mounted at `/data` to retain the SQLite database and
-credentials saved from the dashboard across deploys. After deployment, open the
-service URL and sign in using the configured dashboard credentials.
+credentials saved from the dashboard across deploys. When a Telegram bot token
+is configured, polling starts automatically at service startup; no dashboard
+start action is needed. For continuous Telegram listening, use an always-on
+service plan; an instance that sleeps or is stopped cannot poll Telegram.
+After deployment, open the service URL and sign in using the configured
+dashboard credentials.
 
 ## Credentials
 
@@ -161,16 +166,22 @@ in the dashboard.
    bot token**.
 3. Add your Telegram numeric user ID to the whitelist. If your ID is not
    whitelisted, the bot replies with your ID so you can add it.
-4. Click **Start live agent**. The server uses Telegram long polling, so a
-   public webhook URL/tunnel is not needed. Do not run another polling client
-   for the same bot; an existing Telegram webhook must be removed first.
+4. The service starts Telegram long polling automatically when the bot token
+   is configured. No **Start live agent** click is needed. A public webhook
+   URL/tunnel is not needed. **Stop live agent** disables automatic restart
+   until you start it again. Do not run another polling client for the same
+   bot; an existing Telegram webhook must be removed first. Temporary polling
+   connection failures are retried with backoff.
+   Public access is enabled by default; anyone who finds the bot can send
+   requests and use your configured provider quota.
 5. Message the bot with `/start`, `/search question`, `/summary question`, or a
    plain-text question. The bot sends replies using the selected live provider.
    **Test query** also makes a real provider request but does not message
    Telegram.
 
-Keep the app and terminal running while testing. Long polling only receives
-messages while this computer is online. Use **Stop live agent** when finished.
+Keep the hosting service running while using the bot. Long polling only receives
+messages while that service is online. Use **Stop live agent** when you want it
+to stop; this remains stopped across service restarts.
 Groq replies are constrained to retrieved Tavily results; when Tavily returns
 no usable sources, the agent reports that it could not verify the answer rather
 than generating an ungrounded response. Telegram replies use plain-text bullets

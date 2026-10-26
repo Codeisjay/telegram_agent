@@ -148,7 +148,7 @@ test('database backup can be reopened with jobs and evidence intact', async () =
   const restored = await JobDatabase.open(backupPath)
   assert.equal(restored.listJobs().length, database.listJobs().length)
   assert.ok(restored.listJobs().some((job) => job.sources.length > 0 && job.evidence.length > 0))
-  assert.equal(restored.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 3)
+  assert.equal(restored.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 5)
   restored.close()
 })
 

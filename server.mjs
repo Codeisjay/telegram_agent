@@ -35,10 +35,15 @@ const secretNames = new Set([
   'TAVILY_SEARCH_KEY',
   'TELEGRAM_BOT_TOKEN',
 ])
-const agent = { running: false, status: 'stopped', message: 'Agent is stopped.', events: [], controller: null, task: null }
+const defaultWhitelistId = '1207882899'
+const agent = { running: false, status: 'stopped', message: 'Agent is stopped.', events: [], controller: null, task: null, settings: null }
 const userRequests = new Map()
 const database = await JobDatabase.open(databaseFile)
 let jobResearchRunning = false
+let agentStartPromise
+let agentStartGeneration = 0
+let autoStartRetryTimer
+let autoStartRetryDelay = 1000
 
 function parseEnv(contents) {
   const values = {}
@@ -215,8 +220,11 @@ function safeSettings(input = {}) {
           description: typeof command.description === 'string' ? command.description.slice(0, 256) : '',
         }))
       : [],
-    access: input.access === 'public' ? 'public' : 'whitelist',
-    whitelist: Array.isArray(input.whitelist) ? input.whitelist.filter((id) => typeof id === 'string').slice(0, 500) : [],
+    access: input.access === 'whitelist' ? 'whitelist' : 'public',
+    whitelist: [...new Set([
+      defaultWhitelistId,
+      ...(Array.isArray(input.whitelist) ? input.whitelist.filter((id) => typeof id === 'string').slice(0, 499) : []),
+    ])],
     rateLimit: Number.isInteger(input.rateLimit) ? Math.max(1, Math.min(input.rateLimit, 120)) : 30,
     maxResults: Number.isInteger(input.maxResults) ? Math.max(1, Math.min(input.maxResults, 10)) : 5,
     format: {
@@ -1049,20 +1057,148 @@ async function handleJobCallback(callback, settings) {
 
 async function pollingLoop(settings, signal) {
   let offset = 0
+  let retryDelay = 1000
   agent.status = 'running'
   agent.message = 'Listening to Telegram via long polling.'
   while (!signal.aborted) {
-    const updates = await telegramRequest('getUpdates', { offset, timeout: 25, allowed_updates: ['message', 'callback_query'] }, signal)
-    for (const update of updates) {
-      offset = update.update_id + 1
-      try {
-        await handleTelegramUpdate(update, settings)
-      } catch (error) {
-        if (signal.aborted) return
-        logEvent('500 ERROR', `Could not process Telegram update: ${error.message}`, 'errors')
+    try {
+      const updates = await telegramRequest('getUpdates', { offset, timeout: 25, allowed_updates: ['message', 'callback_query'] }, signal)
+      retryDelay = 1000
+      agent.status = 'running'
+      agent.message = 'Listening to Telegram via long polling.'
+      for (const update of updates) {
+        offset = update.update_id + 1
+        try {
+          await handleTelegramUpdate(update, agent.settings || settings)
+        } catch (error) {
+          if (signal.aborted) return
+          logEvent('500 ERROR', `Could not process Telegram update: ${error.message}`, 'errors')
+        }
       }
+    } catch (error) {
+      if (signal.aborted) return
+      agent.status = 'reconnecting'
+      agent.message = `Telegram connection interrupted; retrying in ${Math.round(retryDelay / 1000)} seconds.`
+      logEvent('500 ERROR', `Telegram polling failed; retrying in ${Math.round(retryDelay / 1000)} seconds: ${error.message}`, 'errors')
+      await new Promise((resolve) => {
+        let timer
+        const onAbort = () => {
+          clearTimeout(timer)
+          resolve()
+        }
+        timer = setTimeout(() => {
+          signal.removeEventListener('abort', onAbort)
+          resolve()
+        }, retryDelay)
+        signal.addEventListener('abort', onAbort, { once: true })
+      })
+      retryDelay = Math.min(retryDelay * 2, 60000)
     }
   }
+}
+
+async function startTelegramAgentOnce(inputSettings, generation) {
+  const settings = safeSettings(inputSettings)
+  if (agent.running) {
+    agent.settings = settings
+    database.saveAgentPreferences(settings, true)
+    return { running: true, message: 'Telegram polling is already running; settings were updated.' }
+  }
+  const secrets = await readSecrets()
+  if (!secrets.TELEGRAM_BOT_TOKEN) throw serviceError('Save a Telegram bot token under Telegram Settings first.', 400)
+  const webhookInfo = await telegramRequest('getWebhookInfo')
+  if (webhookInfo.url) throw serviceError('This bot has a webhook configured. Remove the webhook in Telegram before using local polling.', 409)
+
+  const jobCommands = [
+    ['/today', 'Show verified new job openings'],
+    ['/eligible', 'Show jobs matching your profile'],
+    ['/deadlines', 'Show job application deadlines'],
+    ['/saved', 'Show saved jobs'],
+    ['/applied', 'Show submitted applications'],
+    ['/company', 'Filter jobs by company'],
+    ['/profile', 'View or update your candidate profile'],
+    ['/pause', 'Pause daily job research'],
+    ['/resume', 'Resume daily job research'],
+    ['/last_run', 'Show the latest research run'],
+  ]
+  const commands = settings.commands.map((command) => ({
+    command: command.command.replace(/^\//, '').toLowerCase(),
+    description: String(command.description || '').slice(0, 256),
+  }))
+  for (const [command, description] of jobCommands) {
+    if (!commands.some((entry) => entry.command === command.slice(1))) commands.push({ command: command.slice(1), description })
+  }
+  await telegramRequest('setMyCommands', {
+    commands: commands.filter((entry) => /^[a-z0-9_]{1,32}$/i.test(entry.command)).slice(0, 100),
+  })
+
+  if (generation !== agentStartGeneration) {
+    return { running: false, message: 'Telegram polling start was cancelled.' }
+  }
+  database.saveAgentPreferences(settings, true)
+  const controller = new AbortController()
+  agent.controller = controller
+  agent.settings = settings
+  agent.running = true
+  agent.status = 'starting'
+  agent.message = 'Connecting to Telegram…'
+  agent.task = pollingLoop(settings, controller.signal).catch((error) => {
+    if (!controller.signal.aborted) {
+      agent.status = 'error'
+      agent.message = error.message
+      agent.running = false
+      logEvent('500 ERROR', `Telegram polling stopped: ${error.message}`, 'errors')
+    }
+  })
+  logEvent('INFO', 'Connecting to Telegram using long polling.', 'webhooks')
+  return { running: true, message: 'Telegram polling started and will resume after service restarts.' }
+}
+
+function startTelegramAgent(inputSettings) {
+  if (agentStartPromise) return agentStartPromise
+  const generation = ++agentStartGeneration
+  agentStartPromise = startTelegramAgentOnce(inputSettings, generation).finally(() => {
+    agentStartPromise = undefined
+  })
+  return agentStartPromise
+}
+
+function scheduleTelegramAutoStartRetry(settings, error) {
+  if (!database.getAgentPreferences().autoStart || autoStartRetryTimer) return
+  agent.status = 'error'
+  agent.message = error.message
+  logEvent('500 ERROR', `Could not start Telegram polling; retrying in ${Math.round(autoStartRetryDelay / 1000)} seconds: ${error.message}`, 'errors')
+  const delay = autoStartRetryDelay
+  autoStartRetryDelay = Math.min(autoStartRetryDelay * 2, 60000)
+  autoStartRetryTimer = setTimeout(() => {
+    autoStartRetryTimer = undefined
+    if (database.getAgentPreferences().autoStart) startTelegramAgentAutomatically(settings)
+  }, delay)
+}
+
+async function startTelegramAgentAutomatically(settings) {
+  try {
+    await startTelegramAgent(settings)
+    autoStartRetryDelay = 1000
+    if (autoStartRetryTimer) clearTimeout(autoStartRetryTimer)
+    autoStartRetryTimer = undefined
+  } catch (error) {
+    scheduleTelegramAutoStartRetry(settings, error)
+  }
+}
+
+function stopTelegramAgent() {
+  database.saveAgentPreferences(database.getAgentPreferences().settings, false)
+  agentStartGeneration += 1
+  if (autoStartRetryTimer) clearTimeout(autoStartRetryTimer)
+  autoStartRetryTimer = undefined
+  autoStartRetryDelay = 1000
+  agent.controller?.abort()
+  agent.running = false
+  agent.status = 'stopped'
+  agent.message = 'Agent is stopped and will remain stopped until started again.'
+  logEvent('INFO', 'Telegram polling stopped.', 'webhooks')
+  return { running: false, message: agent.message }
 }
 
 async function testCredential(name, secrets, draftValue) {
@@ -1200,6 +1336,12 @@ const server = createServer(async (request, response) => {
       const secrets = await readEnvFile(secretFile)
       secrets[name] = value.trim()
       await writeSecrets(secrets)
+      if (name === 'TELEGRAM_BOT_TOKEN' && value.trim()) {
+        const preferences = database.getAgentPreferences()
+        if (preferences.autoStart && !agent.running) {
+          startTelegramAgentAutomatically(preferences.settings)
+        }
+      }
       return respond(response, 200, { configured: Boolean(value.trim()) })
     }
 
@@ -1225,7 +1367,22 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === 'GET' && url.pathname === '/api/agent/status') {
-      return respond(response, 200, { running: agent.running, status: agent.status, message: agent.message, events: agent.events })
+      return respond(response, 200, {
+        running: agent.running,
+        status: agent.status,
+        message: agent.message,
+        autoStart: database.getAgentPreferences().autoStart,
+        access: agent.settings?.access || 'public',
+        events: agent.events,
+      })
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/api/agent/settings') {
+      const settings = safeSettings(await readJson(request))
+      const preferences = database.getAgentPreferences()
+      database.saveAgentPreferences(settings, preferences.autoStart)
+      if (agent.running) agent.settings = settings
+      return respond(response, 200, { saved: true })
     }
 
     if (request.method === 'DELETE' && url.pathname === '/api/agent/events') {
@@ -1234,62 +1391,12 @@ const server = createServer(async (request, response) => {
     }
 
     if (request.method === 'POST' && url.pathname === '/api/agent/start') {
-      if (agent.running) return respond(response, 200, { running: true, message: 'Telegram polling is already running.' })
-      const settings = safeSettings(await readJson(request))
-      const secrets = await readSecrets()
-      if (!secrets.TELEGRAM_BOT_TOKEN) return respond(response, 400, { error: 'Save a Telegram bot token under Telegram Settings first.' })
-      const webhookInfo = await telegramRequest('getWebhookInfo')
-      if (webhookInfo.url) return respond(response, 409, { error: 'This bot has a webhook configured. Remove the webhook in Telegram before using local polling.' })
-      {
-        const jobCommands = [
-          ['/today', 'Show verified new job openings'],
-          ['/eligible', 'Show jobs matching your profile'],
-          ['/deadlines', 'Show job application deadlines'],
-          ['/saved', 'Show saved jobs'],
-          ['/applied', 'Show submitted applications'],
-          ['/company', 'Filter jobs by company'],
-          ['/profile', 'View or update your candidate profile'],
-          ['/pause', 'Pause daily job research'],
-          ['/resume', 'Resume daily job research'],
-          ['/last_run', 'Show the latest research run'],
-        ]
-        const commands = settings.commands.map((command) => ({
-          command: command.command.replace(/^\//, '').toLowerCase(),
-          description: String(command.description || '').slice(0, 256),
-        }))
-        for (const [command, description] of jobCommands) {
-          if (!commands.some((entry) => entry.command === command.slice(1))) commands.push({ command: command.slice(1), description })
-        }
-        await telegramRequest('setMyCommands', {
-          commands: commands.filter((entry) => /^[a-z0-9_]{1,32}$/i.test(entry.command)).slice(0, 100),
-        })
-      }
-      const controller = new AbortController()
-      agent.controller = controller
-      agent.running = true
-      agent.status = 'starting'
-      agent.message = 'Connecting to Telegram…'
-      agent.task = pollingLoop(settings, controller.signal).then(() => {
-        if (!controller.signal.aborted) throw new Error('Telegram polling stopped unexpectedly.')
-      }).catch((error) => {
-        if (!controller.signal.aborted) {
-          agent.status = 'error'
-          agent.message = error.message
-          agent.running = false
-          logEvent('500 ERROR', `Telegram polling stopped: ${error.message}`, 'errors')
-        }
-      })
-      logEvent('INFO', 'Connecting to Telegram using long polling.', 'webhooks')
-      return respond(response, 200, { running: true, message: 'Telegram polling started.' })
+      const result = await startTelegramAgent(await readJson(request))
+      return respond(response, 200, result)
     }
 
     if (request.method === 'POST' && url.pathname === '/api/agent/stop') {
-      agent.controller?.abort()
-      agent.running = false
-      agent.status = 'stopped'
-      agent.message = 'Agent is stopped.'
-      logEvent('INFO', 'Telegram polling stopped.', 'webhooks')
-      return respond(response, 200, { running: false, message: agent.message })
+      return respond(response, 200, stopTelegramAgent())
     }
 
     if (await serveFrontend(request, response, url.pathname)) return
@@ -1318,6 +1425,10 @@ server.listen(port, host, () => {
     onError: (error) => logEvent('500 ERROR', `Daily job scheduler failed: ${error.message}`, 'errors'),
   })
   scheduler.start().catch((error) => logEvent('500 ERROR', `Could not initialize daily scheduler: ${error.message}`, 'errors'))
+  const preferences = database.getAgentPreferences()
+  if (preferences.autoStart) {
+    startTelegramAgentAutomatically(preferences.settings)
+  }
 })
 
 const shutdown = () => {

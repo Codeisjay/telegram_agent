@@ -285,6 +285,7 @@ test('overlapping manual research runs are rejected', async () => {
 })
 
 test('Telegram rate limits are recorded and failed notifications can be retried without duplicate sends', async () => {
+  await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' })
   const saveToken = await fetch(`${baseUrl}/api/secrets`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
@@ -330,6 +331,7 @@ test('Telegram rate limits are recorded and failed notifications can be retried 
 })
 
 test('ambiguous Telegram timeout is persisted without an immediate duplicate retry', async () => {
+  await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' })
   await fetch(`${baseUrl}/api/secrets`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
@@ -441,6 +443,85 @@ test('Telegram polling splits long AI responses into valid message chunks', asyn
   } finally {
     await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' })
   }
+})
+
+test('Telegram listener resumes after service restarts until manually stopped', async () => {
+  const originalStop = new Promise((resolve) => server.once('exit', resolve))
+  server.kill('SIGTERM')
+  await originalStop
+
+  const agentDataDirectory = path.join(tempRoot, 'auto-start-agent-data')
+  const firstInstance = startTestBackend({
+    AGENTFLOW_DATA_DIR: agentDataDirectory,
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
+  })
+  server = firstInstance.child
+  baseUrl = await firstInstance.started
+  let status
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await fetch(`${baseUrl}/api/agent/status`).then((response) => response.json())
+    if (status.running) break
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(status.running, true)
+  assert.equal(status.autoStart, true)
+  assert.equal(status.access, 'public')
+
+  const updateSettings = await fetch(`${baseUrl}/api/agent/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ access: 'whitelist', whitelist: [] }),
+  })
+  assert.equal(updateSettings.status, 200)
+  const savedAgentPreferences = await JobDatabase.open(path.join(agentDataDirectory, 'jobs.sqlite'))
+  assert.deepEqual(JSON.parse(savedAgentPreferences.db.prepare('SELECT settings_json FROM agent_preferences WHERE id=1').get().settings_json).whitelist, ['1207882899'])
+  savedAgentPreferences.close()
+
+  const firstStop = new Promise((resolve) => server.once('exit', resolve))
+  server.kill('SIGTERM')
+  await firstStop
+  const legacyPreferences = await JobDatabase.open(path.join(agentDataDirectory, 'jobs.sqlite'))
+  legacyPreferences.db.prepare("UPDATE agent_preferences SET settings_json = ?, access_configured = 0 WHERE id = 1")
+    .run(JSON.stringify({ access: 'whitelist', whitelist: [] }))
+  legacyPreferences.close()
+
+  const restarted = startTestBackend({
+    AGENTFLOW_DATA_DIR: agentDataDirectory,
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
+  })
+  server = restarted.child
+  baseUrl = await restarted.started
+  for (let attempt = 0; attempt < 100; attempt++) {
+    status = await fetch(`${baseUrl}/api/agent/status`).then((response) => response.json())
+    if (status.running) break
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.equal(status.running, true)
+  assert.equal(status.autoStart, true)
+  assert.equal(status.access, 'public')
+  const restartedPreferences = await JobDatabase.open(path.join(agentDataDirectory, 'jobs.sqlite'))
+  assert.deepEqual(JSON.parse(restartedPreferences.db.prepare('SELECT settings_json FROM agent_preferences WHERE id=1').get().settings_json).whitelist, ['1207882899'])
+  restartedPreferences.close()
+
+  const stop = await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' })
+  assert.equal(stop.status, 200)
+  status = await fetch(`${baseUrl}/api/agent/status`).then((response) => response.json())
+  assert.equal(status.running, false)
+  assert.equal(status.autoStart, false)
+
+  const secondStop = new Promise((resolve) => server.once('exit', resolve))
+  server.kill('SIGTERM')
+  await secondStop
+
+  const stoppedBackend = startTestBackend({
+    AGENTFLOW_DATA_DIR: agentDataDirectory,
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
+  })
+  server = stoppedBackend.child
+  baseUrl = await stoppedBackend.started
+  status = await fetch(`${baseUrl}/api/agent/status`).then((response) => response.json())
+  assert.equal(status.running, false)
+  assert.equal(status.autoStart, false)
 })
 
 test('production requires dashboard authentication and serves the built dashboard', async () => {
