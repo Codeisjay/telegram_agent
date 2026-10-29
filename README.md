@@ -18,6 +18,11 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
   and isolated retries. Optional `AGENTFLOW_JOB_PROMPT_TOKEN_BUDGET` and
   `AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS` environment variables tune the
   conservative prompt-token budget and per-page text limit.
+  OpenRouter extraction retries transient in-flight credit reservation errors
+  with backoff and reserves up to 1,200 completion tokens per page. Persistent
+  OpenRouter credit errors still require the account's in-flight requests to
+  settle or sufficient available credits; the app does not add credits or switch
+  models/providers automatically.
 - **Telegram interaction:** Use `/start`, `/search <question>`, and
   `/summary <question>` or send a plain-text question. Long replies are split
   into Telegram-sized messages.

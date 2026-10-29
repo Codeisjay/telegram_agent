@@ -1,5 +1,6 @@
 const originalFetch = globalThis.fetch
 let telegramUpdateDelivered = false
+let creditCapacityRetryRequests = 0
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input.url)
@@ -48,6 +49,15 @@ globalThis.fetch = async (input, init) => {
             url: `https://careers.example.com/jobs/${jobId}`,
             content: 'Official internship vacancy.',
           })),
+        })
+      }
+      if (request.query.includes('CreditRetryCo')) {
+        return Response.json({
+          results: [{
+            title: 'Software Engineer Intern job-a-27',
+            url: 'https://careers.example.com/jobs/job-a-27',
+            content: 'Official internship vacancy.',
+          }],
         })
       }
       if (request.query.trimStart().startsWith('FailCo ')) {
@@ -167,6 +177,11 @@ globalThis.fetch = async (input, init) => {
     }
     if (instructions.includes('LlmFailCo')) {
       return Response.json({ error: { message: 'Temporary LLM failure.' } }, { status: 503 })
+    }
+    if (instructions.includes('CreditRetryCo') && creditCapacityRetryRequests++ === 0) {
+      return Response.json({
+        error: { message: 'This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits.' },
+      }, { status: 402 })
     }
     const pageData = instructions.match(/Fetched official career pages:\s*([\s\S]+)$/)?.[1] || '[]'
     const pages = JSON.parse(pageData)
