@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { validateExtractedJobs } from '../job-extraction.mjs'
+import { cleanJobPageContent, deduplicateExtractedJobs, validateExtractedJobs } from '../job-extraction.mjs'
 
 const sourceUrl = 'https://careers.example.com/jobs/SE-2027'
 const applicationUrl = 'https://example.wd5.myworkdayjobs.com/en-US/early-careers/job/SE-2027'
@@ -89,4 +89,31 @@ test('does not treat malformed model JSON as a successful empty search', () => {
     name: 'Example Systems',
     officialDomains: ['careers.example.com'],
   }), /invalid job-extraction JSON/i)
+})
+
+test('cleans page boilerplate and duplicate content while enforcing the configured description limit', () => {
+  const cleaned = cleanJobPageContent([
+    '<script>tracking code</script>',
+    '<nav>Home | About | Careers</nav>',
+    '<div class="cookie-consent">Accept all cookies</div>',
+    '<main><p>Software Engineer Intern 2027.</p><p>Software Engineer Intern 2027.</p>',
+    '<p>Applications are open.</p></main>',
+  ].join(''), 1000)
+  assert.match(cleaned, /Software Engineer Intern 2027/)
+  assert.match(cleaned, /Applications are open/)
+  assert.doesNotMatch(cleaned, /tracking code|Home \| About|Accept all cookies/)
+  assert.equal(cleaned.match(/Software Engineer Intern 2027/g).length, 1)
+  assert.equal(cleanJobPageContent('Relevant job description '.repeat(20), 120).length, 120)
+})
+
+test('deduplicates jobs by canonical application URL and company/title', () => {
+  const jobs = deduplicateExtractedJobs([
+    { company: 'Example Systems', title: 'Engineer', applicationUrl: 'https://www.example.com/apply?utm_source=search' },
+    { company: 'Other Systems', title: 'Different title', applicationUrl: 'https://example.com/apply' },
+    { company: ' example systems ', title: 'Engineer', applicationUrl: 'https://example.com/another-role' },
+    { company: 'Example Systems', title: 'Designer', applicationUrl: 'https://example.com/designer' },
+  ])
+  assert.equal(jobs.length, 2)
+  assert.equal(jobs[0].title, 'Engineer')
+  assert.equal(jobs[1].title, 'Designer')
 })

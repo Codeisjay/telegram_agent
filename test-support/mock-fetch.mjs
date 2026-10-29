@@ -41,6 +41,15 @@ globalThis.fetch = async (input, init) => {
   if (url.hostname === 'api.tavily.com') {
     const request = JSON.parse(init.body)
     if (url.pathname.endsWith('/search')) {
+      if (request.query.includes('Large Jobs Co')) {
+        return Response.json({
+          results: ['token-limit-27', 'job-a-27', 'job-b-27'].map((jobId) => ({
+            title: `Software Engineer Intern ${jobId}`,
+            url: `https://careers.example.com/jobs/${jobId}`,
+            content: 'Official internship vacancy.',
+          })),
+        })
+      }
       if (request.query.trimStart().startsWith('FailCo ')) {
         return Response.json({ error: { message: 'Temporary search failure' } }, { status: 503 })
       }
@@ -92,28 +101,127 @@ globalThis.fetch = async (input, init) => {
         throw new DOMException('The operation timed out.', 'TimeoutError')
       }
       return Response.json({
-        results: request.urls.map((pageUrl) => ({
-          url: pageUrl,
-          raw_content: [
-            'Software Engineer Intern 2027.',
-            'Title: Software Engineer Intern.',
-            'Job ID: INT-27.',
-            'Applications are open.',
-            'Graduation year 2027.',
-            "Bachelor's degree in Computer Science.",
-            'Minimum CGPA 7.0.',
-            'No active backlogs.',
-            'Experience: 0 years of experience.',
-            'Employment type: Internship.',
-            'Location: Bengaluru.',
-            'Skills: Java and Python.',
-            'Apply by December 31, 2026.',
-          ].join(' '),
-        })),
+        results: request.urls.map((pageUrl) => {
+          if (pageUrl.includes('/token-limit-27') || pageUrl.includes('/job-a-27') || pageUrl.includes('/job-b-27')) {
+            const jobId = pageUrl.split('/').pop()
+            const title = `Software Engineer Intern ${jobId}`
+            return {
+              url: pageUrl,
+              raw_content: [
+                `<script>${'tracking script '.repeat(12000)}</script>`,
+                `<nav>${'Home Careers About '.repeat(5000)}</nav>`,
+                `${title}.`,
+                `Title: ${title}.`,
+                `Job ID: ${jobId}.`,
+                'Applications are open.',
+                'Graduation year 2027.',
+                "Bachelor's degree in Computer Science.",
+                'Minimum CGPA 7.0.',
+                'No active backlogs.',
+                'Experience: 0 years of experience.',
+                'Employment type: Internship.',
+                'Location: Bengaluru.',
+                'Skills: Java and Python.',
+                'Apply by December 31, 2026.',
+              ].join('\n'),
+            }
+          }
+          return {
+            url: pageUrl,
+            raw_content: [
+              'Software Engineer Intern 2027.',
+              'Title: Software Engineer Intern.',
+              'Job ID: INT-27.',
+              'Applications are open.',
+              'Graduation year 2027.',
+              "Bachelor's degree in Computer Science.",
+              'Minimum CGPA 7.0.',
+              'No active backlogs.',
+              'Experience: 0 years of experience.',
+              'Employment type: Internship.',
+              'Location: Bengaluru.',
+              'Skills: Java and Python.',
+              'Apply by December 31, 2026.',
+            ].join(' '),
+          }
+        }),
       })
     }
     return Response.json({
       results: [{ title: 'Test source', url: 'https://example.test', content: 'Test search result.' }],
+    })
+  }
+
+  if (url.hostname === 'openrouter.ai' && url.pathname.endsWith('/chat/completions')) {
+    const request = JSON.parse(init.body)
+    const authorization = new Headers(init?.headers).get('authorization')
+    if (!authorization?.startsWith('Bearer ')) {
+      return Response.json({ error: { message: 'Invalid API Key' } }, { status: 401 })
+    }
+    if (request.model !== 'perplexity/sonar') {
+      return Response.json({ error: { message: 'Unexpected OpenRouter model.' } }, { status: 400 })
+    }
+    const instructions = request.messages[0].content
+    if (!instructions.includes('Extract only current job vacancies')) {
+      return Response.json({ choices: [{ message: { content: 'Mock OpenRouter response' } }] })
+    }
+    if (instructions.includes('LlmFailCo')) {
+      return Response.json({ error: { message: 'Temporary LLM failure.' } }, { status: 503 })
+    }
+    const pageData = instructions.match(/Fetched official career pages:\s*([\s\S]+)$/)?.[1] || '[]'
+    const pages = JSON.parse(pageData)
+    if (pages.length !== 1) {
+      return Response.json({ error: { message: 'Expected one page per job extraction request.' } }, { status: 400 })
+    }
+    if (pages[0].url.includes('/token-limit-27')) {
+      return Response.json({ error: { message: 'Prompt tokens limit exceeded: 13283 > 11938' } }, { status: 400 })
+    }
+    const content = pages[0].content
+    const excerpt = (text) => content.includes(text) ? text : undefined
+    const company = instructions.match(/Company: ([^.]+)/)?.[1] || 'Large Jobs Co'
+    const jobId = pages[0].url.split('/').pop()
+    const title = `Software Engineer Intern ${jobId}`
+    return Response.json({
+      choices: [{
+        message: {
+          content: JSON.stringify([{
+            company,
+            title,
+            sourceUrl: pages[0].url,
+            jobId,
+            location: 'Bengaluru',
+            deadline: 'December 31, 2026',
+            experience: '0 years of experience',
+            maxBacklogs: 0,
+            backlogRequirement: 'No active backlogs',
+            eligibleGraduationYears: ['2027'],
+            requiredDegrees: ["Bachelor's degree"],
+            requiredBranches: ['Computer Science'],
+            minimumCgpa: 7,
+            skills: ['Java', 'Python'],
+            employmentType: 'Internship',
+            salary: '',
+            openStatus: 'open',
+            evidence: {
+              title: excerpt(`Title: ${title}.`),
+              openStatus: excerpt('Applications are open.'),
+              jobId: excerpt(`Job ID: ${jobId}.`),
+              location: excerpt('Location: Bengaluru.'),
+              deadline: excerpt('Apply by December 31, 2026.'),
+              eligibleGraduationYears: excerpt('Graduation year 2027.'),
+              requiredDegrees: excerpt("Bachelor's degree in Computer Science."),
+              requiredBranches: excerpt("Bachelor's degree in Computer Science."),
+              minimumCgpa: excerpt('Minimum CGPA 7.0.'),
+              maxBacklogs: excerpt('No active backlogs.'),
+              backlogRequirement: excerpt('No active backlogs.'),
+              experience: excerpt('Experience: 0 years of experience.'),
+              employmentType: excerpt('Employment type: Internship.'),
+              skills: excerpt('Skills: Java and Python.'),
+            },
+          }]),
+        },
+      }],
+      usage: { prompt_tokens: Math.ceil(JSON.stringify(request.messages).length / 3), completion_tokens: 300 },
     })
   }
 

@@ -7,6 +7,62 @@ function quoteIsPresent(text, quote) {
   return normalizedQuote.length >= 12 && normalizedText(text).includes(normalizedQuote)
 }
 
+export function cleanJobPageContent(content, maxCharacters = 8000) {
+  const maximum = Number.isInteger(maxCharacters) && maxCharacters > 0 ? maxCharacters : 8000
+  const cleanedHtml = String(content || '')
+    .replace(/<(script|style|nav|header|footer|aside|form|iframe|noscript)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '\n')
+    .replace(/<(div|section|ul|ol)[^>]*(?:id|class)=["'][^"']*(?:cookie|consent|navigation|menu|footer|header|social|share)[^"']*["'][^>]*>[\s\S]*?<\/\1\s*>/gi, '\n')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+  const boilerplate = /\b(cookie preferences|cookie settings|accept all cookies|manage cookies|privacy choices|skip to content|all rights reserved|subscribe to our newsletter|follow us on)\b/i
+  const seen = new Set()
+  const paragraphs = cleanedHtml
+    .split(/\r?\n|(?<=[.!?])\s{2,}/)
+    .map((paragraph) => paragraph.replace(/\s+/g, ' ').trim())
+    .filter((paragraph) => paragraph && !boilerplate.test(paragraph))
+    .filter((paragraph) => {
+      const normalized = normalizedText(paragraph)
+      if (seen.has(normalized)) return false
+      seen.add(normalized)
+      return true
+    })
+  return paragraphs.join('\n').slice(0, maximum)
+}
+
+function canonicalUrl(value) {
+  try {
+    const url = new URL(value)
+    if (!['http:', 'https:'].includes(url.protocol)) return ''
+    url.hash = ''
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(utm_.+|ref|source|campaign|trk)$/i.test(key)) url.searchParams.delete(key)
+    }
+    url.hostname = url.hostname.toLowerCase().replace(/^www\./, '')
+    url.pathname = url.pathname.replace(/\/+$/, '') || '/'
+    return url.toString()
+  } catch {
+    return ''
+  }
+}
+
+export function deduplicateExtractedJobs(jobs) {
+  const seenUrls = new Set()
+  const seenEmployerTitles = new Set()
+  return jobs.filter((job) => {
+    const url = canonicalUrl(job.applicationUrl)
+    const employerTitle = `${normalizedText(job.company)}|${normalizedText(job.title)}`
+    if ((url && seenUrls.has(url)) || seenEmployerTitles.has(employerTitle)) return false
+    if (url) seenUrls.add(url)
+    seenEmployerTitles.add(employerTitle)
+    return true
+  })
+}
+
 export function extractJson(content) {
   if (Array.isArray(content)) return content
   const cleaned = String(content || '').trim()

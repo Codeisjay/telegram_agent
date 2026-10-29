@@ -230,6 +230,48 @@ test('job research verifies official pages, stores evidence, and deduplicates re
   assert.equal(secondState.providerUsage.filter((entry) => entry.operation === 'job-analysis').length, 1)
 })
 
+test('OpenRouter job extraction bounds prompts, retries token limits, and continues other jobs', async () => {
+  for (const [name, value] of [
+    ['OPENROUTER_API_KEY', 'test-openrouter-key'],
+    ['TAVILY_SEARCH_KEY', 'test-tavily-key'],
+  ]) {
+    const saved = await fetch(`${baseUrl}/api/secrets`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, value }),
+    })
+    assert.equal(saved.status, 200)
+  }
+
+  const settings = await fetch(`${baseUrl}/api/jobs/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      provider: 'openrouter',
+      targetGraduationYear: 2027,
+      companies: [{ name: 'Large Jobs Co', officialDomains: ['careers.example.com'] }],
+    }),
+  })
+  assert.equal(settings.status, 200)
+
+  const run = await fetch(`${baseUrl}/api/jobs/run`, { method: 'POST' })
+  const result = await run.json()
+  assert.equal(run.status, 200, result.error)
+  assert.equal(result.status, 'completed')
+
+  const jobs = (await fetch(`${baseUrl}/api/jobs`).then((response) => response.json())).jobs
+    .filter((job) => job.company === 'Large Jobs Co')
+  assert.equal(jobs.length, 2)
+  assert.deepEqual(new Set(jobs.map((job) => job.jobId)), new Set(['job-a-27', 'job-b-27']))
+
+  const state = await fetch(`${baseUrl}/api/jobs/state`).then((response) => response.json())
+  const analyses = state.providerUsage.filter((entry) => entry.provider === 'openrouter' && entry.operation === 'job-analysis')
+  assert.equal(analyses.length, 5, JSON.stringify(analyses))
+  assert.equal(analyses.filter((entry) => entry.status === '400').length, 3)
+  assert.equal(analyses.filter((entry) => entry.status === '200').length, 2)
+  assert.equal(state.runs[0].status, 'completed')
+})
+
 test('job research reports provider/search failures as failed runs', async () => {
   const settingsResponse = await fetch(`${baseUrl}/api/jobs/settings`, {
     method: 'PUT',
@@ -543,6 +585,8 @@ test('production requires dashboard authentication and serves the built dashboar
     AGENTFLOW_USERNAME: 'deploy-admin',
     AGENTFLOW_PASSWORD: 'a-long-test-password-123',
     AGENTFLOW_DATA_DIR: path.join(tempRoot, 'production-data'),
+    OPENROUTER_API_KEY: 'test-openrouter-key',
+    TAVILY_SEARCH_KEY: 'test-tavily-key',
   })
   server = production.child
   try {
@@ -555,6 +599,10 @@ test('production requires dashboard authentication and serves the built dashboar
     assert.equal(health.status, 200)
     assert.deepEqual(Object.keys(await health.json()).sort(), ['ok', 'service'])
 
+    const invalidHealthMethod = await fetch(`${productionUrl}/api/health`, { method: 'POST' })
+    assert.equal(invalidHealthMethod.status, 405)
+    assert.equal(invalidHealthMethod.headers.get('allow'), 'GET')
+
     const authorization = `Basic ${Buffer.from('deploy-admin:a-long-test-password-123').toString('base64')}`
     const dashboard = await fetch(productionUrl, { headers: { authorization } })
     assert.equal(dashboard.status, 200)
@@ -564,6 +612,98 @@ test('production requires dashboard authentication and serves the built dashboar
     assert.equal(deniedApi.status, 401)
     const authorizedApi = await fetch(`${productionUrl}/api/jobs/state`, { headers: { authorization } })
     assert.equal(authorizedApi.status, 200)
+
+    const deniedCron = await fetch(`${productionUrl}/api/cron/jobs`, { method: 'POST' })
+    assert.equal(deniedCron.status, 401)
+    assert.doesNotMatch(await deniedCron.text(), /test-tavily-key|a-long-test-password-123/)
+
+    const invalidAuthorization = `Basic ${Buffer.from('deploy-admin:wrong-password').toString('base64')}`
+    const invalidCron = await fetch(`${productionUrl}/api/cron/jobs`, {
+      method: 'POST',
+      headers: { authorization: invalidAuthorization },
+    })
+    assert.equal(invalidCron.status, 401)
+
+    const wrongMethod = await fetch(`${productionUrl}/api/cron/jobs`, { headers: { authorization } })
+    assert.equal(wrongMethod.status, 405)
+    assert.equal(wrongMethod.headers.get('allow'), 'POST')
+
+    const settings = await fetch(`${productionUrl}/api/jobs/settings`, {
+      method: 'PUT',
+      headers: { authorization, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'openrouter',
+        targetGraduationYear: 2027,
+        companies: [{ name: 'LlmFailCo', officialDomains: ['careers.example.com'] }],
+      }),
+    })
+    assert.equal(settings.status, 200)
+
+    const failedCronResponse = await fetch(`${productionUrl}/api/cron/jobs`, {
+      method: 'POST',
+      headers: { authorization },
+    })
+    const failedCronResult = await failedCronResponse.json()
+    assert.equal(failedCronResponse.status, 502)
+    assert.match(failedCronResult.error, /Temporary LLM failure/)
+    assert.doesNotMatch(failedCronResult.error, /test-openrouter-key|test-tavily-key|a-long-test-password-123/)
+
+    const retrySettings = await fetch(`${productionUrl}/api/jobs/settings`, {
+      method: 'PUT',
+      headers: { authorization, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'openrouter',
+        targetGraduationYear: 2027,
+        companies: [{ name: 'Example Systems', officialDomains: ['careers.example.com'] }],
+      }),
+    })
+    assert.equal(retrySettings.status, 200)
+
+    const simultaneousCronResponses = await Promise.all([0, 1].map(() => fetch(`${productionUrl}/api/cron/jobs`, {
+      method: 'POST',
+      headers: { authorization },
+    })))
+    const simultaneousResults = await Promise.all(simultaneousCronResponses.map((response) => response.json()))
+    assert.deepEqual(simultaneousCronResponses.map((response) => response.status).sort(), [200, 409])
+    const cronResult = simultaneousResults[simultaneousCronResponses.findIndex((response) => response.status === 200)]
+    assert.equal(cronResult.status, 'completed')
+    assert.equal(cronResult.replayed, false)
+
+    const replayResponse = await fetch(`${productionUrl}/api/cron/jobs`, {
+      method: 'POST',
+      headers: { authorization },
+    })
+    const replayResult = await replayResponse.json()
+    assert.equal(replayResponse.status, 200)
+    assert.equal(replayResult.replayed, true)
+    assert.equal(replayResult.runId, cronResult.runId)
+    const state = await fetch(`${productionUrl}/api/jobs/state`, { headers: { authorization } }).then((response) => response.json())
+    const cronRuns = state.runs.filter((run) => run.trigger === 'external-cron')
+    assert.equal(cronRuns.length, 2)
+    assert.ok(cronRuns.some((run) => run.status === 'failed'))
+    assert.ok(cronRuns.some((run) => run.status === 'completed'))
+    assert.doesNotMatch(JSON.stringify(cronRuns), /test-openrouter-key|test-tavily-key|a-long-test-password-123/)
+
+    const productionStopped = new Promise((resolve) => server.once('exit', resolve))
+    server.kill('SIGTERM')
+    await productionStopped
+    const restarted = startTestBackend({
+      NODE_ENV: 'production',
+      AGENTFLOW_HOST: '127.0.0.1',
+      AGENTFLOW_USERNAME: 'deploy-admin',
+      AGENTFLOW_PASSWORD: 'a-long-test-password-123',
+      AGENTFLOW_DATA_DIR: path.join(tempRoot, 'production-data'),
+      OPENROUTER_API_KEY: 'test-openrouter-key',
+      TAVILY_SEARCH_KEY: 'test-tavily-key',
+    })
+    server = restarted.child
+    const restartedUrl = await restarted.started
+    const restartReplay = await fetch(`${restartedUrl}/api/cron/jobs`, {
+      method: 'POST',
+      headers: { authorization },
+    }).then((response) => response.json())
+    assert.equal(restartReplay.replayed, true)
+    assert.equal(restartReplay.runId, cronResult.runId)
   } finally {
     if (server.exitCode === null) {
       const productionStopped = new Promise((resolve) => server.once('exit', resolve))

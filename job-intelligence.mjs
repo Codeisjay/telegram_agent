@@ -481,6 +481,19 @@ export class JobDatabase {
       this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (6, ?)')
         .run(updatedAt)
     }
+    if (!this.db.prepare('SELECT 1 FROM schema_migrations WHERE version = 7').get()) {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS cron_executions (
+        execution_key TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        result_json TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER NOT NULL DEFAULT 0
+      )`)
+      this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)')
+        .run(new Date().toISOString())
+    }
     const schedule = this.db.prepare('SELECT next_run_at FROM scheduler_state WHERE id = 1').get()
     if (!schedule.next_run_at) {
       this.db.prepare('UPDATE scheduler_state SET next_run_at = ?, updated_at = ? WHERE id = 1')
@@ -587,8 +600,11 @@ export class JobDatabase {
 
   recoverInterruptedRuns() {
     const now = new Date().toISOString()
-    return this.db.prepare("UPDATE search_runs SET status='failed', completed_at=?, error='Process stopped during this run.' WHERE status='running'")
+    const recoveredRuns = this.db.prepare("UPDATE search_runs SET status='failed', completed_at=?, error='Process stopped during this run.' WHERE status='running'")
       .run(now).changes
+    this.db.prepare(`UPDATE cron_executions SET status='failed', completed_at=?,
+      error='Service restarted during cron execution.' WHERE status='running'`).run(now)
+    return recoveredRuns
   }
 
   markMissedRun(error = 'Scheduled run was missed while the service was stopped.') {
@@ -621,6 +637,33 @@ export class JobDatabase {
 
   getRun(id) {
     return this.db.prepare('SELECT * FROM search_runs WHERE id=?').get(id)
+  }
+
+  getCronExecution(executionKey) {
+    return this.db.prepare('SELECT * FROM cron_executions WHERE execution_key=?').get(executionKey)
+  }
+
+  startCronExecution(executionKey) {
+    const now = new Date().toISOString()
+    return this.db.prepare(`INSERT INTO cron_executions(execution_key, status, started_at)
+      VALUES(?, 'running', ?)
+      ON CONFLICT(execution_key) DO UPDATE SET status='running', result_json='', error='',
+        started_at=excluded.started_at, completed_at='', duration_ms=0
+      WHERE cron_executions.status='failed'`).run(executionKey, now).changes === 1
+  }
+
+  completeCronExecution(executionKey, result, durationMs) {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE cron_executions SET status='completed', result_json=?, error='',
+      completed_at=?, duration_ms=? WHERE execution_key=? AND status='running'`)
+      .run(JSON.stringify(result), now, Math.max(0, Math.round(durationMs)), executionKey)
+  }
+
+  failCronExecution(executionKey, error, durationMs) {
+    const now = new Date().toISOString()
+    this.db.prepare(`UPDATE cron_executions SET status='failed', result_json='', error=?,
+      completed_at=?, duration_ms=? WHERE execution_key=? AND status='running'`)
+      .run(String(error).slice(0, 350), now, Math.max(0, Math.round(durationMs)), executionKey)
   }
 
   listRuns(limit = 20) {

@@ -13,6 +13,11 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
   are instructed to rely on retrieved results, report when claims cannot be
   verified, and cite source links returned by search. If there are no usable
   results, the agent does not generate a speculative answer.
+- **Job extraction:** Google/Microsoft and other configured employer searches
+  clean and process each official job page independently, with bounded prompts
+  and isolated retries. Optional `AGENTFLOW_JOB_PROMPT_TOKEN_BUDGET` and
+  `AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS` environment variables tune the
+  conservative prompt-token budget and per-page text limit.
 - **Telegram interaction:** Use `/start`, `/search <question>`, and
   `/summary <question>` or send a plain-text question. Long replies are split
   into Telegram-sized messages.
@@ -135,12 +140,58 @@ deploy it as a Static Site). In the service's Environment settings, add:
   `TELEGRAM_BOT_TOKEN`.
 
 Render supplies `PORT`; leave `AGENTFLOW_PORT` unset so the app listens on
-Render's assigned port. Configure the health check path as `/api/health`.
-Attach a persistent disk mounted at `/data` to retain the SQLite database and
-credentials saved from the dashboard across deploys. When a Telegram bot token
-is configured, polling starts automatically at service startup; no dashboard
-start action is needed. For continuous Telegram listening, use an always-on
-service plan; an instance that sleeps or is stopped cannot poll Telegram.
+Render's assigned port. Configure Render's health check path as `/api/health`.
+To reduce idle spin-downs, configure cron-job.org to send a lightweight request
+to that health endpoint:
+
+- **URL:** `https://<your-render-service>.onrender.com/api/health`
+- **Method:** `GET`
+- **Authentication/headers:** none
+- **Body:** none
+- **Schedule:** every 5 minutes
+
+The health endpoint returns HTTP 200 with `{"ok":true,"service":"agentflow-api"}`
+and does not run a job search. Do not ping `/` (dashboard Basic Auth protects it)
+or `/api/cron/jobs` (that is an authenticated job-search trigger).
+
+Separately, `POST /api/cron/jobs` can trigger the daily search if desired. It uses
+the same HTTP Basic credentials as the dashboard, shares a persistent daily
+idempotency record with the in-process scheduler, and replays the recorded result
+for same-day retries instead of repeating searches. It requires no request body.
+Configure that separate daily task only if daily execution is wanted:
+
+- **URL:** `https://<your-render-service>.onrender.com/api/cron/jobs`
+- **Method:** `POST`
+- **Authentication:** HTTP Basic using `AGENTFLOW_USERNAME` and
+  `AGENTFLOW_PASSWORD`.
+- **Body:** none
+- **Schedule:** once daily at 09:00 Asia/Kolkata (03:30 UTC)
+
+The job endpoint returns HTTP 200 with the recorded run ID, outcome, and counts
+on success; a duplicate same-day request returns that result with
+`replayed: true`. It returns 401 for missing/invalid Basic credentials, 409 while
+the daily run is already in progress, and a useful error status if the run
+fails.
+
+When a Telegram bot token is configured, polling starts automatically at
+service startup. Render Free web services spin down after 15 minutes without
+inbound traffic and may take about a minute to wake. A successful request every
+5 minutes should normally count as inbound activity and avoid idle spin-down, but
+it is not a guarantee of uninterrupted uptime: the external schedule can fail,
+Render can restart or suspend a free service, and free instances have monthly
+usage limits. If requests stop long enough for the service to sleep, the next
+ping wakes it; the in-process scheduler and Telegram polling are unavailable
+until startup completes. Free Render services also have ephemeral filesystems,
+so SQLite data and credentials saved through the dashboard can be lost on
+restart, spin-down, or deploy. Persistent disks require a paid Render service.
+For continuously available Telegram polling and durable SQLite, use one always-on
+paid web service with a persistent disk mounted at `/data`; this existing
+single-process architecture does not need a separate worker. A Render Cron Job
+is not a drop-in replacement: it costs at least $1/month, cannot use a persistent
+disk, and the current server entry point starts the web server rather than a
+run-and-exit job. An external scheduler can be free, but cannot eliminate
+Render's restarts or free-tier availability/data limits.
+
 After deployment, open the service URL and sign in using the configured
 dashboard credentials.
 

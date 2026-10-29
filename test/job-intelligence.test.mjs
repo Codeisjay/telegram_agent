@@ -136,10 +136,29 @@ test('old verification is not presented as current open evidence', () => {
 
 test('persistent run records recover interrupted work as a failure', () => {
   const runId = database.createRun('simulated-crash')
+  assert.equal(database.startCronExecution('test-interrupted-cron'), true)
   assert.equal(database.recoverInterruptedRuns(), 1)
   assert.equal(database.getRun(runId).status, 'failed')
+  assert.equal(database.getCronExecution('test-interrupted-cron').status, 'failed')
+  assert.equal(database.getCronExecution('test-interrupted-cron').error, 'Service restarted during cron execution.')
   const missedRunId = database.markMissedRun()
   assert.equal(database.getRun(missedRunId).status, 'missed')
+})
+
+test('daily cron executions retain outcomes and allow retry only after failure', () => {
+  const executionKey = 'test-daily-cron'
+  assert.equal(database.startCronExecution(executionKey), true)
+  assert.equal(database.startCronExecution(executionKey), false)
+  database.failCronExecution(executionKey, 'sanitized test failure', 12.6)
+  assert.equal(database.getCronExecution(executionKey).status, 'failed')
+  assert.equal(database.startCronExecution(executionKey), true)
+  const result = { runId: 99, status: 'completed', newJobsCount: 2 }
+  database.completeCronExecution(executionKey, result, 45.4)
+  const completed = database.getCronExecution(executionKey)
+  assert.equal(completed.status, 'completed')
+  assert.deepEqual(JSON.parse(completed.result_json), result)
+  assert.equal(completed.duration_ms, 45)
+  assert.equal(database.startCronExecution(executionKey), false)
 })
 
 test('database backup can be reopened with jobs and evidence intact', async () => {
@@ -148,7 +167,7 @@ test('database backup can be reopened with jobs and evidence intact', async () =
   const restored = await JobDatabase.open(backupPath)
   assert.equal(restored.listJobs().length, database.listJobs().length)
   assert.ok(restored.listJobs().some((job) => job.sources.length > 0 && job.evidence.length > 0))
-  assert.equal(restored.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 6)
+  assert.equal(restored.db.prepare('SELECT MAX(version) AS version FROM schema_migrations').get().version, 7)
   restored.close()
 })
 
