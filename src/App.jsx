@@ -349,7 +349,7 @@ function App() {
       </div>
 
       {active === 'overview' && <Overview logs={logs} setLogs={setLogs} paused={paused} setPaused={setPaused} logTab={logTab} setLogTab={setLogTab} logFilter={logFilter} setLogFilter={setLogFilter} onToast={setToast} onTest={() => { setQueryOpen(true); setTestResult(null) }} agentRunning={agentStatus.running} onToggleAgent={toggleAgent} activeProvider={activeProvider} />}
-      {active === 'jobs' && <JobsPage state={jobState} loading={jobLoading} setLoading={setJobLoading} onRefresh={refreshJobState} onToast={setToast} />}
+      {active === 'jobs' && <JobsPage state={jobState} loading={jobLoading} setLoading={setJobLoading} onRefresh={refreshJobState} onToast={setToast} provider={config.provider} onProviderChange={(provider) => update('provider', provider)} />}
       {active === 'rules' && <RulesPage config={config} update={update} onToast={setToast} />}
       {active === 'models' && <ModelsPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} />}
       {active === 'telegram' && <TelegramPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} agentRunning={agentStatus.running} onToggleAgent={toggleAgent} />}

@@ -611,9 +611,11 @@ test('Telegram listener resumes after service restarts until manually stopped', 
   const updateSettings = await fetch(`${baseUrl}/api/agent/settings`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ access: 'whitelist', whitelist: [] }),
+    body: JSON.stringify({ provider: 'gemini', access: 'whitelist', whitelist: [] }),
   })
   assert.equal(updateSettings.status, 200)
+  const jobSettings = await fetch(`${baseUrl}/api/jobs/state`).then((response) => response.json())
+  assert.equal(jobSettings.settings.provider, 'gemini')
   const savedAgentPreferences = await JobDatabase.open(path.join(agentDataDirectory, 'jobs.sqlite'))
   assert.deepEqual(JSON.parse(savedAgentPreferences.db.prepare('SELECT settings_json FROM agent_preferences WHERE id=1').get().settings_json).whitelist, ['1207882899'])
   savedAgentPreferences.close()

@@ -584,8 +584,13 @@ export class JobDatabase {
   }
 
   saveAgentPreferences(settings, autoStart) {
+    const updatedAt = new Date().toISOString()
     this.db.prepare('UPDATE agent_preferences SET settings_json = ?, auto_start = ?, auto_start_configured = 1, access_configured = 1, updated_at = ? WHERE id = 1')
-      .run(JSON.stringify(settings), Number(autoStart), new Date().toISOString())
+      .run(JSON.stringify(settings), Number(autoStart), updatedAt)
+    if (['gemini', 'groq', 'openrouter'].includes(settings.provider)) {
+      this.db.prepare('UPDATE job_settings SET provider = ?, updated_at = ? WHERE id = 1')
+        .run(settings.provider, updatedAt)
+    }
     return this.getAgentPreferences()
   }
 

@@ -17,7 +17,8 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
   clean and process each official job page independently, with bounded prompts
   and isolated retries. Optional `AGENTFLOW_JOB_PROMPT_TOKEN_BUDGET` and
   `AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS` environment variables tune the
-  conservative prompt-token budget and per-page text limit.
+  conservative prompt-token budget and per-page text limit. Job intelligence
+  uses the same AI provider selected in LLM & Web Search settings.
   OpenRouter extraction retries transient in-flight credit reservation errors
   with backoff and reserves up to 1,200 completion tokens per page. If OpenRouter
   reports a lower affordable completion-token limit, extraction retries using

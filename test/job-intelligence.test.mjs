@@ -177,6 +177,7 @@ test('OpenRouter is the default and migrates saved Gemini defaults once', async 
   assert.equal(providerDatabase.getSettings().provider, 'openrouter')
   providerDatabase.saveSettings({ provider: 'gemini' })
   providerDatabase.saveAgentPreferences({ provider: 'gemini' }, true)
+  assert.equal(providerDatabase.getSettings().provider, 'gemini')
   providerDatabase.db.prepare('DELETE FROM schema_migrations WHERE version = 6').run()
   providerDatabase.close()
 

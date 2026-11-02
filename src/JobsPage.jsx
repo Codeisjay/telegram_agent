@@ -7,7 +7,7 @@ function Badge({ children, tone = 'green' }) {
   return <span className={`badge badge-${tone}`}>{children}</span>
 }
 
-export default function JobsPage({ state, loading, setLoading, onRefresh, onToast }) {
+export default function JobsPage({ state, loading, setLoading, onRefresh, onToast, provider, onProviderChange }) {
   const [profile, setProfile] = useState(null)
   const [settings, setSettings] = useState(null)
   const [companyName, setCompanyName] = useState('')
@@ -43,7 +43,7 @@ export default function JobsPage({ state, loading, setLoading, onRefresh, onToas
       const response = await fetch('/api/jobs/settings', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(next),
+        body: JSON.stringify({ ...next, provider }),
       })
       const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not save job settings.')
@@ -155,7 +155,7 @@ export default function JobsPage({ state, loading, setLoading, onRefresh, onToas
       <div className="panel-heading"><div><div className="panel-title-icon search-config-icon"><Globe2 size={16} /></div><div><h2>Official company career sites</h2><p>Research is restricted to these configured official domains.</p></div></div><button className="outline-button small-button" disabled={loading || state.runInProgress} onClick={runResearch}><Search size={14} />{loading || state.runInProgress ? 'Research running…' : 'Run research now'}</button></div>
       <div className="company-list">{settings.companies.map((company, index) => <div className="company-row" key={`${company.name}-${index}`}><strong>{company.name}</strong><div><code>{company.officialDomains.join(', ')}</code>{company.applicationDomains?.length > 0 && <small>ATS: {company.applicationDomains.join(', ')}</small>}</div><button className="icon-button" aria-label={`Remove ${company.name}`} onClick={() => persistSettings({ ...settings, companies: settings.companies.filter((_, item) => item !== index) })}><X size={14} /></button></div>)}{!settings.companies.length && <div className="job-empty">No companies configured. Add companies with their official career domains; no companies or personal details are assumed.</div>}</div>
       <div className="company-add-row"><input aria-label="Company name" placeholder="Company name" value={companyName} onChange={(event) => setCompanyName(event.target.value)} /><input aria-label="Official domains" placeholder="Employer career domain(s)" value={companyDomains} onChange={(event) => setCompanyDomains(event.target.value)} /><input aria-label="Employer-linked application domains" placeholder="Linked ATS domain(s), optional" value={applicationDomains} onChange={(event) => setApplicationDomains(event.target.value)} /><button className="outline-button small-button" onClick={addCompany}><Plus size={14} /> Add company</button></div>
-      <div className="job-preferences-row"><label>Search target graduation year <input type="number" min="2020" max="2040" value={settings.targetGraduationYear} onChange={(event) => setSettings({ ...settings, targetGraduationYear: Number(event.target.value) })} /></label><label>AI provider <select value={settings.provider} onChange={(event) => setSettings({ ...settings, provider: event.target.value })}><option value="gemini">Gemini</option><option value="groq">Groq</option><option value="openrouter">OpenRouter</option></select></label><label>Telegram notification chat ID <input value={settings.telegramChatId || ''} placeholder="Numeric chat ID" onChange={(event) => setSettings({ ...settings, telegramChatId: event.target.value })} /></label><button className="outline-button small-button" onClick={() => persistSettings()}>Save research settings</button></div>
+      <div className="job-preferences-row"><label>Search target graduation year <input type="number" min="2020" max="2040" value={settings.targetGraduationYear} onChange={(event) => setSettings({ ...settings, targetGraduationYear: Number(event.target.value) })} /></label><label>AI provider (shared with LLM settings) <select value={provider} onChange={(event) => onProviderChange(event.target.value)}><option value="gemini">Gemini</option><option value="groq">Groq</option><option value="openrouter">OpenRouter</option></select></label><label>Telegram notification chat ID <input value={settings.telegramChatId || ''} placeholder="Numeric chat ID" onChange={(event) => setSettings({ ...settings, telegramChatId: event.target.value })} /></label><button className="outline-button small-button" onClick={() => persistSettings()}>Save research settings</button></div>
     </section>
 
     <section className="panel settings-panel jobs-list-panel">
