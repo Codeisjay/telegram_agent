@@ -1,6 +1,7 @@
 const originalFetch = globalThis.fetch
 let telegramUpdateDelivered = false
 let creditCapacityRetryRequests = 0
+let creditBudgetRetryRequests = 0
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input.url)
@@ -51,7 +52,7 @@ globalThis.fetch = async (input, init) => {
           })),
         })
       }
-      if (request.query.includes('CreditRetryCo')) {
+      if (request.query.includes('CreditRetryCo') || request.query.includes('CreditBudgetCo')) {
         return Response.json({
           results: [{
             title: 'Software Engineer Intern job-a-27',
@@ -182,6 +183,16 @@ globalThis.fetch = async (input, init) => {
       return Response.json({
         error: { message: 'This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits.' },
       }, { status: 402 })
+    }
+    if (instructions.includes('CreditBudgetCo')) {
+      if (creditBudgetRetryRequests++ === 0) {
+        return Response.json({
+          error: { message: 'This request requires more credits, or fewer max_tokens. You requested up to 1200 tokens, but can only afford 434.' },
+        }, { status: 402 })
+      }
+      if (request.max_tokens !== 434) {
+        return Response.json({ error: { message: 'Retry did not use the reported completion-token limit.' } }, { status: 400 })
+      }
     }
     const pageData = instructions.match(/Fetched official career pages:\s*([\s\S]+)$/)?.[1] || '[]'
     const pages = JSON.parse(pageData)

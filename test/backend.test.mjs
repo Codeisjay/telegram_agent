@@ -317,6 +317,52 @@ test('OpenRouter job extraction retries transient in-flight credit reservation f
   assert.equal(analyses.filter((entry) => entry.status === '200').length - baselineSuccesses, 1)
 })
 
+test('OpenRouter job extraction retries with the affordable completion-token limit', async () => {
+  const baselineState = await fetch(`${baseUrl}/api/jobs/state`).then((item) => item.json())
+  const baselineAnalyses = baselineState.providerUsage.filter((entry) => entry.provider === 'openrouter'
+    && entry.operation === 'job-analysis')
+  const baselineBudgetFailures = baselineAnalyses.filter((entry) => entry.status === '402').length
+  const baselineSuccesses = baselineAnalyses.filter((entry) => entry.status === '200').length
+
+  for (const [name, value] of [
+    ['OPENROUTER_API_KEY', 'test-openrouter-key'],
+    ['TAVILY_SEARCH_KEY', 'test-tavily-key'],
+  ]) {
+    const saved = await fetch(`${baseUrl}/api/secrets`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, value }),
+    })
+    assert.equal(saved.status, 200)
+  }
+
+  const settings = await fetch(`${baseUrl}/api/jobs/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      provider: 'openrouter',
+      targetGraduationYear: 2027,
+      companies: [{ name: 'CreditBudgetCo', officialDomains: ['careers.example.com'] }],
+    }),
+  })
+  assert.equal(settings.status, 200)
+
+  const response = await fetch(`${baseUrl}/api/jobs/run`, { method: 'POST' })
+  const result = await response.json()
+  assert.equal(response.status, 200, result.error)
+  assert.equal(result.status, 'completed')
+
+  const jobs = (await fetch(`${baseUrl}/api/jobs`).then((item) => item.json())).jobs
+    .filter((job) => job.company === 'CreditBudgetCo')
+  assert.equal(jobs.length, 1)
+
+  const state = await fetch(`${baseUrl}/api/jobs/state`).then((item) => item.json())
+  const analyses = state.providerUsage.filter((entry) => entry.provider === 'openrouter'
+    && entry.operation === 'job-analysis')
+  assert.equal(analyses.filter((entry) => entry.status === '402').length - baselineBudgetFailures, 1)
+  assert.equal(analyses.filter((entry) => entry.status === '200').length - baselineSuccesses, 1)
+})
+
 test('job research reports provider/search failures as failed runs', async () => {
   const settingsResponse = await fetch(`${baseUrl}/api/jobs/settings`, {
     method: 'PUT',

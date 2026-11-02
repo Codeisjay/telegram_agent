@@ -563,6 +563,7 @@ function estimatePromptTokens(text) {
 function classifyExtractionFailure(message, status = 0) {
   if (/prompt.{0,30}tokens?.{0,30}(?:limit|exceed)|context length|maximum context|too many tokens|(?:request|input).{0,20}too large|token count/i.test(message)) return 'token_limit'
   if (/would exceed your available credits.{0,100}in.flight requests|in.flight requests settle/i.test(message)) return 'credit_capacity'
+  if (/can only afford\s+\d+/i.test(message)) return 'completion_token_budget'
   if (/insufficient credits|not enough credits|add credits|payment required/i.test(message)) return 'insufficient_credits'
   if (status === 429 || /rate.?limit|too many requests/i.test(message)) return 'rate_limit'
   if (status === 401 || status === 403 || /invalid api key|unauthorized|authentication/i.test(message)) return 'authentication'
@@ -607,6 +608,7 @@ async function extractCompanyVacancies(company, targetGraduationYear, pages, sec
   for (const page of pages) {
     const label = safeJobPageLabel(page.url)
     let pageContent = cleanJobPageContent(page.content, jobDescriptionMaxCharacters)
+    let maxCompletionTokens = 1200
     let retryCount = 0
     let completed = false
     while (!completed) {
@@ -656,7 +658,7 @@ async function extractCompanyVacancies(company, targetGraduationYear, pages, sec
               model,
               messages: [{ role: 'system', content: instructions }, { role: 'user', content: 'Extract the supported vacancies as JSON.' }],
               temperature: 0,
-              max_tokens: 1200,
+              max_tokens: openrouter ? maxCompletionTokens : 1200,
             }),
             signal: AbortSignal.timeout(45000),
           })
@@ -679,6 +681,14 @@ async function extractCompanyVacancies(company, targetGraduationYear, pages, sec
           const delayMs = retryCount === 1 ? 2000 : 5000
           logEvent('WARN', `Job extraction retry provider=${provider} model=${model} input_tokens=${estimatedTokens} batch_size=1 retry_count=${retryCount} reason=credit_capacity delay_ms=${delayMs} job=${label}`, 'search')
           await new Promise((resolve) => setTimeout(resolve, delayMs))
+          continue
+        }
+        const affordableTokens = Number(providerError.match(/can only afford\s+(\d+)/i)?.[1])
+        if (provider === 'openrouter' && failureReason === 'completion_token_budget'
+          && retryCount < 2 && affordableTokens >= 100 && affordableTokens < maxCompletionTokens) {
+          maxCompletionTokens = affordableTokens
+          retryCount++
+          logEvent('WARN', `Job extraction retry provider=${provider} model=${model} input_tokens=${estimatedTokens} batch_size=1 retry_count=${retryCount} reason=completion_token_budget max_tokens=${maxCompletionTokens} job=${label}`, 'search')
           continue
         }
         if (failureReason === 'token_limit' && retryCount < 2 && pageContent.length > 100) {
