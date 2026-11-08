@@ -8,6 +8,7 @@ import { formatTelegramAnswer } from './response-format.mjs'
 import { DailyScheduler } from './daily-scheduler.mjs'
 import { cleanJobPageContent, deduplicateExtractedJobs, extractJson, validateExtractedJobs } from './job-extraction.mjs'
 import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAuthorized, nextDailyRun, normalizeCandidateProfile, shouldNotifyJob } from './job-intelligence.mjs'
+import { DEFAULT_NEWS_CATEGORIES, NewsScheduler, buildNewsSearchQuery, deduplicateNewsResults, isQuietHours, matchNewsCategory, normalizeNewsSettings, withRateLimitRetry } from './news-intelligence.mjs'
 
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
@@ -48,6 +49,7 @@ const agent = { running: false, status: 'stopped', message: 'Agent is stopped.',
 const userRequests = new Map()
 const database = await JobDatabase.open(databaseFile)
 let jobResearchRunning = false
+let newsResearchRunning = false
 let agentStartPromise
 let agentStartGeneration = 0
 let autoStartRetryTimer
@@ -572,6 +574,25 @@ function classifyExtractionFailure(message, status = 0) {
   return 'provider'
 }
 
+function extractionRateLimitDelay(response, message, retryCount) {
+  const retryAfter = response.headers.get('retry-after')
+  let delayMs = Number(retryAfter) * 1000
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    const retryAt = retryAfter ? Date.parse(retryAfter) : NaN
+    delayMs = Number.isFinite(retryAt) ? retryAt - Date.now() : NaN
+  }
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    const retryIn = message.match(/try again in\s+(\d+(?:\.\d+)?)\s*(ms|s|seconds?|minutes?|m)\b/i)
+    if (retryIn) {
+      const amount = Number(retryIn[1])
+      const unit = retryIn[2].toLowerCase()
+      delayMs = amount * (unit === 'ms' ? 1 : unit === 'm' || unit.startsWith('minute') ? 60000 : 1000)
+    }
+  }
+  if (!Number.isFinite(delayMs) || delayMs <= 0) delayMs = retryCount === 1 ? 2000 : 5000
+  return Math.min(Math.ceil(delayMs), 60000)
+}
+
 function safeJobPageLabel(pageUrl) {
   try {
     const url = new URL(pageUrl)
@@ -683,6 +704,13 @@ async function extractCompanyVacancies(company, targetGraduationYear, pages, sec
           await new Promise((resolve) => setTimeout(resolve, delayMs))
           continue
         }
+        if (failureReason === 'rate_limit' && retryCount < 2) {
+          retryCount++
+          const delayMs = extractionRateLimitDelay(response, providerError, retryCount)
+          logEvent('WARN', `Job extraction retry provider=${provider} model=${model} input_tokens=${estimatedTokens} batch_size=1 retry_count=${retryCount} reason=rate_limit delay_ms=${delayMs} job=${label}`, 'search')
+          await new Promise((resolve) => setTimeout(resolve, delayMs))
+          continue
+        }
         const affordableTokens = Number(providerError.match(/can only afford\s+(\d+)/i)?.[1])
         if (provider === 'openrouter' && failureReason === 'completion_token_budget'
           && retryCount < 2 && affordableTokens >= 100 && affordableTokens < maxCompletionTokens) {
@@ -742,6 +770,187 @@ async function extractCompanyVacancies(company, targetGraduationYear, pages, sec
   }
   if (failures) logEvent('WARN', `Job extraction continued after ${failures} failed job page(s) for ${company.name}.`, 'search')
   return { jobs: extractedJobs, failures }
+}
+
+function buildNewsArticleSummary(article, fallback = 'This is a relevant update in your monitored areas.') {
+  return {
+    title: String(article?.title || article?.headline || 'Recent technology update').trim().slice(0, 200),
+    summary: String(article?.summary || article?.content || fallback).trim().slice(0, 450),
+    whyItMatters: String(article?.whyItMatters || 'It matters because it affects AI, software engineering, startups, or hiring trends you are tracking.').trim().slice(0, 500),
+    sourceUrl: String(article?.url || article?.sourceUrl || '').trim(),
+    source: String(article?.source || '').trim(),
+  }
+}
+
+async function searchRecentNews(secrets, categories) {
+  if (!secrets.TAVILY_SEARCH_KEY) throw serviceError('Save a Tavily Search key before enabling proactive news monitoring.', 400)
+  const response = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      api_key: secrets.TAVILY_SEARCH_KEY,
+      query: buildNewsSearchQuery(categories),
+      search_depth: 'basic',
+      max_results: 15,
+      include_answer: false,
+      topic: 'news',
+    }),
+    signal: AbortSignal.timeout(20000),
+  })
+  if (!response.ok) throw serviceError(`Tavily news search failed: ${await responseError(response)}`, 502)
+  const result = await response.json()
+  const entries = deduplicateNewsResults((Array.isArray(result.results) ? result.results : []).map((item) => ({
+    title: typeof item.title === 'string' ? item.title : '',
+    url: typeof item.url === 'string' ? item.url : '',
+    content: typeof item.content === 'string' ? item.content : (typeof item.snippet === 'string' ? item.snippet : ''),
+    source: typeof item.source === 'string' ? item.source : '',
+    publishedAt: typeof item.published_date === 'string' ? item.published_date : '',
+  }))).filter((entry) => matchNewsCategory(`${entry.title}\n${entry.content}`, categories))
+  return entries.slice(0, 12)
+}
+
+async function summarizeNewsArticles(articles, secrets) {
+  if (!articles.length) return []
+  const key = secrets.GROQ_API_KEY
+  if (!key) return articles.map((article) => buildNewsArticleSummary({
+    title: article.title,
+    summary: article.content || 'Recent update in your monitored technology categories.',
+    whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
+    url: article.url,
+    source: article.source,
+  }))
+  try {
+    const response = await withRateLimitRetry(async () => fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-120b',
+        temperature: 0.2,
+        max_tokens: 1800,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a concise technology news curator. Return only valid JSON: an array of up to 4 objects, each with "headline", "summary", "whyItMatters", and "sourceUrl". Keep each item brief and relevant to AI/ML, software engineering, startups, jobs, internships, or engineering innovation. Use only the supplied headlines and summaries; do not invent facts.',
+          },
+          {
+            role: 'user',
+            content: JSON.stringify(articles.map((article) => ({
+              title: article.title,
+              summary: article.content,
+              url: article.url,
+            })), null, 2),
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(30000),
+    }), { retries: 3, baseDelayMs: 1000 })
+    if (!response.ok) {
+      if ([429, 500, 502, 503, 504].includes(response.status)) {
+        throw Object.assign(new Error(`Groq request failed with HTTP ${response.status}.`), { status: response.status })
+      }
+      return articles.map((article) => buildNewsArticleSummary({
+        title: article.title,
+        summary: article.content || 'Recent update in your monitored technology categories.',
+        whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
+        url: article.url,
+        source: article.source,
+      }))
+    }
+    const result = await response.json()
+    const text = result.choices?.[0]?.message?.content || '[]'
+    const cleaned = text.replace(/```json|```/g, '').trim()
+    const parsed = JSON.parse(cleaned)
+    if (!Array.isArray(parsed) || !parsed.length) return articles.map((article) => buildNewsArticleSummary({
+      title: article.title,
+      summary: article.content || 'Recent update in your monitored technology categories.',
+      whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
+      url: article.url,
+      source: article.source,
+    }))
+    return parsed.slice(0, 4).map((item) => buildNewsArticleSummary({
+      title: item.headline || item.title || 'Technology update',
+      summary: item.summary || item.description || 'Recent update in your monitored categories.',
+      whyItMatters: item.whyItMatters || item.why_it_matters || 'It matches one of the business or technology topics you are tracking.',
+      url: item.sourceUrl || item.url || '',
+      source: item.source || '',
+    }))
+  } catch (error) {
+    logEvent('WARN', `Groq news summarization failed: ${error.message}`, 'search')
+    return articles.map((article) => buildNewsArticleSummary({
+      title: article.title,
+      summary: article.content || 'Recent update in your monitored technology categories.',
+      whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
+      url: article.url,
+      source: article.source,
+    }))
+  }
+}
+
+async function sendNewsNotification(chatId, article) {
+  const text = [
+    article.title,
+    article.summary,
+    `Why it matters: ${article.whyItMatters}`,
+    article.sourceUrl ? `Source: ${article.sourceUrl}` : '',
+  ].filter(Boolean).join('\n')
+  await sendTelegramMessage(chatId, text)
+}
+
+async function runNewsResearch(trigger = 'scheduled') {
+  if (newsResearchRunning) throw serviceError('A news monitoring run is already in progress.', 409)
+  newsResearchRunning = true
+  const settings = database.getNewsSettings()
+  const runId = database.createNewsRun(trigger)
+  try {
+    if (!settings.enabled && !['telegram', 'manual', 'external-cron'].includes(trigger)) {
+      return { status: 'disabled', skipped: true, delivered: 0 }
+    }
+    const secrets = await readSecrets()
+    const discovered = await searchRecentNews(secrets, settings.categories)
+    if (!discovered.length) {
+      database.completeNewsRun(runId, { status: 'skipped', discoveredCount: 0, newCount: 0, deliveredCount: 0 })
+      return { status: 'skipped', discovered: 0, delivered: 0, skipped: true }
+    }
+    const summaries = await summarizeNewsArticles(discovered, secrets)
+    let newCount = 0
+    let deliveredCount = 0
+    const chatId = database.getSettings().telegramChatId
+    for (const article of summaries.slice(0, 4)) {
+      const payload = {
+        title: article.title,
+        url: article.sourceUrl || '',
+        source: article.source || new URL(article.sourceUrl || 'https://example.com').hostname.replace(/^www\./, ''),
+        summary: article.summary,
+        whyItMatters: article.whyItMatters,
+        publishedAt: new Date().toISOString(),
+        categories: settings.categories,
+      }
+      const stored = database.upsertNewsArticle(payload)
+      if (stored.isNew) newCount++
+      if (!chatId) continue
+      const notificationKey = `telegram:${stored.id}`
+      const quiet = isQuietHours(new Date(), settings.quietStart, settings.quietEnd)
+      const dailyCount = database.countNewsNotificationsSince(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+      const canNotify = !quiet && dailyCount < settings.maxNotificationsPerDay && !database.hasNewsNotification(stored.id, notificationKey)
+      if (!canNotify) continue
+      await sendNewsNotification(chatId, payload)
+      database.recordNewsNotification(stored.id, notificationKey)
+      deliveredCount++
+    }
+    database.completeNewsRun(runId, {
+      status: 'completed',
+      discoveredCount: discovered.length,
+      newCount,
+      deliveredCount,
+    })
+    return { status: 'completed', discovered: discovered.length, new: newCount, delivered: deliveredCount, skipped: false }
+  } catch (error) {
+    const safeError = sanitizeJobError(error.message, await readSecrets().catch(() => ({})))
+    database.failNewsRun(runId, safeError)
+    throw serviceError(safeError, error.status || 502)
+  } finally {
+    newsResearchRunning = false
+  }
 }
 
 async function runJobResearch(trigger = 'manual') {
@@ -1080,6 +1289,57 @@ async function handleTelegramUpdate(update, settings) {
     database.saveSettings({ paused })
     if (!paused) database.setNextRun(nextDailyRun())
     await sendTelegramMessage(chatId, paused ? 'Daily job research paused.' : 'Daily job research resumed. The next run is scheduled for 09:00 Asia/Kolkata.')
+    return
+  }
+  if (['/news', '/news_on', '/news_off', '/news_now', '/news_settings', '/news_history'].includes(commandText)) {
+    if (!isTelegramUserAdmin(settings, userId, chatId)) {
+      await sendTelegramMessage(chatId, 'News controls require your Telegram user ID to be listed in the dashboard whitelist.')
+      return
+    }
+    const newsSettings = database.getNewsSettings()
+    if (commandText === '/news_on') {
+      database.saveNewsSettings({ ...newsSettings, enabled: true, nextRunAt: new Date(Date.now() + newsSettings.intervalHours * 60 * 60 * 1000).toISOString() })
+      await sendTelegramMessage(chatId, 'Proactive news monitoring enabled. AgentFlow will scan every 3 hours in Asia/Kolkata time and only notify when the brief is genuinely relevant.')
+      return
+    }
+    if (commandText === '/news_off') {
+      database.saveNewsSettings({ ...newsSettings, enabled: false })
+      await sendTelegramMessage(chatId, 'Proactive news monitoring disabled.')
+      return
+    }
+    if (commandText === '/news_now') {
+      const result = await runNewsResearch('telegram')
+      await sendTelegramMessage(chatId, `News scan complete: ${result.discovered || 0} discovered, ${result.new || 0} new, ${result.delivered || 0} delivered.`)
+      return
+    }
+    if (commandText === '/news_settings') {
+      const summary = [
+        `Enabled: ${newsSettings.enabled ? 'yes' : 'no'}`,
+        `Interval: every ${newsSettings.intervalHours} hours`,
+        `Categories: ${newsSettings.categories.join(', ') || 'none'}`,
+        `Max per day: ${newsSettings.maxNotificationsPerDay}`,
+        `Quiet hours: ${newsSettings.quietStart}-${newsSettings.quietEnd} Asia/Kolkata`,
+      ].join('\n')
+      await sendTelegramMessage(chatId, `News settings:\n${summary}`)
+      return
+    }
+    if (commandText === '/news_history') {
+      const notifications = database.listNewsNotifications(5)
+      if (!notifications.length) {
+        await sendTelegramMessage(chatId, 'No proactive Telegram news notifications have been sent yet.')
+        return
+      }
+      const lines = notifications.map((item) => `• ${item.title}${item.summary ? ` — ${item.summary.slice(0, 120)}` : ''}`)
+      await sendTelegramMessage(chatId, `Recent news briefings:\n${lines.join('\n')}`)
+      return
+    }
+    const articles = database.listNewsArticles(3)
+    if (!articles.length) {
+      await sendTelegramMessage(chatId, 'No recent news has been discovered yet. Use /news_now to trigger a scan.')
+      return
+    }
+    const text = articles.map((article) => `${article.title}\n${article.summary || 'Recent update'}\nSource: ${article.url || article.source}`).join('\n\n')
+    await sendTelegramMessage(chatId, `Latest monitored news:\n${text}`)
     return
   }
 
@@ -1429,6 +1689,7 @@ async function testCredential(name, secrets, draftValue) {
 }
 
 let scheduler
+let newsScheduler
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${host}:${port}`)
   try {
@@ -1490,6 +1751,34 @@ const server = createServer(async (request, response) => {
     if (request.method === 'POST' && url.pathname === '/api/jobs/run') {
       const result = await runJobResearch('manual')
       return respond(response, 200, result)
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/news') {
+      return respond(response, 200, {
+        settings: database.getNewsSettings(),
+        articles: database.listNewsArticles(10),
+        notifications: database.listNewsNotifications(10),
+        history: database.listNewsRuns(10),
+      })
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/api/news/settings') {
+      const input = await readJson(request)
+      const settings = normalizeNewsSettings(input, database.getNewsSettings())
+      return respond(response, 200, { settings: database.saveNewsSettings(settings) })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/cron/news') {
+      const result = await runNewsResearch('external-cron')
+      return respond(response, 200, result)
+    }
+    if (url.pathname === '/api/cron/news') {
+      response.writeHead(405, {
+        allow: 'POST',
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      })
+      return response.end(JSON.stringify({ error: 'Use POST to trigger the proactive news scan.' }))
     }
 
     if (request.method === 'POST' && url.pathname === '/api/cron/jobs') {
@@ -1623,6 +1912,13 @@ server.listen(port, host, () => {
     onError: (error) => logEvent('500 ERROR', `Daily job scheduler failed: ${error.message}`, 'errors'),
   })
   scheduler.start().catch((error) => logEvent('500 ERROR', `Could not initialize daily scheduler: ${error.message}`, 'errors'))
+  newsScheduler = new NewsScheduler({
+    database,
+    run: runNewsResearch,
+    onError: (error) => logEvent('500 ERROR', `News scheduler failed: ${error.message}`, 'errors'),
+    intervalMs: 30000,
+  })
+  newsScheduler.start().catch((error) => logEvent('500 ERROR', `Could not initialize proactive news scheduler: ${error.message}`, 'errors'))
   const preferences = database.getAgentPreferences()
   if (preferences.autoStart) {
     startTelegramAgentAutomatically(preferences.settings)
@@ -1633,6 +1929,7 @@ const shutdown = () => {
   agent.controller?.abort()
   server.close(() => {
     scheduler?.stop()
+    newsScheduler?.stop()
     database.close()
     process.exit(0)
   })

@@ -4,7 +4,7 @@ import {
   Bot, BriefcaseBusiness, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, CircleHelp,
   Clock3, Command, Copy, Cpu, ExternalLink, Eye, EyeOff, FileText, Filter, FlaskConical,
   Globe2, KeyRound, LayoutDashboard, LockKeyhole, Menu, MessageCircle,
-  MoreHorizontal, Pause, Play, Plus, Radio, RefreshCw, Search, Send, Settings2,
+  MoreHorizontal, Newspaper, Pause, Play, Plus, Radio, RefreshCw, Search, Send, Settings2,
   Shield, SlidersHorizontal, Sparkles, Terminal, Trash2, TrendingUp, Webhook,
   X, Zap,
 } from 'lucide-react'
@@ -18,6 +18,7 @@ const navItems = [
   { id: 'jobs', label: 'Job intelligence', icon: BriefcaseBusiness },
   { id: 'rules', label: 'Prompt & Rules', icon: SlidersHorizontal },
   { id: 'models', label: 'LLM & Web Search', icon: Cpu },
+  { id: 'news', label: 'News interests', icon: Newspaper },
   { id: 'telegram', label: 'Telegram Settings', icon: Send },
 ]
 
@@ -340,7 +341,7 @@ function App() {
 
     <main className={`main-content ${collapsed ? 'main-expanded' : ''}`}>
       <div className="page-heading">
-        <div><div className="breadcrumbs">Workspace <ChevronRight size={13} /> <span>{navItems.find((item) => item.id === active)?.label}</span></div><h1>{active === 'overview' ? 'Overview' : active === 'jobs' ? 'Job intelligence' : active === 'rules' ? 'Prompt & rules' : active === 'models' ? 'LLM & web search' : 'Telegram settings'}</h1><p>{active === 'overview' ? 'Monitor your agent’s performance and recent activity.' : active === 'jobs' ? 'Find verified internship and fresher openings against your candidate profile.' : active === 'rules' ? 'Shape how your agent thinks, responds, and formats results.' : active === 'models' ? 'Manage your AI providers, search behavior, and API credentials.' : 'Configure your Telegram connection, commands, and access.'}</p></div>
+        <div><div className="breadcrumbs">Workspace <ChevronRight size={13} /> <span>{navItems.find((item) => item.id === active)?.label}</span></div><h1>{active === 'overview' ? 'Overview' : active === 'jobs' ? 'Job intelligence' : active === 'rules' ? 'Prompt & rules' : active === 'models' ? 'LLM & web search' : active === 'news' ? 'News interests' : 'Telegram settings'}</h1><p>{active === 'overview' ? 'Monitor your agent’s performance and recent activity.' : active === 'jobs' ? 'Find verified internship and fresher openings against your candidate profile.' : active === 'rules' ? 'Shape how your agent thinks, responds, and formats results.' : active === 'models' ? 'Manage your AI providers, search behavior, and API credentials.' : active === 'news' ? 'Choose the topics AgentFlow monitors and sends to your Telegram chat.' : 'Configure your Telegram connection, commands, and access.'}</p></div>
         <div className="heading-actions">
           <button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={15} /><span>Search anything...</span><kbd><Command size={11} /> K</kbd></button>
           <IconButton label="Toggle theme" onClick={() => setDark(!dark)}><Sparkles size={17} /></IconButton>
@@ -352,6 +353,7 @@ function App() {
       {active === 'jobs' && <JobsPage state={jobState} loading={jobLoading} setLoading={setJobLoading} onRefresh={refreshJobState} onToast={setToast} provider={config.provider} onProviderChange={(provider) => update('provider', provider)} />}
       {active === 'rules' && <RulesPage config={config} update={update} onToast={setToast} />}
       {active === 'models' && <ModelsPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} />}
+      {active === 'news' && <NewsInterestsPage onToast={setToast} />}
       {active === 'telegram' && <TelegramPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} agentRunning={agentStatus.running} onToggleAgent={toggleAgent} />}
       <footer className="page-footer"><span>AgentFlow AI <span className="footer-sep">/</span> Control Center</span><span>All changes saved automatically <span className="save-indicator" /></span></footer>
     </main>
@@ -440,6 +442,108 @@ function TrafficChart({ logs }) {
 
 function SectionHeader({ eyebrow, title, description, action }) {
   return <div className="section-heading"><div><span className="eyebrow">{eyebrow}</span><h2>{title}</h2><p>{description}</p></div>{action}</div>
+}
+
+const defaultNewsTopics = [
+  'AI/ML',
+  'Generative AI',
+  'Software engineering',
+  'Technology',
+  'Indian startups',
+  'Fresher jobs',
+  'Internships',
+  'Engineering innovations',
+]
+
+function NewsInterestsPage({ onToast }) {
+  const [settings, setSettings] = useState(null)
+  const [topicDraft, setTopicDraft] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let mounted = true
+    fetch('/api/news')
+      .then(async (response) => {
+        const result = await readApiResponse(response)
+        if (!response.ok) throw new Error(result.error || 'Could not load news settings.')
+        if (mounted) setSettings(result.settings)
+      })
+      .catch((error) => {
+        if (mounted) onToast(error.message || 'Could not load news settings.')
+      })
+      .finally(() => {
+        if (mounted) setLoading(false)
+      })
+    return () => { mounted = false }
+  }, [onToast])
+
+  const updateSettings = (patch) => setSettings((current) => ({ ...current, ...patch }))
+  const addTopic = (event) => {
+    event.preventDefault()
+    const topic = topicDraft.trim().replace(/\s+/g, ' ')
+    if (!topic) return
+    if (settings.categories.some((category) => category.toLowerCase() === topic.toLowerCase())) {
+      onToast('That topic is already in your list.')
+      return
+    }
+    if (settings.categories.length >= 15) {
+      onToast('You can monitor up to 15 topics.')
+      return
+    }
+    updateSettings({ categories: [...settings.categories, topic] })
+    setTopicDraft('')
+  }
+  const saveSettings = async () => {
+    setSaving(true)
+    try {
+      const response = await fetch('/api/news/settings', {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(settings),
+      })
+      const result = await readApiResponse(response)
+      if (!response.ok) throw new Error(result.error || 'Could not save news settings.')
+      setSettings(result.settings)
+      onToast('News monitoring settings saved.')
+    } catch (error) {
+      onToast(error.message || 'Could not save news settings.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <div className="settings-page">
+    <SectionHeader eyebrow="PERSONALIZED MONITORING" title="News interests" description="Add the subjects you care about. AgentFlow will search for recent, relevant stories and send updates to Telegram." action={<button className="primary-button" disabled={loading || saving || !settings} onClick={saveSettings}>{saving ? <RefreshCw size={14} className="spin" /> : <Check size={15} />}{saving ? 'Saving…' : 'Save settings'}</button>} />
+    {loading && <section className="panel settings-panel"><p className="news-loading">Loading your saved news settings…</p></section>}
+    {!loading && settings && <>
+      <section className="panel settings-panel news-monitor-panel">
+        <div className="panel-heading"><div><div className="panel-title-icon search-config-icon"><Newspaper size={16} /></div><div><h2>Proactive news monitoring</h2><p>Search recent news and notify your Telegram chat when a story matches your interests.</p></div></div><Badge tone={settings.enabled ? 'green' : 'subtle'}>{settings.enabled ? 'MONITORING ON' : 'MONITORING OFF'}</Badge></div>
+        <div className="news-monitor-controls">
+          <div className="news-monitor-toggle"><div><strong>Enable monitoring</strong><span>Runs automatically while your AgentFlow service is online.</span></div><Switch checked={settings.enabled} label="Enable proactive news monitoring" onChange={(enabled) => updateSettings({ enabled })} /></div>
+          <label className="news-interval-field">Search interval <span>hours</span><input type="number" min="1" max="24" step="1" value={settings.intervalHours} onChange={(event) => updateSettings({ intervalHours: Math.max(1, Math.min(24, Number(event.target.value) || 1)) })} /></label>
+          <div className="news-next-run"><Clock3 size={15} /><span>Next scheduled scan (Asia/Kolkata)</span><strong>{settings.nextRunAt ? new Date(settings.nextRunAt).toLocaleString(undefined, { timeZone: 'Asia/Kolkata' }) : 'Set when monitoring is enabled'}</strong></div>
+        </div>
+      </section>
+      <section className="panel settings-panel news-topics-panel">
+        <div className="panel-heading"><div><div className="panel-title-icon prompt-title-icon"><Search size={16} /></div><div><h2>Your notification topics</h2><p>Stories are searched and filtered using these topics. Add your own, such as crime or politics.</p></div></div><Badge tone="subtle">{settings.categories.length}/15 TOPICS</Badge></div>
+        <form className="news-topic-add" onSubmit={addTopic}><input aria-label="Add a news topic" maxLength="60" placeholder="Enter a topic, e.g. crime, politics, climate change" value={topicDraft} onChange={(event) => setTopicDraft(event.target.value)} /><button className="outline-button small-button" type="submit" disabled={!topicDraft.trim() || settings.categories.length >= 15}><Plus size={14} /> Add topic</button></form>
+        <div className="news-topic-list" aria-label="Selected news topics">
+          {settings.categories.map((category) => <span className="news-topic-chip" key={category}>{category}<button type="button" aria-label={`Remove ${category}`} disabled={settings.categories.length <= 1} onClick={() => updateSettings({ categories: settings.categories.filter((entry) => entry !== category) })}><X size={12} /></button></span>)}
+        </div>
+        <div className="news-topics-footer"><span>At least one topic is required. Up to 15 topics, 60 characters each.</span><button type="button" className="text-button" onClick={() => updateSettings({ categories: [...defaultNewsTopics] })}>Restore default topics</button></div>
+      </section>
+      <section className="panel settings-panel news-delivery-panel">
+        <div className="panel-heading"><div><div className="panel-title-icon telegram-icon"><Send size={15} /></div><div><h2>Delivery preferences</h2><p>Control when and how often news alerts can arrive.</p></div></div></div>
+        <div className="news-delivery-controls">
+          <label>Quiet hours start<input type="time" value={settings.quietStart} onChange={(event) => updateSettings({ quietStart: event.target.value })} /></label>
+          <label>Quiet hours end<input type="time" value={settings.quietEnd} onChange={(event) => updateSettings({ quietEnd: event.target.value })} /></label>
+          <label>Maximum alerts per day<input type="number" min="1" max="10" value={settings.maxNotificationsPerDay} onChange={(event) => updateSettings({ maxNotificationsPerDay: Math.max(1, Math.min(10, Number(event.target.value) || 1)) })} /></label>
+        </div>
+        <div className="news-delivery-note">Quiet hours and scheduled times use Asia/Kolkata. Telegram commands /news_now and /news_settings are also available.</div>
+      </section>
+    </>}
+  </div>
 }
 
 function RulesPage({ config, update, onToast }) {

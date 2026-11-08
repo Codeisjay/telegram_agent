@@ -407,6 +407,48 @@ export class JobDatabase {
         access_configured INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS news_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        enabled INTEGER NOT NULL DEFAULT 0,
+        interval_hours INTEGER NOT NULL DEFAULT 3,
+        categories_json TEXT NOT NULL DEFAULT '[]',
+        quiet_start TEXT NOT NULL DEFAULT '23:00',
+        quiet_end TEXT NOT NULL DEFAULT '07:00',
+        max_notifications_per_day INTEGER NOT NULL DEFAULT 4,
+        next_run_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS news_articles (
+        id INTEGER PRIMARY KEY,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        url TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        why_it_matters TEXT NOT NULL DEFAULT '',
+        published_at TEXT NOT NULL DEFAULT '',
+        categories_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS news_notifications (
+        id INTEGER PRIMARY KEY,
+        article_id INTEGER NOT NULL REFERENCES news_articles(id) ON DELETE CASCADE,
+        notification_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(article_id, notification_key)
+      );
+      CREATE TABLE IF NOT EXISTS news_runs (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        discovered_count INTEGER NOT NULL DEFAULT 0,
+        new_count INTEGER NOT NULL DEFAULT 0,
+        delivered_count INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT ''
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -420,6 +462,8 @@ export class JobDatabase {
         VALUES (1, '[]', 'openrouter', 2027, datetime('now'));
       INSERT OR IGNORE INTO scheduler_state(id, paused, next_run_at, updated_at)
         VALUES (1, 0, '', datetime('now'));
+      INSERT OR IGNORE INTO news_settings(id, enabled, interval_hours, categories_json, quiet_start, quiet_end, max_notifications_per_day, next_run_at, updated_at)
+        VALUES (1, 0, 3, '["AI/ML","Generative AI","Software engineering","Technology","Indian startups","Fresher jobs","Internships","Engineering innovations"]', '23:00', '07:00', 4, '', datetime('now'));
       INSERT OR IGNORE INTO agent_preferences(id, settings_json, auto_start, updated_at)
         VALUES (1, '{}', 1, datetime('now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'));
@@ -592,6 +636,145 @@ export class JobDatabase {
         .run(settings.provider, updatedAt)
     }
     return this.getAgentPreferences()
+  }
+
+  getNewsSettings() {
+    const row = this.db.prepare('SELECT enabled, interval_hours, categories_json, quiet_start, quiet_end, max_notifications_per_day, next_run_at, updated_at FROM news_settings WHERE id = 1').get()
+    return {
+      enabled: Boolean(row.enabled),
+      intervalHours: Number(row.interval_hours || 3),
+      categories: JSON.parse(row.categories_json || '[]'),
+      quietStart: row.quiet_start || '23:00',
+      quietEnd: row.quiet_end || '07:00',
+      maxNotificationsPerDay: Number(row.max_notifications_per_day || 4),
+      nextRunAt: row.next_run_at || '',
+      updatedAt: row.updated_at,
+    }
+  }
+
+  saveNewsSettings(input = {}) {
+    const current = this.getNewsSettings()
+    const enabled = typeof input.enabled === 'boolean' ? input.enabled : current.enabled
+    const intervalHours = Number.isInteger(input.intervalHours) ? Math.min(24, Math.max(1, input.intervalHours)) : current.intervalHours
+    const categoriesByKey = new Map()
+    if (Array.isArray(input.categories)) {
+      for (const value of input.categories) {
+        if (typeof value !== 'string') continue
+        const category = value.trim().replace(/\s+/g, ' ').slice(0, 60)
+        const key = category.toLowerCase()
+        if (category && !categoriesByKey.has(key)) categoriesByKey.set(key, category)
+      }
+    }
+    const categories = [...categoriesByKey.values()].slice(0, 15)
+    if (!categories.length) categories.push(...current.categories.slice(0, 15))
+    const quietStart = typeof input.quietStart === 'string' && /^\d{2}:\d{2}$/.test(input.quietStart)
+      ? input.quietStart
+      : current.quietStart
+    const quietEnd = typeof input.quietEnd === 'string' && /^\d{2}:\d{2}$/.test(input.quietEnd)
+      ? input.quietEnd
+      : current.quietEnd
+    const maxNotificationsPerDay = Number.isInteger(input.maxNotificationsPerDay)
+      ? Math.min(10, Math.max(1, input.maxNotificationsPerDay))
+      : current.maxNotificationsPerDay
+    const updatedAt = new Date().toISOString()
+    const nextRunAt = typeof input.nextRunAt === 'string' && input.nextRunAt
+      ? input.nextRunAt
+      : current.nextRunAt || (enabled ? new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString() : '')
+    this.db.prepare('UPDATE news_settings SET enabled = ?, interval_hours = ?, categories_json = ?, quiet_start = ?, quiet_end = ?, max_notifications_per_day = ?, next_run_at = ?, updated_at = ? WHERE id = 1')
+      .run(Number(enabled), intervalHours, JSON.stringify(categories), quietStart, quietEnd, maxNotificationsPerDay, nextRunAt, updatedAt)
+    return this.getNewsSettings()
+  }
+
+  setNewsNextRun(value) {
+    this.db.prepare('UPDATE news_settings SET next_run_at = ?, updated_at = ? WHERE id = 1')
+      .run(value, new Date().toISOString())
+    return this.getNewsSettings()
+  }
+
+  createNewsRun(trigger) {
+    const now = new Date().toISOString()
+    const result = this.db.prepare('INSERT INTO news_runs(status, trigger, started_at) VALUES (?, ?, ?)')
+      .run('running', trigger, now)
+    return Number(result.lastInsertRowid)
+  }
+
+  completeNewsRun(id, result = {}) {
+    const now = new Date().toISOString()
+    this.db.prepare('UPDATE news_runs SET status = ?, discovered_count = ?, new_count = ?, delivered_count = ?, completed_at = ?, error = ? WHERE id = ?')
+      .run(result.status || 'completed', Number(result.discoveredCount || 0), Number(result.newCount || 0), Number(result.deliveredCount || 0), now, result.error || '', id)
+    return this.getNewsRun(id)
+  }
+
+  failNewsRun(id, error = 'News sync failed.') {
+    const now = new Date().toISOString()
+    this.db.prepare('UPDATE news_runs SET status = ?, completed_at = ?, error = ? WHERE id = ?')
+      .run('failed', now, String(error).slice(0, 350), id)
+    return this.getNewsRun(id)
+  }
+
+  getNewsRun(id) {
+    return this.db.prepare('SELECT * FROM news_runs WHERE id = ?').get(id)
+  }
+
+  listNewsRuns(limit = 10) {
+    return this.db.prepare('SELECT * FROM news_runs ORDER BY id DESC LIMIT ?').all(limit)
+  }
+
+  upsertNewsArticle(article = {}) {
+    const title = String(article.title || article.headline || 'Untitled update').trim().slice(0, 300)
+    const url = String(article.url || '').trim()
+    const dedupeKey = (url || title).toLowerCase().replace(/^https?:\/\//, '').replace(/[?#].*$/, '').replace(/\/$/, '') || title.toLowerCase()
+    let source = String(article.source || '').trim().replace(/^www\./, '').slice(0, 200)
+    if (!source && url) {
+      try {
+        source = new URL(url).hostname.replace(/^www\./, '')
+      } catch {
+        source = ''
+      }
+    }
+    const summary = String(article.summary || article.content || '').trim().slice(0, 2000)
+    const whyItMatters = String(article.whyItMatters || article.why_it_matters || '').trim().slice(0, 1000)
+    const publishedAt = String(article.publishedAt || article.published_at || '').trim()
+    const categories = Array.isArray(article.categories) ? article.categories : []
+    const existing = this.db.prepare('SELECT id FROM news_articles WHERE dedupe_key = ?').get(dedupeKey)
+    if (existing) {
+      this.db.prepare('UPDATE news_articles SET title = ?, url = ?, source = ?, summary = ?, why_it_matters = ?, published_at = ?, categories_json = ?, updated_at = ? WHERE id = ?')
+        .run(title, url, source, summary, whyItMatters, publishedAt, JSON.stringify(categories), new Date().toISOString(), existing.id)
+      return { id: existing.id, isNew: false }
+    }
+    const result = this.db.prepare('INSERT INTO news_articles(dedupe_key, title, url, source, summary, why_it_matters, published_at, categories_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(dedupeKey, title, url, source, summary, whyItMatters, publishedAt, JSON.stringify(categories), new Date().toISOString(), new Date().toISOString())
+    return { id: Number(result.lastInsertRowid), isNew: true }
+  }
+
+  listNewsArticles(limit = 10) {
+    return this.db.prepare('SELECT * FROM news_articles ORDER BY created_at DESC LIMIT ?').all(limit)
+  }
+
+  listNewsNotifications(limit = 10) {
+    return this.db.prepare(`
+      SELECT n.id, n.article_id, n.notification_key, n.created_at,
+        a.title, a.url, a.summary, a.why_it_matters, a.source
+      FROM news_notifications n
+      JOIN news_articles a ON a.id = n.article_id
+      ORDER BY n.created_at DESC
+      LIMIT ?
+    `).all(limit)
+  }
+
+  countNewsNotificationsSince(timeIso) {
+    if (!timeIso) return 0
+    return Number(this.db.prepare('SELECT COUNT(*) AS count FROM news_notifications WHERE created_at >= ?').get(timeIso).count)
+  }
+
+  recordNewsNotification(articleId, notificationKey) {
+    const result = this.db.prepare('INSERT OR IGNORE INTO news_notifications(article_id, notification_key, created_at) VALUES (?, ?, ?)')
+      .run(articleId, String(notificationKey), new Date().toISOString())
+    return result.changes > 0
+  }
+
+  hasNewsNotification(articleId, notificationKey) {
+    return Boolean(this.db.prepare('SELECT 1 FROM news_notifications WHERE article_id = ? AND notification_key = ?').get(articleId, String(notificationKey)))
   }
 
   getScheduler() {

@@ -2,6 +2,7 @@ const originalFetch = globalThis.fetch
 let telegramUpdateDelivered = false
 let creditCapacityRetryRequests = 0
 let creditBudgetRetryRequests = 0
+let groqRateLimitRetryRequests = 0
 
 globalThis.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input.url)
@@ -91,7 +92,8 @@ globalThis.fetch = async (input, init) => {
         })
       }
       if (request.query.includes('SlowCo')) await new Promise((resolve) => setTimeout(resolve, 250))
-      if (request.query.includes('Example Systems') || request.query.includes('NotificationCo') || request.query.includes('LlmFailCo')) {
+      if (request.query.includes('Example Systems') || request.query.includes('NotificationCo')
+        || request.query.includes('LlmFailCo') || request.query.includes('GroqTPMRetryCo')) {
         return Response.json({
           results: [{
             title: 'Software Engineer Intern',
@@ -264,6 +266,11 @@ globalThis.fetch = async (input, init) => {
       if (request.messages.some((message) => message.content.includes('Extract only current job vacancies'))) {
         if (request.messages[0].content.includes('LlmFailCo')) {
           return Response.json({ error: { message: 'Temporary LLM failure.' } }, { status: 503 })
+        }
+        if (request.messages[0].content.includes('GroqTPMRetryCo') && groqRateLimitRetryRequests++ === 0) {
+          return Response.json({
+            error: { message: 'Rate limit reached for model. Please try again in 0.01s.' },
+          }, { status: 429 })
         }
         if (request.messages[0].content.includes('LlmTimeoutCo')) {
           throw new DOMException('The operation timed out.', 'TimeoutError')

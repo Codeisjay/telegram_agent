@@ -19,6 +19,8 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
   `AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS` environment variables tune the
   conservative prompt-token budget and per-page text limit. Job intelligence
   uses the same AI provider selected in LLM & Web Search settings.
+  Extraction retries provider rate limits using the provider's requested wait
+  time when available, with a bounded number of retries.
   OpenRouter extraction retries transient in-flight credit reservation errors
   with backoff and reserves up to 1,200 completion tokens per page. If OpenRouter
   reports a lower affordable completion-token limit, extraction retries using
@@ -46,6 +48,37 @@ AgentFlow combines a local web dashboard with a Telegram research bot:
 The bot does not maintain conversation history between messages. The `/clear`
 command currently confirms that the conversation is cleared, but there is no
 stored conversation state to reset.
+
+## Proactive news notifications
+
+AgentFlow can run a proactive monitoring loop that discovers recent AI, startup,
+engineering, and career news, filters it for relevance, and sends brief Telegram
+updates when stories are genuinely new and important.
+
+- **Scheduler:** runs every 3 hours by default in Asia/Kolkata time; the
+  interval, enable/disable toggle, quiet hours, and topic list are all stored
+  in SQLite. Use the dashboard's **News interests** screen to add custom topics
+  such as crime or politics, remove topics, or restore the default AI, technology,
+  startup, and career interests. Telegram commands can also enable, disable, and
+  inspect monitoring.
+- **Discovery:** Tavily search is used to collect recent headlines and source
+  links, then results are deduplicated and filtered in Node.js before calling Groq.
+- **Summarization:** Groq is only used when new candidate articles exist; it
+  processes up to 10–15 items in one batch to keep cost and token usage low.
+- **Telegram delivery:** only relevant updates are sent, duplicates are blocked,
+  and a hard cap of 4 notifications per day is enforced outside the quiet window
+  (11:00 PM–7:00 AM Asia/Kolkata).
+- **Commands:** `/news`, `/news_on`, `/news_off`, `/news_now`,
+  `/news_settings`, and `/news_history` are available to authorized Telegram
+  users.
+- **Cron endpoint:** `POST /api/cron/news` triggers the same proactive scan with
+  Basic Auth, separate from the existing job-research cron. It is intended for
+  external schedulers like cron-job.org.
+
+Render Free instances sleep after inactivity and use ephemeral storage, so the
+news scheduler should be treated as best-effort rather than a guaranteed always-on
+monitor. Keep the service awake with periodic health checks, and prefer a paid
+always-on plan for durable SQLite data and continuous polling.
 
 ## Run locally
 

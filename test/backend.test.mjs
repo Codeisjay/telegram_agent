@@ -76,6 +76,21 @@ test('health endpoint reports status without returning credential values', async
   assert.equal(Object.hasOwn(health, 'credentials'), false)
 })
 
+test('news settings API persists user-selected notification topics', async () => {
+  const response = await fetch(`${baseUrl}/api/news`)
+  assert.equal(response.status, 200)
+  const { settings } = await response.json()
+  const update = await fetch(`${baseUrl}/api/news/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...settings, categories: ['crime', 'politics'] }),
+  })
+  assert.equal(update.status, 200)
+  assert.deepEqual((await update.json()).settings.categories, ['crime', 'politics'])
+  const persisted = await fetch(`${baseUrl}/api/news`).then((result) => result.json())
+  assert.deepEqual(persisted.settings.categories, ['crime', 'politics'])
+})
+
 test('uses the platform PORT when AGENTFLOW_PORT is not configured', async () => {
   const backend = startTestBackend({ AGENTFLOW_PORT: undefined, PORT: '0' })
   try {
@@ -361,6 +376,34 @@ test('OpenRouter job extraction retries with the affordable completion-token lim
     && entry.operation === 'job-analysis')
   assert.equal(analyses.filter((entry) => entry.status === '402').length - baselineBudgetFailures, 1)
   assert.equal(analyses.filter((entry) => entry.status === '200').length - baselineSuccesses, 1)
+})
+
+test('Groq job extraction retries TPM rate limits after the provider wait time', async () => {
+  const settings = await fetch(`${baseUrl}/api/jobs/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      provider: 'groq',
+      targetGraduationYear: 2027,
+      companies: [{ name: 'GroqTPMRetryCo', officialDomains: ['careers.example.com'] }],
+    }),
+  })
+  assert.equal(settings.status, 200)
+
+  const response = await fetch(`${baseUrl}/api/jobs/run`, { method: 'POST' })
+  const result = await response.json()
+  assert.equal(response.status, 200, result.error)
+  assert.equal(result.status, 'completed')
+
+  const jobs = (await fetch(`${baseUrl}/api/jobs`).then((item) => item.json())).jobs
+    .filter((job) => job.company === 'GroqTPMRetryCo')
+  assert.equal(jobs.length, 1)
+
+  const state = await fetch(`${baseUrl}/api/jobs/state`).then((item) => item.json())
+  const analyses = state.providerUsage.filter((entry) => entry.provider === 'groq'
+    && entry.operation === 'job-analysis')
+  assert.ok(analyses.some((entry) => entry.status === '429'))
+  assert.ok(analyses.some((entry) => entry.status === '200'))
 })
 
 test('job research reports provider/search failures as failed runs', async () => {
