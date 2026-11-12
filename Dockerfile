@@ -14,6 +14,8 @@ ENV NODE_ENV=production \
     AGENTFLOW_DATA_DIR=/data
 
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY server.mjs daily-scheduler.mjs job-extraction.mjs job-intelligence.mjs news-intelligence.mjs companion-intelligence.mjs companion-store.mjs response-format.mjs backup.mjs migrate-postgres.mjs ./
 COPY migrations ./migrations
