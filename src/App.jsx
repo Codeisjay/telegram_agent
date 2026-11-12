@@ -536,11 +536,12 @@ function NewsInterestsPage({ onToast }) {
       <section className="panel settings-panel news-delivery-panel">
         <div className="panel-heading"><div><div className="panel-title-icon telegram-icon"><Send size={15} /></div><div><h2>Delivery preferences</h2><p>Control when and how often news alerts can arrive.</p></div></div></div>
         <div className="news-delivery-controls">
+          <label>Telegram delivery chat ID<input type="text" inputMode="numeric" placeholder="e.g. 1207882899" value={settings.telegramChatId || ''} onChange={(event) => updateSettings({ telegramChatId: event.target.value.trim() })} /></label>
           <label>Quiet hours start<input type="time" value={settings.quietStart} onChange={(event) => updateSettings({ quietStart: event.target.value })} /></label>
           <label>Quiet hours end<input type="time" value={settings.quietEnd} onChange={(event) => updateSettings({ quietEnd: event.target.value })} /></label>
           <label>Maximum alerts per day<input type="number" min="1" max="10" value={settings.maxNotificationsPerDay} onChange={(event) => updateSettings({ maxNotificationsPerDay: Math.max(1, Math.min(10, Number(event.target.value) || 1)) })} /></label>
         </div>
-        <div className="news-delivery-note">Quiet hours and scheduled times use Asia/Kolkata. Telegram commands /news_now and /news_settings are also available.</div>
+        <div className="news-delivery-note">Save your numeric Telegram chat ID here. The service sends up to 4 matching headlines automatically at your interval; no /news_now command is needed. Scans use search-result snippets and no LLM tokens. Keep AgentFlow online for scheduled scans. Quiet hours use Asia/Kolkata.</div>
       </section>
     </>}
   </div>

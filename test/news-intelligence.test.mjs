@@ -5,7 +5,7 @@ import path from 'node:path'
 import { test } from 'node:test'
 
 import { JobDatabase } from '../job-intelligence.mjs'
-import { buildNewsSearchQuery, matchNewsCategory, NewsScheduler, deduplicateNewsResults, isQuietHours, normalizeNewsSettings, withRateLimitRetry } from '../news-intelligence.mjs'
+import { buildNewsSearchQuery, formatNewsArticles, matchNewsCategory, NewsScheduler, deduplicateNewsResults, isQuietHours, normalizeNewsSettings, withRateLimitRetry } from '../news-intelligence.mjs'
 
 test('scheduler respects the configured interval and next run time', async () => {
   const tempRoot = await mkdtemp(path.join(tmpdir(), 'agentflow-news-scheduler-'))
@@ -51,6 +51,24 @@ test('custom topics are normalized, included in search, and exclusively drive re
   assert.equal(matchNewsCategory('Police investigate a major city crime.', settings.categories), true)
   assert.equal(matchNewsCategory('A startup launches a new AI model.', settings.categories), false)
   assert.equal(matchNewsCategory('A startup launches a new AI model.', []), false)
+})
+
+test('formats at most four matching news items without generated summaries', () => {
+  const articles = formatNewsArticles([
+    { title: 'AI startup raises funding', url: 'https://example.com/1', content: 'An AI startup announced a funding round.' },
+    { title: 'Unrelated sports story', url: 'https://example.com/2', content: 'The team won the final.' },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      title: `Technology update ${index}`,
+      url: `https://example.com/${index + 3}`,
+      content: 'Technology teams introduced a new software platform.',
+    })),
+  ], ['AI', 'Technology'])
+
+  assert.equal(articles.length, 4)
+  assert.deepEqual(articles[0].categories, ['AI'])
+  assert.equal(articles[0].summary, 'An AI startup announced a funding round.')
+  assert.match(articles[0].whyItMatters, /AI/)
+  assert.equal(articles.some((article) => article.title === 'Unrelated sports story'), false)
 })
 
 test('Groq rate-limit retries recover with bounded backoff', async () => {

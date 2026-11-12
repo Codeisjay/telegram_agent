@@ -63,11 +63,15 @@ updates when stories are genuinely new and important.
   inspect monitoring.
 - **Discovery:** Tavily search is used to collect recent headlines and source
   links, then results are deduplicated and filtered in Node.js before calling Groq.
-- **Summarization:** Groq is only used when new candidate articles exist; it
-  processes up to 10–15 items in one batch to keep cost and token usage low.
+- **Low-token delivery:** scheduled news scans do not call an LLM. They send up
+  to four topic-matched headlines with short search-result snippets and source
+  links, using zero LLM tokens for the news loop.
 - **Telegram delivery:** only relevant updates are sent, duplicates are blocked,
   and a hard cap of 4 notifications per day is enforced outside the quiet window
   (11:00 PM–7:00 AM Asia/Kolkata).
+- **Automatic delivery:** save your numeric Telegram chat ID on the News
+  interests screen, enable monitoring, and keep AgentFlow online. It sends
+  matching updates on the configured interval; `/news_now` is optional.
 - **Commands:** `/news`, `/news_on`, `/news_off`, `/news_now`,
   `/news_settings`, and `/news_history` are available to authorized Telegram
   users.

@@ -611,7 +611,8 @@ export class JobDatabase {
     const year = Number(input.targetGraduationYear)
     const targetYear = Number.isInteger(year) && year >= 2020 && year <= 2040 ? year : current.targetGraduationYear
     const paused = typeof input.paused === 'boolean' ? input.paused : current.paused
-    const telegramChatId = typeof input.telegramChatId === 'string' && /^-?\d{1,20}$/.test(input.telegramChatId)
+    const telegramChatId = typeof input.telegramChatId === 'string'
+      && (input.telegramChatId === '' || /^-?\d{1,20}$/.test(input.telegramChatId))
       ? input.telegramChatId
       : current.telegramChatId
     const updatedAt = new Date().toISOString()

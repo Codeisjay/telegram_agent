@@ -115,6 +115,23 @@ export function matchNewsCategory(articleText, categories = DEFAULT_NEWS_CATEGOR
   return matches
 }
 
+export function formatNewsArticles(articles = [], categories = DEFAULT_NEWS_CATEGORIES) {
+  return articles.filter((article) => categories.some((category) => (
+    matchNewsCategory(`${article.title || ''}\n${article.content || ''}`, [category])
+  ))).slice(0, 4).map((article) => {
+    const text = `${article.title || ''}\n${article.content || ''}`
+    const matchedCategories = categories.filter((category) => matchNewsCategory(text, [category]))
+    return {
+      title: String(article.title || 'Recent news update').trim().slice(0, 200),
+      summary: String(article.content || 'Open the source for details.').trim().slice(0, 450),
+      whyItMatters: `Matches your monitored topic${matchedCategories.length === 1 ? '' : 's'}: ${matchedCategories.join(', ') || 'your interests'}.`,
+      sourceUrl: String(article.url || '').trim(),
+      source: String(article.source || '').trim(),
+      categories: matchedCategories,
+    }
+  })
+}
+
 export function isQuietHours(date = new Date(), quietStart = '23:00', quietEnd = '07:00', timeZone = 'Asia/Kolkata') {
   const formatter = new Intl.DateTimeFormat('en-GB', {
     timeZone,

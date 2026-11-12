@@ -8,7 +8,7 @@ import { formatTelegramAnswer } from './response-format.mjs'
 import { DailyScheduler } from './daily-scheduler.mjs'
 import { cleanJobPageContent, deduplicateExtractedJobs, extractJson, validateExtractedJobs } from './job-extraction.mjs'
 import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAuthorized, nextDailyRun, normalizeCandidateProfile, shouldNotifyJob } from './job-intelligence.mjs'
-import { DEFAULT_NEWS_CATEGORIES, NewsScheduler, buildNewsSearchQuery, deduplicateNewsResults, isQuietHours, matchNewsCategory, normalizeNewsSettings, withRateLimitRetry } from './news-intelligence.mjs'
+import { DEFAULT_NEWS_CATEGORIES, NewsScheduler, buildNewsSearchQuery, deduplicateNewsResults, formatNewsArticles, isQuietHours, matchNewsCategory, normalizeNewsSettings, withRateLimitRetry } from './news-intelligence.mjs'
 
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
@@ -911,7 +911,7 @@ async function runNewsResearch(trigger = 'scheduled') {
       database.completeNewsRun(runId, { status: 'skipped', discoveredCount: 0, newCount: 0, deliveredCount: 0 })
       return { status: 'skipped', discovered: 0, delivered: 0, skipped: true }
     }
-    const summaries = await summarizeNewsArticles(discovered, secrets)
+    const summaries = formatNewsArticles(discovered, settings.categories)
     let newCount = 0
     let deliveredCount = 0
     const chatId = database.getSettings().telegramChatId
@@ -923,7 +923,7 @@ async function runNewsResearch(trigger = 'scheduled') {
         summary: article.summary,
         whyItMatters: article.whyItMatters,
         publishedAt: new Date().toISOString(),
-        categories: settings.categories,
+        categories: article.categories,
       }
       const stored = database.upsertNewsArticle(payload)
       if (stored.isNew) newCount++
@@ -1755,7 +1755,7 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'GET' && url.pathname === '/api/news') {
       return respond(response, 200, {
-        settings: database.getNewsSettings(),
+        settings: { ...database.getNewsSettings(), telegramChatId: database.getSettings().telegramChatId },
         articles: database.listNewsArticles(10),
         notifications: database.listNewsNotifications(10),
         history: database.listNewsRuns(10),
@@ -1764,8 +1764,19 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'PUT' && url.pathname === '/api/news/settings') {
       const input = await readJson(request)
+      if (Object.hasOwn(input, 'telegramChatId')
+        && input.telegramChatId !== ''
+        && (typeof input.telegramChatId !== 'string' || !/^-?\d{1,20}$/.test(input.telegramChatId))) {
+        return respond(response, 400, { error: 'Telegram notification chat ID must be numeric.' })
+      }
       const settings = normalizeNewsSettings(input, database.getNewsSettings())
-      return respond(response, 200, { settings: database.saveNewsSettings(settings) })
+      database.saveNewsSettings(settings)
+      if (typeof input.telegramChatId === 'string') {
+        database.saveSettings({ ...database.getSettings(), telegramChatId: input.telegramChatId })
+      }
+      return respond(response, 200, {
+        settings: { ...database.getNewsSettings(), telegramChatId: database.getSettings().telegramChatId },
+      })
     }
 
     if (request.method === 'POST' && url.pathname === '/api/cron/news') {

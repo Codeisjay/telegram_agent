@@ -76,19 +76,37 @@ test('health endpoint reports status without returning credential values', async
   assert.equal(Object.hasOwn(health, 'credentials'), false)
 })
 
-test('news settings API persists user-selected notification topics', async () => {
+test('news settings API persists custom topics and the Telegram delivery chat ID', async () => {
   const response = await fetch(`${baseUrl}/api/news`)
   assert.equal(response.status, 200)
   const { settings } = await response.json()
   const update = await fetch(`${baseUrl}/api/news/settings`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ...settings, categories: ['crime', 'politics'] }),
+    body: JSON.stringify({ ...settings, categories: ['crime', 'politics'], telegramChatId: '1207882899' }),
   })
   assert.equal(update.status, 200)
-  assert.deepEqual((await update.json()).settings.categories, ['crime', 'politics'])
+  const saved = (await update.json()).settings
+  assert.deepEqual(saved.categories, ['crime', 'politics'])
+  assert.equal(saved.telegramChatId, '1207882899')
   const persisted = await fetch(`${baseUrl}/api/news`).then((result) => result.json())
   assert.deepEqual(persisted.settings.categories, ['crime', 'politics'])
+  assert.equal(persisted.settings.telegramChatId, '1207882899')
+
+  const invalid = await fetch(`${baseUrl}/api/news/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ telegramChatId: 'not-a-chat-id' }),
+  })
+  assert.equal(invalid.status, 400)
+
+  const clearRecipient = await fetch(`${baseUrl}/api/news/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ telegramChatId: '' }),
+  })
+  assert.equal(clearRecipient.status, 200)
+  assert.equal((await clearRecipient.json()).settings.telegramChatId, '')
 })
 
 test('uses the platform PORT when AGENTFLOW_PORT is not configured', async () => {
