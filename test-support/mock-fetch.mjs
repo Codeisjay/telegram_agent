@@ -44,6 +44,16 @@ globalThis.fetch = async (input, init) => {
   if (url.hostname === 'api.tavily.com') {
     const request = JSON.parse(init.body)
     if (url.pathname.endsWith('/search')) {
+      if (request.topic === 'news') {
+        return Response.json({
+          results: [{
+            title: 'New Generative AI research breakthrough announced',
+            url: 'https://reuters.com/technology/generative-ai-breakthrough',
+            content: 'Researchers announced a new Generative AI model with improved capabilities.',
+            published_date: new Date().toISOString(),
+          }],
+        })
+      }
       if (request.query.includes('Large Jobs Co')) {
         return Response.json({
           results: ['token-limit-27', 'job-a-27', 'job-b-27'].map((jobId) => ({
@@ -263,6 +273,22 @@ globalThis.fetch = async (input, init) => {
         return Response.json({ error: { message: 'Unexpected or retired Groq model.' } }, { status: 400 })
       }
       const request = JSON.parse(init.body)
+      if (request.messages[0].content.includes('Summarize only the supplied news')) {
+        const articles = JSON.parse(request.messages[1].content)
+        return Response.json({
+          choices: [{
+            message: {
+              content: JSON.stringify(articles.map((article) => ({
+                index: article.index,
+                headline: article.title,
+                summary: 'A new model was announced.',
+                whyItMatters: 'It may influence AI capabilities and products.',
+              }))),
+            },
+          }],
+          usage: { prompt_tokens: 120, completion_tokens: 40 },
+        })
+      }
       if (request.messages.some((message) => message.content.includes('Extract only current job vacancies'))) {
         if (request.messages[0].content.includes('LlmFailCo')) {
           return Response.json({ error: { message: 'Temporary LLM failure.' } }, { status: 503 })

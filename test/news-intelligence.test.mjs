@@ -5,7 +5,11 @@ import path from 'node:path'
 import { test } from 'node:test'
 
 import { JobDatabase } from '../job-intelligence.mjs'
-import { buildNewsSearchQuery, formatNewsArticles, matchNewsCategory, NewsScheduler, deduplicateNewsResults, isQuietHours, normalizeNewsSettings, withRateLimitRetry } from '../news-intelligence.mjs'
+import {
+  buildNewsSearchQuery, buildNewsSearchQueries, matchNewsCategory, NewsScheduler,
+  deduplicateNewsResults, isQuietHours, normalizeNewsInterests, normalizeNewsSettings,
+  rankNewsArticles, startOfDayInTimeZone, withRateLimitRetry,
+} from '../news-intelligence.mjs'
 
 test('scheduler respects the configured interval and next run time', async () => {
   const tempRoot = await mkdtemp(path.join(tmpdir(), 'agentflow-news-scheduler-'))
@@ -53,22 +57,38 @@ test('custom topics are normalized, included in search, and exclusively drive re
   assert.equal(matchNewsCategory('A startup launches a new AI model.', []), false)
 })
 
-test('formats at most four matching news items without generated summaries', () => {
-  const articles = formatNewsArticles([
-    { title: 'AI startup raises funding', url: 'https://example.com/1', content: 'An AI startup announced a funding round.' },
-    { title: 'Unrelated sports story', url: 'https://example.com/2', content: 'The team won the final.' },
-    ...Array.from({ length: 5 }, (_, index) => ({
-      title: `Technology update ${index}`,
-      url: `https://example.com/${index + 3}`,
-      content: 'Technology teams introduced a new software platform.',
-    })),
-  ], ['AI', 'Technology'])
+test('news searches combine every enabled interest and rank fresh high-priority coverage', () => {
+  const interests = normalizeNewsInterests([
+    { topic: 'Generative AI', enabled: true, priority: 'high' },
+    { topic: 'Browser Engineering', enabled: true, priority: 'medium' },
+    { topic: 'Closed topic', enabled: false, priority: 'high' },
+    { topic: 'Clean energy', enabled: true, priority: 'low' },
+  ])
+  const queries = buildNewsSearchQueries(interests)
+  assert.ok(queries.length <= 3)
+  for (const interest of interests.filter((item) => item.enabled)) {
+    assert.ok(queries.some((query) => query.query.includes(`"${interest.topic}"`)))
+  }
+  assert.equal(queries.some((query) => query.query.includes('Closed topic')), false)
+  assert.equal(queries[0].query.includes('"Generative AI"'), true)
 
-  assert.equal(articles.length, 4)
-  assert.deepEqual(articles[0].categories, ['AI'])
-  assert.equal(articles[0].summary, 'An AI startup announced a funding round.')
-  assert.match(articles[0].whyItMatters, /AI/)
-  assert.equal(articles.some((article) => article.title === 'Unrelated sports story'), false)
+  const ranked = rankNewsArticles([
+    {
+      title: 'Generative AI research update',
+      url: 'https://reuters.com/technology/ai-update',
+      content: 'New model research was published.',
+      publishedAt: '2026-11-12T10:00:00.000Z',
+    },
+    {
+      title: 'Generative AI old report',
+      url: 'https://example.com/old-report',
+      content: 'A prior update.',
+      publishedAt: '2026-10-01T10:00:00.000Z',
+    },
+  ], interests, new Date('2026-11-12T11:00:00.000Z'))
+  assert.equal(ranked.length, 1)
+  assert.deepEqual(ranked[0].matchedInterests, ['Generative AI'])
+  assert.equal(startOfDayInTimeZone(new Date('2026-11-12T12:00:00.000Z')).toISOString(), '2026-11-11T18:30:00.000Z')
 })
 
 test('Groq rate-limit retries recover with bounded backoff', async () => {

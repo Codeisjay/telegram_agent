@@ -7,8 +7,12 @@ import { fileURLToPath } from 'node:url'
 import { formatTelegramAnswer } from './response-format.mjs'
 import { DailyScheduler } from './daily-scheduler.mjs'
 import { cleanJobPageContent, deduplicateExtractedJobs, extractJson, validateExtractedJobs } from './job-extraction.mjs'
-import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAuthorized, nextDailyRun, normalizeCandidateProfile, shouldNotifyJob } from './job-intelligence.mjs'
-import { DEFAULT_NEWS_CATEGORIES, NewsScheduler, buildNewsSearchQuery, deduplicateNewsResults, formatNewsArticles, isQuietHours, matchNewsCategory, normalizeNewsSettings, withRateLimitRetry } from './news-intelligence.mjs'
+import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAuthorized, nextDailyRun, normalizeCandidateProfile, normalizeLifeEvent, shouldNotifyJob } from './job-intelligence.mjs'
+import {
+  NewsScheduler, buildNewsSearchQueries, deduplicateNewsResults, isQuietHours,
+  normalizeNewsSettings, rankNewsArticles, startOfDayInTimeZone,
+} from './news-intelligence.mjs'
+import { getDueGreeting, isQuietHours as isCompanionQuietHours, parseNaturalLanguageEvent } from './companion-intelligence.mjs'
 
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
@@ -31,6 +35,7 @@ const databaseFile = process.env.AGENTFLOW_DB_PATH || path.join(secretDirectory,
 const projectEnvFile = process.env.AGENTFLOW_ENV_FILE || path.join(path.dirname(fileURLToPath(import.meta.url)), '.env')
 const jobPromptTokenBudget = readPositiveInteger(process.env.AGENTFLOW_JOB_PROMPT_TOKEN_BUDGET, 6000, 1000, 9000)
 const jobDescriptionMaxCharacters = readPositiveInteger(process.env.AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS, 8000, 1000, 30000)
+const newsCronSecret = process.env.AGENTFLOW_NEWS_CRON_SECRET || ''
 const secretNames = new Set([
   'GEMINI_API_KEY',
   'GROQ_API_KEY',
@@ -150,6 +155,13 @@ function isDashboardAuthorized(request) {
     && safeStringEqual(decoded.slice(separator + 1), dashboardPassword)
 }
 
+function isNewsCronAuthorized(request) {
+  const authorization = request.headers.authorization || ''
+  if (newsCronSecret && authorization.startsWith('Bearer ')
+    && safeStringEqual(authorization.slice(7), newsCronSecret)) return true
+  return production && isDashboardAuthorized(request)
+}
+
 const contentTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -222,6 +234,61 @@ function sanitizeJobError(message, secrets = {}) {
     if (typeof value === 'string' && value) safeMessage = safeMessage.replaceAll(value, '[redacted]')
   }
   return safeMessage.slice(0, 350)
+}
+
+function getCompanionNotificationChatId() {
+  const companion = database.getCompanionSettings()
+  if (typeof companion.notificationChatId === 'string' && companion.notificationChatId.trim()) return companion.notificationChatId.trim()
+  const news = database.getNewsSettings()
+  if (typeof news.telegramChatId === 'string' && news.telegramChatId.trim()) return news.telegramChatId.trim()
+  const settings = database.getSettings()
+  return typeof settings.telegramChatId === 'string' ? settings.telegramChatId : ''
+}
+
+async function notifyCompanion(chatId, text) {
+  if (!chatId) return false
+  try {
+    await sendTelegramMessage(chatId, text)
+    return true
+  } catch (error) {
+    logEvent('ERROR', `Companion notification failed: ${error.message}`, 'errors')
+    return false
+  }
+}
+
+async function processCompanionNotifications() {
+  const settings = database.getCompanionSettings()
+  if (settings.paused) return
+  const chatId = getCompanionNotificationChatId()
+  if (!chatId) return
+  const now = new Date()
+  const greeting = getDueGreeting(settings, now)
+  if (greeting) {
+    const dayKey = greeting.dayKey || now.toISOString().slice(0, 10)
+    if (!database.hasCompanionGreeting(greeting.kind, dayKey)) {
+      await notifyCompanion(chatId, greeting.message)
+      database.recordCompanionGreeting(greeting.kind, dayKey, now.toISOString())
+    }
+  }
+  for (const event of database.getDueLifeEvents(now)) {
+    const dueAt = event.dueAt || now.toISOString()
+    const text = `${event.title}${event.eventTime ? ` at ${event.eventTime}` : ''} — ${event.description || 'Reminder due now.'}`
+    const notified = database.markLifeEventNotified(event.id, event.notificationKey, dueAt)
+    if (!notified) continue
+    await notifyCompanion(chatId, text)
+    const nextDate = new Date(`${event.eventDate}T${event.eventTime || '00:00'}:00`)
+    if (event.recurrence && event.recurrence !== 'None') {
+      const nextOccurrence = new Date(nextDate)
+      if (event.recurrence === 'Daily') nextOccurrence.setDate(nextOccurrence.getDate() + 1)
+      else if (event.recurrence === 'Weekly') nextOccurrence.setDate(nextOccurrence.getDate() + 7)
+      else if (event.recurrence === 'Monthly') nextOccurrence.setMonth(nextOccurrence.getMonth() + 1)
+      else if (event.recurrence === 'Yearly') nextOccurrence.setFullYear(nextOccurrence.getFullYear() + 1)
+      database.updateLifeEvent(event.id, {
+        eventDate: nextOccurrence.toISOString().slice(0, 10),
+        nextOccurrence: nextOccurrence.toISOString().slice(0, 10),
+      })
+    }
+  }
 }
 
 function safeSettings(input = {}) {
@@ -775,124 +842,177 @@ async function extractCompanyVacancies(company, targetGraduationYear, pages, sec
 function buildNewsArticleSummary(article, fallback = 'This is a relevant update in your monitored areas.') {
   return {
     title: String(article?.title || article?.headline || 'Recent technology update').trim().slice(0, 200),
-    summary: String(article?.summary || article?.content || fallback).trim().slice(0, 450),
-    whyItMatters: String(article?.whyItMatters || 'It matters because it affects AI, software engineering, startups, or hiring trends you are tracking.').trim().slice(0, 500),
+    summary: String(article?.summary || article?.content || fallback).trim().slice(0, 350),
+    whyItMatters: String(article?.whyItMatters || 'This development may affect the topics you follow.').trim().slice(0, 300),
     sourceUrl: String(article?.url || article?.sourceUrl || '').trim(),
     source: String(article?.source || '').trim(),
+    matchedInterests: Array.isArray(article?.matchedInterests) ? article.matchedInterests : [],
+    publishedAt: typeof article?.publishedAt === 'string' ? article.publishedAt : '',
   }
 }
 
-async function searchRecentNews(secrets, categories) {
+async function searchRecentNews(secrets, interests) {
   if (!secrets.TAVILY_SEARCH_KEY) throw serviceError('Save a Tavily Search key before enabling proactive news monitoring.', 400)
-  const response = await fetch('https://api.tavily.com/search', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      api_key: secrets.TAVILY_SEARCH_KEY,
-      query: buildNewsSearchQuery(categories),
-      search_depth: 'basic',
-      max_results: 15,
-      include_answer: false,
-      topic: 'news',
-    }),
-    signal: AbortSignal.timeout(20000),
-  })
-  if (!response.ok) throw serviceError(`Tavily news search failed: ${await responseError(response)}`, 502)
-  const result = await response.json()
-  const entries = deduplicateNewsResults((Array.isArray(result.results) ? result.results : []).map((item) => ({
-    title: typeof item.title === 'string' ? item.title : '',
-    url: typeof item.url === 'string' ? item.url : '',
-    content: typeof item.content === 'string' ? item.content : (typeof item.snippet === 'string' ? item.snippet : ''),
-    source: typeof item.source === 'string' ? item.source : '',
-    publishedAt: typeof item.published_date === 'string' ? item.published_date : '',
-  }))).filter((entry) => matchNewsCategory(`${entry.title}\n${entry.content}`, categories))
-  return entries.slice(0, 12)
+  const queries = buildNewsSearchQueries(interests)
+  const entries = []
+  for (const search of queries) {
+    const startedAt = Date.now()
+    try {
+      const response = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          api_key: secrets.TAVILY_SEARCH_KEY,
+          query: search.query,
+          search_depth: 'basic',
+          max_results: 5,
+          include_answer: false,
+          topic: 'news',
+          time_range: 'week',
+        }),
+        signal: AbortSignal.timeout(20000),
+      })
+      if (!response.ok) {
+        const detail = await responseError(response)
+        database.recordProviderUsage({
+          provider: 'tavily', operation: 'news-search', status: 'failed',
+          durationMs: Date.now() - startedAt, error: `HTTP ${response.status}: ${detail}`,
+        })
+        throw serviceError(`Tavily news search failed: ${detail}`, 502)
+      }
+      const result = await response.json()
+      database.recordProviderUsage({
+        provider: 'tavily', operation: 'news-search', status: 'success',
+        durationMs: Date.now() - startedAt,
+      })
+      entries.push(...(Array.isArray(result.results) ? result.results : []).map((item) => ({
+        title: typeof item.title === 'string' ? item.title : '',
+        url: typeof item.url === 'string' ? item.url : '',
+        content: typeof item.content === 'string' ? item.content : (typeof item.snippet === 'string' ? item.snippet : ''),
+        source: typeof item.source === 'string' ? item.source : '',
+        publishedAt: typeof item.published_date === 'string' ? item.published_date : '',
+      })))
+    } catch (error) {
+      if (!error.status) {
+        database.recordProviderUsage({
+          provider: 'tavily', operation: 'news-search', status: 'failed',
+          durationMs: Date.now() - startedAt, error: error.message,
+        })
+        throw serviceError(`Tavily news search failed: ${error.message}`, 502)
+      }
+      throw error
+    }
+  }
+  return rankNewsArticles(deduplicateNewsResults(entries), interests).slice(0, 15)
 }
 
-async function summarizeNewsArticles(articles, secrets) {
-  if (!articles.length) return []
-  const key = secrets.GROQ_API_KEY
-  if (!key) return articles.map((article) => buildNewsArticleSummary({
-    title: article.title,
-    summary: article.content || 'Recent update in your monitored technology categories.',
-    whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
-    url: article.url,
-    source: article.source,
+function localNewsSummaries(articles) {
+  return articles.map((article) => buildNewsArticleSummary({
+    ...article,
+    summary: article.content || 'A recent development related to your monitored interests.',
+    whyItMatters: `It is relevant to: ${article.matchedInterests.join(', ')}.`,
   }))
+}
+
+async function summarizeNewsArticles(articles, secrets, settings) {
+  if (!articles.length || !secrets.GROQ_API_KEY) return localNewsSummaries(articles)
+  if (settings.groqCooldownUntil && Date.parse(settings.groqCooldownUntil) > Date.now()) {
+    return localNewsSummaries(articles)
+  }
+  const maxInputCharacters = Math.max(1000, (settings.inputTokenBudget - 600) * 4)
+  const inputArticles = []
+  let inputCharacters = 0
+  for (const [index, article] of articles.entries()) {
+    const item = {
+      index,
+      title: article.title.slice(0, 220),
+      snippet: article.content.slice(0, 500),
+      publishedAt: article.publishedAt,
+      interests: article.matchedInterests,
+    }
+    const itemSize = JSON.stringify(item).length
+    if (inputArticles.length && inputCharacters + itemSize > maxInputCharacters) break
+    inputArticles.push(item)
+    inputCharacters += itemSize
+  }
+  if (!inputArticles.length) return localNewsSummaries(articles)
+
+  const startedAt = Date.now()
+  let usageRecorded = false
   try {
-    const response = await withRateLimitRetry(async () => fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${secrets.GROQ_API_KEY}`, 'content-type': 'application/json' },
       body: JSON.stringify({
         model: 'openai/gpt-oss-120b',
         temperature: 0.2,
-        max_tokens: 1800,
+        max_tokens: settings.outputTokenBudget,
         messages: [
           {
             role: 'system',
-            content: 'You are a concise technology news curator. Return only valid JSON: an array of up to 4 objects, each with "headline", "summary", "whyItMatters", and "sourceUrl". Keep each item brief and relevant to AI/ML, software engineering, startups, jobs, internships, or engineering innovation. Use only the supplied headlines and summaries; do not invent facts.',
+            content: 'Summarize only the supplied news in concise JSON. Return an array with one object per input, containing index, headline, summary (max 2 short sentences), and whyItMatters (one short sentence). Never invent facts or add URLs. Prioritize material developments.',
           },
-          {
-            role: 'user',
-            content: JSON.stringify(articles.map((article) => ({
-              title: article.title,
-              summary: article.content,
-              url: article.url,
-            })), null, 2),
-          },
+          { role: 'user', content: JSON.stringify(inputArticles) },
         ],
       }),
-      signal: AbortSignal.timeout(30000),
-    }), { retries: 3, baseDelayMs: 1000 })
+      signal: AbortSignal.timeout(20000),
+    })
     if (!response.ok) {
-      if ([429, 500, 502, 503, 504].includes(response.status)) {
-        throw Object.assign(new Error(`Groq request failed with HTTP ${response.status}.`), { status: response.status })
+      const detail = await responseError(response)
+      const retryAfterSeconds = Number(response.headers.get('retry-after'))
+      if (response.status === 429) {
+        const cooldownMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(24 * 60 * 60 * 1000, retryAfterSeconds * 1000)
+          : 60 * 60 * 1000
+        database.setGroqNewsCooldown(new Date(Date.now() + cooldownMs).toISOString())
       }
-      return articles.map((article) => buildNewsArticleSummary({
-        title: article.title,
-        summary: article.content || 'Recent update in your monitored technology categories.',
-        whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
-        url: article.url,
-        source: article.source,
-      }))
+      database.recordProviderUsage({
+        provider: 'groq', operation: 'news-summarize', status: 'failed',
+        durationMs: Date.now() - startedAt, error: `HTTP ${response.status}: ${detail}`,
+      })
+      logEvent('WARN', `Groq news summary unavailable (HTTP ${response.status}); using search snippets.`, 'search')
+      return localNewsSummaries(articles)
     }
     const result = await response.json()
-    const text = result.choices?.[0]?.message?.content || '[]'
-    const cleaned = text.replace(/```json|```/g, '').trim()
-    const parsed = JSON.parse(cleaned)
-    if (!Array.isArray(parsed) || !parsed.length) return articles.map((article) => buildNewsArticleSummary({
-      title: article.title,
-      summary: article.content || 'Recent update in your monitored technology categories.',
-      whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
-      url: article.url,
-      source: article.source,
-    }))
-    return parsed.slice(0, 4).map((item) => buildNewsArticleSummary({
-      title: item.headline || item.title || 'Technology update',
-      summary: item.summary || item.description || 'Recent update in your monitored categories.',
-      whyItMatters: item.whyItMatters || item.why_it_matters || 'It matches one of the business or technology topics you are tracking.',
-      url: item.sourceUrl || item.url || '',
-      source: item.source || '',
-    }))
+    const usage = result.usage || {}
+    database.recordProviderUsage({
+      provider: 'groq', operation: 'news-summarize', status: 'success',
+      inputTokens: Number.isInteger(usage.prompt_tokens) ? usage.prompt_tokens : undefined,
+      outputTokens: Number.isInteger(usage.completion_tokens) ? usage.completion_tokens : undefined,
+      durationMs: Date.now() - startedAt,
+    })
+    usageRecorded = true
+    const text = String(result.choices?.[0]?.message?.content || '[]').replace(/```json|```/g, '').trim()
+    const parsed = JSON.parse(text)
+    if (!Array.isArray(parsed)) return localNewsSummaries(articles)
+    return articles.map((article, index) => {
+      const item = parsed.find((entry) => Number(entry.index) === index) || parsed[index] || {}
+      return buildNewsArticleSummary({
+        ...article,
+        headline: item.headline || item.title || article.title,
+        summary: item.summary || article.content,
+        whyItMatters: item.whyItMatters || item.why_it_matters || `It is relevant to: ${article.matchedInterests.join(', ')}.`,
+      })
+    })
   } catch (error) {
-    logEvent('WARN', `Groq news summarization failed: ${error.message}`, 'search')
-    return articles.map((article) => buildNewsArticleSummary({
-      title: article.title,
-      summary: article.content || 'Recent update in your monitored technology categories.',
-      whyItMatters: 'It matches one of your monitored categories and may affect builders, founders, or hiring trends.',
-      url: article.url,
-      source: article.source,
-    }))
+    if (!usageRecorded) database.recordProviderUsage({
+      provider: 'groq', operation: 'news-summarize', status: 'failed',
+      durationMs: Date.now() - startedAt, error: error.message,
+    })
+    logEvent('WARN', `Groq news summarization failed; using search snippets: ${error.message}`, 'search')
+    return localNewsSummaries(articles)
   }
 }
 
-async function sendNewsNotification(chatId, article) {
-  const text = [
-    article.title,
+async function sendNewsNotification(chatId, articles) {
+  const text = articles.map((article) => [
+    `📰 ${article.title}`,
     article.summary,
     `Why it matters: ${article.whyItMatters}`,
+    `Interest: ${article.matchedInterests?.join(', ') || article.categories?.join(', ') || 'Personalized news'}`,
+    `Published: ${article.publishedAt ? new Date(article.publishedAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : 'Recent'}`,
     article.sourceUrl ? `Source: ${article.sourceUrl}` : '',
-  ].filter(Boolean).join('\n')
+  ].filter(Boolean).join('\n')).join('\n\n')
   await sendTelegramMessage(chatId, text)
 }
 
@@ -905,38 +1025,81 @@ async function runNewsResearch(trigger = 'scheduled') {
     if (!settings.enabled && !['telegram', 'manual', 'external-cron'].includes(trigger)) {
       return { status: 'disabled', skipped: true, delivered: 0 }
     }
+    const chatId = settings.telegramChatId || database.getSettings().telegramChatId
+    if (!chatId) {
+      const message = 'Add your Telegram chat ID in News interests to receive automatic briefings.'
+      database.completeNewsRun(runId, { status: 'needs-configuration', error: message })
+      return { status: 'needs-configuration', discovered: 0, delivered: 0, reason: message }
+    }
     const secrets = await readSecrets()
-    const discovered = await searchRecentNews(secrets, settings.categories)
+    const discovered = await searchRecentNews(secrets, settings.interests)
+    database.markNewsSuccessful()
     if (!discovered.length) {
       database.completeNewsRun(runId, { status: 'skipped', discoveredCount: 0, newCount: 0, deliveredCount: 0 })
       return { status: 'skipped', discovered: 0, delivered: 0, skipped: true }
     }
-    const summaries = formatNewsArticles(discovered, settings.categories)
+    const todayStart = startOfDayInTimeZone(new Date())
+    const dailyCount = database.countNewsBriefingsSince(todayStart.toISOString())
+    const quiet = isQuietHours(new Date(), settings.quietStart, settings.quietEnd)
+    if (quiet || dailyCount >= settings.maxNotificationsPerDay) {
+      const reason = quiet ? 'quiet-hours' : 'daily-limit'
+      database.completeNewsRun(runId, { status: 'skipped', discoveredCount: discovered.length, error: reason })
+      return { status: 'skipped', discovered: discovered.length, delivered: 0, reason }
+    }
+
+    const candidates = discovered.filter((article) => {
+      const existing = database.getNewsArticle(article.url, article.title)
+      return !existing || (
+        !database.hasNewsNotification(existing.id, `telegram:${chatId}:${existing.id}`)
+        && !database.hasNewsNotification(existing.id, `telegram:${existing.id}`)
+      )
+    }).slice(0, settings.maxArticlesPerNotification)
+    if (!candidates.length) {
+      database.completeNewsRun(runId, { status: 'completed', discoveredCount: discovered.length, newCount: 0, deliveredCount: 0 })
+      return { status: 'completed', discovered: discovered.length, new: 0, delivered: 0, skipped: false }
+    }
+
+    const needingSummary = candidates.filter((article) => {
+      const existing = database.getNewsArticle(article.url, article.title)
+      return !existing?.summary || !existing?.why_it_matters
+    })
+    const generated = await summarizeNewsArticles(needingSummary, secrets, settings)
+    const summaries = candidates.map((article) => {
+      const existing = database.getNewsArticle(article.url, article.title)
+      const generatedSummary = generated[needingSummary.indexOf(article)]
+      return generatedSummary || buildNewsArticleSummary({
+        ...article,
+        summary: existing?.summary || article.content,
+        whyItMatters: existing?.why_it_matters || `It is relevant to: ${article.matchedInterests.join(', ')}.`,
+      })
+    })
     let newCount = 0
-    let deliveredCount = 0
-    const chatId = database.getSettings().telegramChatId
-    for (const article of summaries.slice(0, 4)) {
+    const briefing = []
+    for (const article of summaries) {
       const payload = {
         title: article.title,
         url: article.sourceUrl || '',
         source: article.source || new URL(article.sourceUrl || 'https://example.com').hostname.replace(/^www\./, ''),
         summary: article.summary,
         whyItMatters: article.whyItMatters,
-        publishedAt: new Date().toISOString(),
-        categories: article.categories,
+        publishedAt: article.publishedAt || new Date().toISOString(),
+        categories: article.matchedInterests,
       }
       const stored = database.upsertNewsArticle(payload)
       if (stored.isNew) newCount++
-      if (!chatId) continue
-      const notificationKey = `telegram:${stored.id}`
-      const quiet = isQuietHours(new Date(), settings.quietStart, settings.quietEnd)
-      const dailyCount = database.countNewsNotificationsSince(new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
-      const canNotify = !quiet && dailyCount < settings.maxNotificationsPerDay && !database.hasNewsNotification(stored.id, notificationKey)
-      if (!canNotify) continue
-      await sendNewsNotification(chatId, payload)
-      database.recordNewsNotification(stored.id, notificationKey)
-      deliveredCount++
+      briefing.push({
+        ...article,
+        ...payload,
+        id: stored.id,
+      })
     }
+    await sendNewsNotification(chatId, briefing)
+    const deliveredAt = new Date().toISOString()
+    database.recordNewsBriefing(runId, chatId, deliveredAt)
+    for (const article of briefing) {
+      database.recordNewsNotification(article.id, `telegram:${chatId}:${article.id}`)
+    }
+    const deliveredCount = briefing.length
     database.completeNewsRun(runId, {
       status: 'completed',
       discoveredCount: discovered.length,
@@ -1194,6 +1357,20 @@ async function handleTelegramUpdate(update, settings) {
     await sendTelegramMessage(chatId, `This bot is restricted to approved users. Ask the owner to add your Telegram user ID: ${userId}`)
     logEvent('403 FORBIDDEN', `Rejected unauthorized Telegram user ${userId}`, 'errors')
     return
+  }
+
+  if (!text.startsWith('/') && /birthday|anniversary|interview|exam|examination|meeting|internship|submission|travel|festival|deadline|assignment/i.test(text)) {
+    const event = parseNaturalLanguageEvent(text, new Date())
+    if (event) {
+      const created = database.createLifeEvent({
+        ...event,
+        title: event.title,
+        description: event.description,
+        reminderMinutes: [0, 1440],
+      })
+      await sendTelegramMessage(chatId, `Saved event: ${created.title} for ${created.eventDate}${created.eventTime ? ` at ${created.eventTime}` : ''}.`)
+      return
+    }
   }
 
   if (commandText === '/start') {
@@ -1703,7 +1880,9 @@ const server = createServer(async (request, response) => {
     }
 
     const isPublicHealthCheck = request.method === 'GET' && url.pathname === '/api/health'
-    if (production && !isPublicHealthCheck && !isDashboardAuthorized(request)) {
+    const isNewsCronRoute = request.method === 'POST' && url.pathname === '/api/cron/news'
+    const isAuthorizedNewsCron = isNewsCronRoute && isNewsCronAuthorized(request)
+    if (production && !isPublicHealthCheck && !isAuthorizedNewsCron && !isDashboardAuthorized(request)) {
       response.writeHead(401, {
         'www-authenticate': 'Basic realm="AgentFlow Control Center", charset="UTF-8"',
         'content-type': 'application/json; charset=utf-8',
@@ -1723,7 +1902,38 @@ const server = createServer(async (request, response) => {
         providerUsage: database.listProviderUsage(40),
         scheduler: database.getScheduler(),
         runInProgress: jobResearchRunning,
+        companion: database.getCompanionSettings(),
       })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/companion') {
+      return respond(response, 200, {
+        settings: database.getCompanionSettings(),
+        events: database.listLifeEvents(),
+        chatId: getCompanionNotificationChatId(),
+      })
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/api/companion/settings') {
+      const input = await readJson(request)
+      return respond(response, 200, { settings: database.saveCompanionSettings(input) })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/events') {
+      return respond(response, 200, { events: database.listLifeEvents() })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/events') {
+      const input = await readJson(request)
+      const event = database.createLifeEvent(normalizeLifeEvent(input))
+      return respond(response, 200, { event })
+    }
+
+    if (request.method === 'DELETE' && url.pathname.startsWith('/api/events/')) {
+      const id = Number(url.pathname.split('/').pop())
+      if (!Number.isInteger(id) || id <= 0) return respond(response, 400, { error: 'Invalid event ID.' })
+      const deleted = database.deleteLifeEvent(id)
+      return respond(response, deleted ? 200 : 404, { deleted })
     }
 
     if (request.method === 'PUT' && url.pathname === '/api/jobs/profile') {
@@ -1755,10 +1965,11 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'GET' && url.pathname === '/api/news') {
       return respond(response, 200, {
-        settings: { ...database.getNewsSettings(), telegramChatId: database.getSettings().telegramChatId },
+        settings: database.getNewsSettings(),
         articles: database.listNewsArticles(10),
         notifications: database.listNewsNotifications(10),
         history: database.listNewsRuns(10),
+        usage: database.getNewsUsageStats(),
       })
     }
 
@@ -1769,17 +1980,25 @@ const server = createServer(async (request, response) => {
         && (typeof input.telegramChatId !== 'string' || !/^-?\d{1,20}$/.test(input.telegramChatId))) {
         return respond(response, 400, { error: 'Telegram notification chat ID must be numeric.' })
       }
-      const settings = normalizeNewsSettings(input, database.getNewsSettings())
-      database.saveNewsSettings(settings)
-      if (typeof input.telegramChatId === 'string') {
-        database.saveSettings({ ...database.getSettings(), telegramChatId: input.telegramChatId })
-      }
-      return respond(response, 200, {
-        settings: { ...database.getNewsSettings(), telegramChatId: database.getSettings().telegramChatId },
-      })
+      const settingsInput = { ...input }
+      delete settingsInput.nextRunAt
+      delete settingsInput.lastSuccessfulAt
+      delete settingsInput.groqCooldownUntil
+      delete settingsInput.updatedAt
+      const settings = normalizeNewsSettings(settingsInput, database.getNewsSettings())
+      return respond(response, 200, { settings: database.saveNewsSettings(settings) })
     }
 
     if (request.method === 'POST' && url.pathname === '/api/cron/news') {
+      if (!isNewsCronAuthorized(request)) {
+        return respond(response, 401, { error: 'News scheduler authentication required.' })
+      }
+      const settings = database.getNewsSettings()
+      if (!settings.enabled) return respond(response, 200, { status: 'disabled', skipped: true, delivered: 0 })
+      if (settings.nextRunAt && Date.parse(settings.nextRunAt) > Date.now()) {
+        return respond(response, 200, { status: 'not-due', nextRunAt: settings.nextRunAt })
+      }
+      database.setNewsNextRun(new Date(Date.now() + settings.intervalHours * 60 * 60 * 1000).toISOString())
       const result = await runNewsResearch('external-cron')
       return respond(response, 200, result)
     }
@@ -1930,6 +2149,9 @@ server.listen(port, host, () => {
     intervalMs: 30000,
   })
   newsScheduler.start().catch((error) => logEvent('500 ERROR', `Could not initialize proactive news scheduler: ${error.message}`, 'errors'))
+  setInterval(() => {
+    processCompanionNotifications().catch((error) => logEvent('500 ERROR', `Companion monitor failed: ${error.message}`, 'errors'))
+  }, 60 * 1000)
   const preferences = database.getAgentPreferences()
   if (preferences.autoStart) {
     startTelegramAgentAutomatically(preferences.settings)

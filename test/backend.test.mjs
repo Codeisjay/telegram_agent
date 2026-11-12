@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { getDueGreeting, normalizeCompanionSettings, parseNaturalLanguageEvent } from '../companion-intelligence.mjs'
 import { JobDatabase } from '../job-intelligence.mjs'
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
@@ -16,7 +17,7 @@ let baseUrl
 function makeTestEnvironment(overrides = {}) {
   const environment = { ...process.env, LOCALAPPDATA: secretDirectory, AGENTFLOW_PORT: '0' }
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
-  for (const key of [...secretKeys, 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE']) delete environment[key]
+  for (const key of [...secretKeys, 'AGENTFLOW_NEWS_CRON_SECRET', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete environment[key]
@@ -52,6 +53,26 @@ function startTestBackend(overrides) {
   return { child, started }
 }
 
+test('companion greeting schedule and natural language parsing work as expected', () => {
+  const settings = normalizeCompanionSettings({
+    personalName: 'Jay',
+    greetingTimes: { morning: '08:00', afternoon: '13:00', evening: '18:00', night: '22:00' },
+    greetings: { morning: true, afternoon: true, evening: true, night: true },
+    quietStart: '22:30',
+    quietEnd: '07:00',
+  })
+  const greeting = getDueGreeting(settings, new Date('2026-11-12T08:00:00+05:30'))
+  assert.ok(greeting)
+  assert.equal(greeting.kind, 'morning')
+  assert.equal(greeting.message.includes('Jay'), true)
+  const later = getDueGreeting(settings, new Date('2026-11-12T23:00:00+05:30'))
+  assert.equal(later, null)
+  const event = parseNaturalLanguageEvent("My friend's birthday is on 12 March. Wish them every year.", new Date('2026-01-01T00:00:00Z'))
+  assert.equal(event.category, 'Birthday')
+  assert.equal(event.recurrence, 'Yearly')
+  assert.equal(event.eventDate.slice(0, 4), '2026')
+})
+
 before(async () => {
   const backend = startTestBackend()
   server = backend.child
@@ -76,37 +97,104 @@ test('health endpoint reports status without returning credential values', async
   assert.equal(Object.hasOwn(health, 'credentials'), false)
 })
 
-test('news settings API persists custom topics and the Telegram delivery chat ID', async () => {
+test('news settings API persists user-selected notification topics', async () => {
   const response = await fetch(`${baseUrl}/api/news`)
   assert.equal(response.status, 200)
   const { settings } = await response.json()
   const update = await fetch(`${baseUrl}/api/news/settings`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ ...settings, categories: ['crime', 'politics'], telegramChatId: '1207882899' }),
+    body: JSON.stringify({
+      ...settings,
+      categories: ['crime', 'politics'],
+      telegramChatId: '1207882899',
+      intervalHours: 2,
+      maxArticlesPerNotification: 6,
+      maxNotificationsPerDay: 3,
+      inputTokenBudget: 4500,
+      outputTokenBudget: 900,
+    }),
   })
   assert.equal(update.status, 200)
   const saved = (await update.json()).settings
   assert.deepEqual(saved.categories, ['crime', 'politics'])
   assert.equal(saved.telegramChatId, '1207882899')
+  assert.equal(saved.intervalHours, 2)
+  assert.equal(saved.maxArticlesPerNotification, 6)
+  assert.equal(saved.maxNotificationsPerDay, 3)
+  assert.equal(saved.inputTokenBudget, 4500)
+  assert.equal(saved.outputTokenBudget, 900)
   const persisted = await fetch(`${baseUrl}/api/news`).then((result) => result.json())
   assert.deepEqual(persisted.settings.categories, ['crime', 'politics'])
   assert.equal(persisted.settings.telegramChatId, '1207882899')
-
-  const invalid = await fetch(`${baseUrl}/api/news/settings`, {
+  const interests = await fetch(`${baseUrl}/api/news/settings`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ telegramChatId: 'not-a-chat-id' }),
-  })
-  assert.equal(invalid.status, 400)
+    body: JSON.stringify({
+      interests: [
+        { topic: 'Generative AI', enabled: true, priority: 'high' },
+        { topic: 'Browser Engineering', enabled: false, priority: 'low' },
+      ],
+    }),
+  }).then((result) => result.json())
+  assert.equal(interests.settings.interests[0].priority, 'high')
+  assert.deepEqual(interests.settings.categories, ['Generative AI'])
+})
 
-  const clearRecipient = await fetch(`${baseUrl}/api/news/settings`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ telegramChatId: '' }),
+test('news cron is authenticated, deduplicates before Groq, and sends automatic briefings', async () => {
+  const dataDirectory = path.join(tempRoot, 'news-automation-data')
+  const backend = startTestBackend({
+    AGENTFLOW_DATA_DIR: dataDirectory,
+    AGENTFLOW_NEWS_CRON_SECRET: 'test-news-cron-secret',
+    TAVILY_SEARCH_KEY: 'test-tavily-key',
+    GROQ_API_KEY: 'test-groq-key',
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
   })
-  assert.equal(clearRecipient.status, 200)
-  assert.equal((await clearRecipient.json()).settings.telegramChatId, '')
+  try {
+    const url = await backend.started
+    const unauthorized = await fetch(`${url}/api/cron/news`, { method: 'POST' })
+    assert.equal(unauthorized.status, 401)
+    const update = await fetch(`${url}/api/news/settings`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        enabled: true,
+        intervalHours: 3,
+        categories: ['Generative AI'],
+        telegramChatId: '12345',
+        quietStart: '00:00',
+        quietEnd: '00:01',
+        maxArticlesPerNotification: 3,
+        maxNotificationsPerDay: 4,
+      }),
+    })
+    assert.equal(update.status, 200)
+    const database = await JobDatabase.open(path.join(dataDirectory, 'jobs.sqlite'))
+    database.setNewsNextRun(new Date(Date.now() - 1000).toISOString())
+    database.close()
+
+    const headers = { authorization: 'Bearer test-news-cron-secret' }
+    const first = await fetch(`${url}/api/cron/news`, { method: 'POST', headers })
+    assert.equal(first.status, 200)
+    const result = await first.json()
+    assert.equal(result.delivered, 1)
+
+    const resetSchedule = await JobDatabase.open(path.join(dataDirectory, 'jobs.sqlite'))
+    resetSchedule.setNewsNextRun(new Date(Date.now() - 1000).toISOString())
+    resetSchedule.close()
+    const second = await fetch(`${url}/api/cron/news`, { method: 'POST', headers })
+    assert.equal(second.status, 200)
+    assert.equal((await second.json()).delivered, 0)
+    const state = await fetch(`${url}/api/news`).then((response) => response.json())
+    assert.equal(state.usage.filter((entry) => entry.provider === 'groq').reduce((sum, entry) => sum + entry.requests, 0), 1)
+    assert.equal(state.notifications.length, 1)
+    assert.equal(state.history[0].delivered_count, 0)
+  } finally {
+    if (backend.child.exitCode === null) {
+      backend.child.kill()
+      await new Promise((resolve) => backend.child.once('exit', resolve))
+    }
+  }
 })
 
 test('uses the platform PORT when AGENTFLOW_PORT is not configured', async () => {

@@ -49,40 +49,49 @@ The bot does not maintain conversation history between messages. The `/clear`
 command currently confirms that the conversation is cleared, but there is no
 stored conversation state to reset.
 
-## Proactive news notifications
+## Autonomous personalized news
 
-AgentFlow can run a proactive monitoring loop that discovers recent AI, startup,
-engineering, and career news, filters it for relevance, and sends brief Telegram
-updates when stories are genuinely new and important.
+The **News interests** dashboard configures an autonomous Telegram news agent.
+Once monitoring is enabled and a Telegram chat ID is saved, the service scans
+every 3 hours by default without requiring `/news_now`.
 
-- **Scheduler:** runs every 3 hours by default in Asia/Kolkata time; the
-  interval, enable/disable toggle, quiet hours, and topic list are all stored
-  in SQLite. Use the dashboard's **News interests** screen to add custom topics
-  such as crime or politics, remove topics, or restore the default AI, technology,
-  startup, and career interests. Telegram commands can also enable, disable, and
-  inspect monitoring.
-- **Discovery:** Tavily search is used to collect recent headlines and source
-  links, then results are deduplicated and filtered in Node.js before calling Groq.
-- **Low-token delivery:** scheduled news scans do not call an LLM. They send up
-  to four topic-matched headlines with short search-result snippets and source
-  links, using zero LLM tokens for the news loop.
-- **Telegram delivery:** only relevant updates are sent, duplicates are blocked,
-  and a hard cap of 4 notifications per day is enforced outside the quiet window
-  (11:00 PM–7:00 AM Asia/Kolkata).
-- **Automatic delivery:** save your numeric Telegram chat ID on the News
-  interests screen, enable monitoring, and keep AgentFlow online. It sends
-  matching updates on the configured interval; `/news_now` is optional.
-- **Commands:** `/news`, `/news_on`, `/news_off`, `/news_now`,
-  `/news_settings`, and `/news_history` are available to authorized Telegram
-  users.
-- **Cron endpoint:** `POST /api/cron/news` triggers the same proactive scan with
-  Basic Auth, separate from the existing job-research cron. It is intended for
-  external schedulers like cron-job.org.
+- **Persistent schedule:** the interval (1–24 hours), next scan, last successful
+  search, and monitoring state are stored in SQLite. Missed/interrupted scans
+  are recovered after restart. Times and quiet hours are displayed in
+  Asia/Kolkata.
+- **Personalization:** add up to 25 custom topics, enable/disable each, set high,
+  medium, or low priority, and reorder equal-priority topics. Only enabled
+  interests are searched. A recipient chat ID is configured separately from
+  the dashboard login or Telegram user whitelist; the recipient must have
+  started a conversation with the bot once.
+- **Low-credit discovery:** Tavily performs up to three grouped news searches
+  per scan, with at most five recent results per query. SQLite history filters
+  duplicates before summarization. Relevance and source/date prioritization use
+  local rules, not Groq.
+- **Groq summaries:** there are zero Groq calls when there are no new relevant
+  stories. New articles are summarized in one batched call, bounded by the
+  configured input/output token budgets. Requests are not retried; HTTP 429
+  starts a persistent cooldown and the agent can use search snippets meanwhile.
+- **Delivery and controls:** one concise Telegram briefing contains its headlines,
+  summaries, impact, matching interests, publication times, and original links.
+  Quiet hours, maximum articles per briefing, and daily briefing limit are
+  configurable. No briefing is sent when there is nothing new to report.
+  Dashboard history and Tavily/Groq request/token usage are shown for monitoring.
+- **Optional commands:** `/news`, `/news_on`, `/news_off`, `/news_now`,
+  `/news_settings`, and `/news_history` remain available to authorized users;
+  none is needed for routine scans.
+- **External scheduler:** `POST /api/cron/news` is a separate optional trigger.
+  Set `AGENTFLOW_NEWS_CRON_SECRET` and send it as a Bearer token. If unset, the
+  production dashboard's Basic Auth credentials can authorize this endpoint.
+  Internal scheduled scans do not require external cron.
 
-Render Free instances sleep after inactivity and use ephemeral storage, so the
-news scheduler should be treated as best-effort rather than a guaranteed always-on
-monitor. Keep the service awake with periodic health checks, and prefer a paid
-always-on plan for durable SQLite data and continuous polling.
+Render Free instances can sleep and have ephemeral storage. Periodic health
+requests may wake the service, but scans and Telegram polling cannot run while
+it is asleep, and SQLite settings/history can be lost when its filesystem is
+replaced. For reliable continuous monitoring and durable deduplication, use an
+always-on service with a persistent disk. A secured external scheduler can
+trigger the authenticated endpoint after waking a free instance, but cannot
+guarantee uninterrupted availability or durable data.
 
 ## Run locally
 
@@ -182,6 +191,8 @@ deploy it as a Static Site). In the service's Environment settings, add:
 - Any provider or Telegram credentials you want available, such as
   `GEMINI_API_KEY`, `GROQ_API_KEY`, `TAVILY_SEARCH_KEY`, or
   `TELEGRAM_BOT_TOKEN`.
+- `AGENTFLOW_NEWS_CRON_SECRET`: optional long random secret for an external
+  news scan trigger; keep it private and send as `Authorization: Bearer ...`.
 
 Render supplies `PORT`; leave `AGENTFLOW_PORT` unset so the app listens on
 Render's assigned port. Configure Render's health check path as `/api/health`.
@@ -216,6 +227,17 @@ on success; a duplicate same-day request returns that result with
 `replayed: true`. It returns 401 for missing/invalid Basic credentials, 409 while
 the daily run is already in progress, and a useful error status if the run
 fails.
+
+For autonomous news scans, the in-process scheduler is sufficient while the
+service remains online. If an external scheduler is also desired, configure a
+separate request:
+
+- **URL:** `https://<your-render-service>.onrender.com/api/cron/news`
+- **Method:** `POST`
+- **Authentication:** `Authorization: Bearer <AGENTFLOW_NEWS_CRON_SECRET>`
+- **Body:** none
+- **Schedule:** use the same interval selected in News interests, or leave this
+  endpoint unused to avoid extra searches.
 
 When a Telegram bot token is configured, polling starts automatically at
 service startup. Render Free web services spin down after 15 minutes without

@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
+import { DEFAULT_COMPANION_SETTINGS, normalizeCompanionSettings } from './companion-intelligence.mjs'
+import { DEFAULT_NEWS_CATEGORIES, normalizeNewsSettings } from './news-intelligence.mjs'
 
 export const emptyProfile = {
   graduationYear: '',
@@ -200,6 +202,32 @@ export function normalizeJobUrl(value) {
     return url.toString()
   } catch {
     return ''
+  }
+}
+
+export function normalizeLifeEvent(input = {}) {
+  const dateValue = typeof input.eventDate === 'string' && input.eventDate ? input.eventDate : new Date().toISOString().slice(0, 10)
+  const reminderMinutes = Array.isArray(input.reminderMinutes)
+    ? input.reminderMinutes.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
+    : (Array.isArray(input.reminder_schedule) ? input.reminder_schedule.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
+      : (Array.isArray(input.reminderSchedule) ? input.reminderSchedule.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
+        : [Number(input.reminderMinutes ?? 0)]))
+  const sanitizedReminder = reminderMinutes.length ? [...new Set(reminderMinutes)].slice(0, 8) : [0]
+  const eventTime = typeof input.eventTime === 'string' ? input.eventTime.trim() : ''
+  const recurrence = ['None', 'Daily', 'Weekly', 'Monthly', 'Yearly'].includes(input.recurrence) ? input.recurrence : (input.recurrence || 'None')
+  const category = String(input.category || 'Custom event').trim() || 'Custom event'
+  return {
+    title: String(input.title || 'Personal event').trim().slice(0, 150) || 'Personal event',
+    description: String(input.description || '').trim().slice(0, 500),
+    category,
+    eventDate: dateValue.slice(0, 10),
+    eventTime: /^\d{1,2}:\d{2}$/.test(eventTime) ? eventTime : '',
+    timezone: typeof input.timezone === 'string' && input.timezone ? input.timezone : 'Asia/Kolkata',
+    recurrence,
+    reminderMinutes: sanitizedReminder,
+    importance: ['Low', 'Medium', 'High'].includes(input.importance) ? input.importance : 'Medium',
+    active: input.active === false ? false : true,
+    nextOccurrence: input.nextOccurrence || dateValue.slice(0, 10),
   }
 }
 
@@ -412,10 +440,17 @@ export class JobDatabase {
         enabled INTEGER NOT NULL DEFAULT 0,
         interval_hours INTEGER NOT NULL DEFAULT 3,
         categories_json TEXT NOT NULL DEFAULT '[]',
+        interests_json TEXT NOT NULL DEFAULT '[]',
         quiet_start TEXT NOT NULL DEFAULT '23:00',
         quiet_end TEXT NOT NULL DEFAULT '07:00',
         max_notifications_per_day INTEGER NOT NULL DEFAULT 4,
+        max_articles_per_notification INTEGER NOT NULL DEFAULT 4,
+        input_token_budget INTEGER NOT NULL DEFAULT 6000,
+        output_token_budget INTEGER NOT NULL DEFAULT 1200,
+        telegram_chat_id TEXT NOT NULL DEFAULT '',
         next_run_at TEXT NOT NULL DEFAULT '',
+        last_successful_at TEXT NOT NULL DEFAULT '',
+        groq_cooldown_until TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS news_articles (
@@ -449,6 +484,50 @@ export class JobDatabase {
         completed_at TEXT NOT NULL DEFAULT '',
         error TEXT NOT NULL DEFAULT ''
       );
+      CREATE TABLE IF NOT EXISTS news_briefings (
+        id INTEGER PRIMARY KEY,
+        run_id INTEGER NOT NULL UNIQUE REFERENCES news_runs(id) ON DELETE CASCADE,
+        recipient_chat_id TEXT NOT NULL,
+        delivered_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS companion_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        settings_json TEXT NOT NULL DEFAULT '{}',
+        auto_greetings INTEGER NOT NULL DEFAULT 1,
+        paused INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS personal_events (
+        id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL DEFAULT 'Custom event',
+        event_date TEXT NOT NULL,
+        event_time TEXT NOT NULL DEFAULT '',
+        timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+        recurrence TEXT NOT NULL DEFAULT 'None',
+        reminder_minutes_json TEXT NOT NULL DEFAULT '[]',
+        importance TEXT NOT NULL DEFAULT 'Medium',
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_notified_at TEXT NOT NULL DEFAULT '',
+        next_occurrence TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS event_notifications (
+        id INTEGER PRIMARY KEY,
+        event_id INTEGER NOT NULL REFERENCES personal_events(id) ON DELETE CASCADE,
+        notification_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(event_id, notification_key)
+      );
+      CREATE TABLE IF NOT EXISTS companion_greetings (
+        id INTEGER PRIMARY KEY,
+        greeting_kind TEXT NOT NULL,
+        day_key TEXT NOT NULL,
+        delivered_at TEXT NOT NULL,
+        UNIQUE(greeting_kind, day_key)
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -462,12 +541,26 @@ export class JobDatabase {
         VALUES (1, '[]', 'openrouter', 2027, datetime('now'));
       INSERT OR IGNORE INTO scheduler_state(id, paused, next_run_at, updated_at)
         VALUES (1, 0, '', datetime('now'));
-      INSERT OR IGNORE INTO news_settings(id, enabled, interval_hours, categories_json, quiet_start, quiet_end, max_notifications_per_day, next_run_at, updated_at)
-        VALUES (1, 0, 3, '["AI/ML","Generative AI","Software engineering","Technology","Indian startups","Fresher jobs","Internships","Engineering innovations"]', '23:00', '07:00', 4, '', datetime('now'));
+      INSERT OR IGNORE INTO news_settings(id, enabled, interval_hours, categories_json, interests_json, quiet_start, quiet_end, max_notifications_per_day, next_run_at, updated_at)
+        VALUES (1, 0, 3, '["Artificial Intelligence and Generative AI","Machine Learning and Deep Learning","AI Agents and LLMs","Python, C++ and Software Engineering","Browser Engineering","Technology breakthroughs","Indian startups","Fresher jobs","Internships","Engineering innovations"]', '[]', '23:00', '07:00', 4, '', datetime('now'));
+      INSERT OR IGNORE INTO companion_settings(id, settings_json, auto_greetings, paused, updated_at)
+        VALUES (1, '{}', 1, 0, datetime('now'));
       INSERT OR IGNORE INTO agent_preferences(id, settings_json, auto_start, updated_at)
         VALUES (1, '{}', 1, datetime('now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'));
     `)
+    const newsSettingsColumns = new Set(this.db.prepare('PRAGMA table_info(news_settings)').all().map((column) => column.name))
+    for (const [column, declaration] of [
+      ['interests_json', "TEXT NOT NULL DEFAULT '[]'"],
+      ['max_articles_per_notification', 'INTEGER NOT NULL DEFAULT 4'],
+      ['input_token_budget', 'INTEGER NOT NULL DEFAULT 6000'],
+      ['output_token_budget', 'INTEGER NOT NULL DEFAULT 1200'],
+      ['telegram_chat_id', "TEXT NOT NULL DEFAULT ''"],
+      ['last_successful_at', "TEXT NOT NULL DEFAULT ''"],
+      ['groq_cooldown_until', "TEXT NOT NULL DEFAULT ''"],
+    ]) {
+      if (!newsSettingsColumns.has(column)) this.db.exec(`ALTER TABLE news_settings ADD COLUMN ${column} ${declaration}`)
+    }
     const settingsColumns = new Set(this.db.prepare('PRAGMA table_info(job_settings)').all().map((column) => column.name))
     if (!settingsColumns.has('telegram_chat_id')) {
       this.db.exec("ALTER TABLE job_settings ADD COLUMN telegram_chat_id TEXT NOT NULL DEFAULT ''")
@@ -611,8 +704,7 @@ export class JobDatabase {
     const year = Number(input.targetGraduationYear)
     const targetYear = Number.isInteger(year) && year >= 2020 && year <= 2040 ? year : current.targetGraduationYear
     const paused = typeof input.paused === 'boolean' ? input.paused : current.paused
-    const telegramChatId = typeof input.telegramChatId === 'string'
-      && (input.telegramChatId === '' || /^-?\d{1,20}$/.test(input.telegramChatId))
+    const telegramChatId = typeof input.telegramChatId === 'string' && /^-?\d{1,20}$/.test(input.telegramChatId)
       ? input.telegramChatId
       : current.telegramChatId
     const updatedAt = new Date().toISOString()
@@ -640,56 +732,215 @@ export class JobDatabase {
   }
 
   getNewsSettings() {
-    const row = this.db.prepare('SELECT enabled, interval_hours, categories_json, quiet_start, quiet_end, max_notifications_per_day, next_run_at, updated_at FROM news_settings WHERE id = 1').get()
-    return {
+    const row = this.db.prepare(`SELECT enabled, interval_hours, categories_json, interests_json,
+      quiet_start, quiet_end, max_notifications_per_day, max_articles_per_notification,
+      input_token_budget, output_token_budget, telegram_chat_id, next_run_at,
+      last_successful_at, groq_cooldown_until, updated_at FROM news_settings WHERE id = 1`).get()
+    const categories = JSON.parse(row.categories_json || '[]')
+    const savedInterests = JSON.parse(row.interests_json || '[]')
+    const legacyInterests = (Array.isArray(categories) && categories.length ? categories : DEFAULT_NEWS_CATEGORIES)
+    return normalizeNewsSettings({}, {
       enabled: Boolean(row.enabled),
       intervalHours: Number(row.interval_hours || 3),
-      categories: JSON.parse(row.categories_json || '[]'),
+      categories: legacyInterests,
+      interests: Array.isArray(savedInterests) && savedInterests.length ? savedInterests : legacyInterests,
       quietStart: row.quiet_start || '23:00',
       quietEnd: row.quiet_end || '07:00',
       maxNotificationsPerDay: Number(row.max_notifications_per_day || 4),
+      maxArticlesPerNotification: Number(row.max_articles_per_notification || 4),
+      inputTokenBudget: Number(row.input_token_budget || 6000),
+      outputTokenBudget: Number(row.output_token_budget || 1200),
+      telegramChatId: row.telegram_chat_id || '',
       nextRunAt: row.next_run_at || '',
+      lastSuccessfulAt: row.last_successful_at || '',
+      groqCooldownUntil: row.groq_cooldown_until || '',
       updatedAt: row.updated_at,
-    }
+    })
   }
 
   saveNewsSettings(input = {}) {
     const current = this.getNewsSettings()
-    const enabled = typeof input.enabled === 'boolean' ? input.enabled : current.enabled
-    const intervalHours = Number.isInteger(input.intervalHours) ? Math.min(24, Math.max(1, input.intervalHours)) : current.intervalHours
-    const categoriesByKey = new Map()
-    if (Array.isArray(input.categories)) {
-      for (const value of input.categories) {
-        if (typeof value !== 'string') continue
-        const category = value.trim().replace(/\s+/g, ' ').slice(0, 60)
-        const key = category.toLowerCase()
-        if (category && !categoriesByKey.has(key)) categoriesByKey.set(key, category)
+    const settings = normalizeNewsSettings(input, current)
+    const updatedAt = new Date().toISOString()
+    this.db.prepare(`UPDATE news_settings SET enabled = ?, interval_hours = ?, categories_json = ?,
+      interests_json = ?, quiet_start = ?, quiet_end = ?, max_notifications_per_day = ?,
+      max_articles_per_notification = ?, input_token_budget = ?, output_token_budget = ?,
+      telegram_chat_id = ?, next_run_at = ?, updated_at = ? WHERE id = 1`)
+      .run(Number(settings.enabled), settings.intervalHours, JSON.stringify(settings.categories),
+        JSON.stringify(settings.interests), settings.quietStart, settings.quietEnd,
+        settings.maxNotificationsPerDay, settings.maxArticlesPerNotification,
+        settings.inputTokenBudget, settings.outputTokenBudget, settings.telegramChatId,
+        settings.nextRunAt, updatedAt)
+    return this.getNewsSettings()
+  }
+
+  getCompanionSettings() {
+    const row = this.db.prepare('SELECT settings_json, auto_greetings, paused, updated_at FROM companion_settings WHERE id = 1').get()
+    const settings = JSON.parse(row.settings_json || '{}')
+    return normalizeCompanionSettings(settings, {
+      ...DEFAULT_COMPANION_SETTINGS,
+      paused: Boolean(row.paused),
+      autoGreetings: Boolean(row.auto_greetings),
+      greetingTimes: DEFAULT_COMPANION_SETTINGS.greetingTimes,
+      greetings: DEFAULT_COMPANION_SETTINGS.greetings,
+      notificationChatId: settings.notificationChatId || '',
+    })
+  }
+
+  saveCompanionSettings(input = {}) {
+    const current = this.getCompanionSettings()
+    const settings = normalizeCompanionSettings(input, current)
+    const updatedAt = new Date().toISOString()
+    this.db.prepare('UPDATE companion_settings SET settings_json = ?, auto_greetings = ?, paused = ?, updated_at = ? WHERE id = 1')
+      .run(JSON.stringify(settings), Number(Boolean(settings.greetings && settings.greetings.morning !== false)), Number(settings.paused), updatedAt)
+    return this.getCompanionSettings()
+  }
+
+  recordCompanionGreeting(kind, dayKey = new Date().toISOString().slice(0, 10), deliveredAt = new Date().toISOString()) {
+    const result = this.db.prepare('INSERT OR IGNORE INTO companion_greetings(greeting_kind, day_key, delivered_at) VALUES (?, ?, ?)')
+      .run(String(kind), String(dayKey), deliveredAt)
+    return result.changes > 0
+  }
+
+  hasCompanionGreeting(kind, dayKey = new Date().toISOString().slice(0, 10)) {
+    return Boolean(this.db.prepare('SELECT 1 FROM companion_greetings WHERE greeting_kind = ? AND day_key = ?').get(kind, String(dayKey)))
+  }
+
+  createLifeEvent(input = {}) {
+    const event = normalizeLifeEvent(input)
+    const now = new Date().toISOString()
+    const result = this.db.prepare(`INSERT INTO personal_events(
+      title, description, category, event_date, event_time, timezone, recurrence,
+      reminder_minutes_json, importance, active, created_at, updated_at, next_occurrence
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        event.title,
+        event.description,
+        event.category,
+        event.eventDate,
+        event.eventTime || '',
+        event.timezone,
+        event.recurrence,
+        JSON.stringify(Array.isArray(event.reminderMinutes) ? event.reminderMinutes : [event.reminderMinutes || 0]),
+        event.importance,
+        event.active ? 1 : 0,
+        now,
+        now,
+        event.nextOccurrence || event.eventDate,
+      )
+    const id = Number(result.lastInsertRowid)
+    return this.getLifeEvent(id)
+  }
+
+  getLifeEvent(id) {
+    const row = this.db.prepare('SELECT * FROM personal_events WHERE id = ?').get(id)
+    if (!row) return null
+    return this.deserializeLifeEvent(row)
+  }
+
+  listLifeEvents() {
+    return this.db.prepare('SELECT * FROM personal_events ORDER BY next_occurrence ASC, created_at DESC').all().map((row) => this.deserializeLifeEvent(row))
+  }
+
+  deleteLifeEvent(id) {
+    return this.db.prepare('DELETE FROM personal_events WHERE id = ?').run(id).changes > 0
+  }
+
+  updateLifeEvent(id, input = {}) {
+    const current = this.getLifeEvent(id)
+    if (!current) return null
+    const next = normalizeLifeEvent({ ...current, ...input })
+    const updatedAt = new Date().toISOString()
+    this.db.prepare(`UPDATE personal_events SET title = ?, description = ?, category = ?, event_date = ?, event_time = ?, timezone = ?, recurrence = ?, reminder_minutes_json = ?, importance = ?, active = ?, updated_at = ?, next_occurrence = ? WHERE id = ?`)
+      .run(
+        next.title,
+        next.description,
+        next.category,
+        next.eventDate,
+        next.eventTime || '',
+        next.timezone,
+        next.recurrence,
+        JSON.stringify(Array.isArray(next.reminderMinutes) ? next.reminderMinutes : [next.reminderMinutes || 0]),
+        next.importance,
+        next.active ? 1 : 0,
+        updatedAt,
+        next.nextOccurrence || next.eventDate,
+        id,
+      )
+    return this.getLifeEvent(id)
+  }
+
+  deserializeLifeEvent(row) {
+    const reminderMinutes = JSON.parse(row.reminder_minutes_json || '[]')
+    return {
+      id: Number(row.id),
+      title: row.title,
+      description: row.description,
+      category: row.category,
+      eventDate: row.event_date,
+      eventTime: row.event_time,
+      timezone: row.timezone || 'Asia/Kolkata',
+      recurrence: row.recurrence || 'None',
+      reminderMinutes: Array.isArray(reminderMinutes) ? reminderMinutes.map(Number).filter(Number.isFinite) : [0],
+      importance: row.importance || 'Medium',
+      active: Boolean(row.active),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastNotifiedAt: row.last_notified_at || '',
+      nextOccurrence: row.next_occurrence || row.event_date,
+    }
+  }
+
+  markLifeEventNotified(eventId, notificationKey, deliveredAt = new Date().toISOString()) {
+    const result = this.db.prepare('INSERT OR IGNORE INTO event_notifications(event_id, notification_key, created_at) VALUES (?, ?, ?)')
+      .run(eventId, String(notificationKey), deliveredAt)
+    if (result.changes > 0) {
+      this.db.prepare('UPDATE personal_events SET last_notified_at = ?, updated_at = ? WHERE id = ?')
+        .run(deliveredAt, deliveredAt, eventId)
+    }
+    return result.changes > 0
+  }
+
+  getDueLifeEvents(now = new Date()) {
+    const rows = this.db.prepare('SELECT * FROM personal_events WHERE active = 1 ORDER BY next_occurrence ASC').all()
+    const due = []
+    const currentTimestamp = now.getTime()
+    for (const row of rows) {
+      const event = this.deserializeLifeEvent(row)
+      for (const reminderMinutes of event.reminderMinutes) {
+        const notificationKey = `${event.id}:${event.nextOccurrence || event.eventDate}:${reminderMinutes}`
+        if (this.db.prepare('SELECT 1 FROM event_notifications WHERE event_id = ? AND notification_key = ?').get(event.id, notificationKey)) continue
+        const occurrence = new Date(`${event.eventDate}T${event.eventTime || '00:00'}:00`)
+        if (!Number.isFinite(occurrence.getTime())) continue
+        const milestone = new Date(occurrence.getTime() - reminderMinutes * 60 * 1000)
+        if (milestone.getTime() <= currentTimestamp && milestone.getTime() >= currentTimestamp - 1000 * 60 * 60 * 24) {
+          due.push({ ...event, reminderMinutes, notificationKey, dueAt: milestone.toISOString() })
+          break
+        }
       }
     }
-    const categories = [...categoriesByKey.values()].slice(0, 15)
-    if (!categories.length) categories.push(...current.categories.slice(0, 15))
-    const quietStart = typeof input.quietStart === 'string' && /^\d{2}:\d{2}$/.test(input.quietStart)
-      ? input.quietStart
-      : current.quietStart
-    const quietEnd = typeof input.quietEnd === 'string' && /^\d{2}:\d{2}$/.test(input.quietEnd)
-      ? input.quietEnd
-      : current.quietEnd
-    const maxNotificationsPerDay = Number.isInteger(input.maxNotificationsPerDay)
-      ? Math.min(10, Math.max(1, input.maxNotificationsPerDay))
-      : current.maxNotificationsPerDay
-    const updatedAt = new Date().toISOString()
-    const nextRunAt = typeof input.nextRunAt === 'string' && input.nextRunAt
-      ? input.nextRunAt
-      : current.nextRunAt || (enabled ? new Date(Date.now() + intervalHours * 60 * 60 * 1000).toISOString() : '')
-    this.db.prepare('UPDATE news_settings SET enabled = ?, interval_hours = ?, categories_json = ?, quiet_start = ?, quiet_end = ?, max_notifications_per_day = ?, next_run_at = ?, updated_at = ? WHERE id = 1')
-      .run(Number(enabled), intervalHours, JSON.stringify(categories), quietStart, quietEnd, maxNotificationsPerDay, nextRunAt, updatedAt)
-    return this.getNewsSettings()
+    return due
   }
 
   setNewsNextRun(value) {
     this.db.prepare('UPDATE news_settings SET next_run_at = ?, updated_at = ? WHERE id = 1')
       .run(value, new Date().toISOString())
     return this.getNewsSettings()
+  }
+
+  markNewsSuccessful(value = new Date().toISOString()) {
+    this.db.prepare('UPDATE news_settings SET last_successful_at = ?, updated_at = ? WHERE id = 1')
+      .run(value, new Date().toISOString())
+  }
+
+  setGroqNewsCooldown(value) {
+    this.db.prepare('UPDATE news_settings SET groq_cooldown_until = ?, updated_at = ? WHERE id = 1')
+      .run(value, new Date().toISOString())
+  }
+
+  recoverInterruptedNewsRuns() {
+    return this.db.prepare(`UPDATE news_runs SET status='failed', completed_at=?,
+      error='Process stopped during this run.' WHERE status='running'`).run(new Date().toISOString()).changes
   }
 
   createNewsRun(trigger) {
@@ -752,6 +1003,13 @@ export class JobDatabase {
     return this.db.prepare('SELECT * FROM news_articles ORDER BY created_at DESC LIMIT ?').all(limit)
   }
 
+  getNewsArticle(url, title) {
+    const dedupeKey = (String(url || title || '').trim().toLowerCase()
+      .replace(/^https?:\/\//, '').replace(/[?#].*$/, '').replace(/\/$/, '')) || String(title || '').trim().toLowerCase()
+    if (!dedupeKey) return null
+    return this.db.prepare('SELECT * FROM news_articles WHERE dedupe_key = ?').get(dedupeKey) || null
+  }
+
   listNewsNotifications(limit = 10) {
     return this.db.prepare(`
       SELECT n.id, n.article_id, n.notification_key, n.created_at,
@@ -766,6 +1024,36 @@ export class JobDatabase {
   countNewsNotificationsSince(timeIso) {
     if (!timeIso) return 0
     return Number(this.db.prepare('SELECT COUNT(*) AS count FROM news_notifications WHERE created_at >= ?').get(timeIso).count)
+  }
+
+  countNewsBriefingsSince(timeIso) {
+    if (!timeIso) return 0
+    return Number(this.db.prepare('SELECT COUNT(*) AS count FROM news_briefings WHERE delivered_at >= ?').get(timeIso).count)
+  }
+
+  recordNewsBriefing(runId, recipientChatId, deliveredAt = new Date().toISOString()) {
+    this.db.prepare('INSERT OR IGNORE INTO news_briefings(run_id, recipient_chat_id, delivered_at) VALUES (?, ?, ?)')
+      .run(runId, String(recipientChatId), deliveredAt)
+  }
+
+  getNewsUsageStats() {
+    const rows = this.db.prepare(`SELECT provider, operation, COUNT(*) AS requests,
+      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successful,
+      SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS failed,
+      SUM(COALESCE(input_tokens, 0)) AS inputTokens,
+      SUM(COALESCE(output_tokens, 0)) AS outputTokens
+      FROM provider_usage WHERE operation IN ('news-search', 'news-summarize')
+      AND created_at >= ? GROUP BY provider, operation ORDER BY provider, operation`)
+      .all(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())
+    return rows.map((row) => ({
+      provider: row.provider,
+      operation: row.operation,
+      requests: Number(row.requests),
+      successful: Number(row.successful),
+      failed: Number(row.failed),
+      inputTokens: Number(row.inputTokens),
+      outputTokens: Number(row.outputTokens),
+    }))
   }
 
   recordNewsNotification(articleId, notificationKey) {

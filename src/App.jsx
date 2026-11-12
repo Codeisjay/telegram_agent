@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  Activity, AlertTriangle, ArrowDown, ArrowRight, ArrowUpRight, BarChart3,
+  Activity, AlertTriangle, ArrowDown, ArrowRight, ArrowUp, ArrowUpRight, BarChart3,
   Bot, BriefcaseBusiness, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, CircleHelp,
   Clock3, Command, Copy, Cpu, ExternalLink, Eye, EyeOff, FileText, Filter, FlaskConical,
   Globe2, KeyRound, LayoutDashboard, LockKeyhole, Menu, MessageCircle,
@@ -445,10 +445,12 @@ function SectionHeader({ eyebrow, title, description, action }) {
 }
 
 const defaultNewsTopics = [
-  'AI/ML',
-  'Generative AI',
-  'Software engineering',
-  'Technology',
+  'Artificial Intelligence and Generative AI',
+  'Machine Learning and Deep Learning',
+  'AI Agents and LLMs',
+  'Python, C++ and Software Engineering',
+  'Browser Engineering',
+  'Technology breakthroughs',
   'Indian startups',
   'Fresher jobs',
   'Internships',
@@ -457,42 +459,65 @@ const defaultNewsTopics = [
 
 function NewsInterestsPage({ onToast }) {
   const [settings, setSettings] = useState(null)
+  const [newsData, setNewsData] = useState({ articles: [], notifications: [], history: [], usage: [] })
   const [topicDraft, setTopicDraft] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     let mounted = true
-    fetch('/api/news')
-      .then(async (response) => {
+    const loadNews = async () => {
+      try {
+        const response = await fetch('/api/news')
         const result = await readApiResponse(response)
         if (!response.ok) throw new Error(result.error || 'Could not load news settings.')
-        if (mounted) setSettings(result.settings)
-      })
-      .catch((error) => {
+        if (mounted) {
+          setSettings(result.settings)
+          setNewsData({
+            articles: result.articles || [],
+            notifications: result.notifications || [],
+            history: result.history || [],
+            usage: result.usage || [],
+          })
+        }
+      } catch (error) {
         if (mounted) onToast(error.message || 'Could not load news settings.')
-      })
-      .finally(() => {
+      } finally {
         if (mounted) setLoading(false)
-      })
-    return () => { mounted = false }
+      }
+    }
+    loadNews()
+    const timer = setInterval(loadNews, 30000)
+    return () => { mounted = false; clearInterval(timer) }
   }, [onToast])
 
   const updateSettings = (patch) => setSettings((current) => ({ ...current, ...patch }))
+  const updateInterest = (index, patch) => updateSettings({
+    interests: settings.interests.map((interest, itemIndex) => itemIndex === index ? { ...interest, ...patch } : interest),
+  })
   const addTopic = (event) => {
     event.preventDefault()
     const topic = topicDraft.trim().replace(/\s+/g, ' ')
     if (!topic) return
-    if (settings.categories.some((category) => category.toLowerCase() === topic.toLowerCase())) {
+    if (settings.interests.some((interest) => interest.topic.toLowerCase() === topic.toLowerCase())) {
       onToast('That topic is already in your list.')
       return
     }
-    if (settings.categories.length >= 15) {
-      onToast('You can monitor up to 15 topics.')
+    if (settings.interests.length >= 25) {
+      onToast('You can monitor up to 25 interests.')
       return
     }
-    updateSettings({ categories: [...settings.categories, topic] })
+    updateSettings({
+      interests: [...settings.interests, { topic, enabled: true, priority: 'medium', order: settings.interests.length }],
+    })
     setTopicDraft('')
+  }
+  const moveInterest = (from, to) => {
+    if (to < 0 || to >= settings.interests.length) return
+    const interests = [...settings.interests]
+    const [moved] = interests.splice(from, 1)
+    interests.splice(to, 0, moved)
+    updateSettings({ interests: interests.map((interest, order) => ({ ...interest, order })) })
   }
   const saveSettings = async () => {
     setSaving(true)
@@ -513,8 +538,12 @@ function NewsInterestsPage({ onToast }) {
     }
   }
 
+  const formatDate = (value) => value
+    ? new Date(value).toLocaleString(undefined, { timeZone: 'Asia/Kolkata' })
+    : 'Not yet'
+
   return <div className="settings-page">
-    <SectionHeader eyebrow="PERSONALIZED MONITORING" title="News interests" description="Add the subjects you care about. AgentFlow will search for recent, relevant stories and send updates to Telegram." action={<button className="primary-button" disabled={loading || saving || !settings} onClick={saveSettings}>{saving ? <RefreshCw size={14} className="spin" /> : <Check size={15} />}{saving ? 'Saving…' : 'Save settings'}</button>} />
+    <SectionHeader eyebrow="PERSONALIZED MONITORING" title="News interests" description="Configure once. AgentFlow scans automatically and sends only new, relevant briefings to Telegram." action={<button className="primary-button" disabled={loading || saving || !settings} onClick={saveSettings}>{saving ? <RefreshCw size={14} className="spin" /> : <Check size={15} />}{saving ? 'Saving…' : 'Save settings'}</button>} />
     {loading && <section className="panel settings-panel"><p className="news-loading">Loading your saved news settings…</p></section>}
     {!loading && settings && <>
       <section className="panel settings-panel news-monitor-panel">
@@ -522,26 +551,55 @@ function NewsInterestsPage({ onToast }) {
         <div className="news-monitor-controls">
           <div className="news-monitor-toggle"><div><strong>Enable monitoring</strong><span>Runs automatically while your AgentFlow service is online.</span></div><Switch checked={settings.enabled} label="Enable proactive news monitoring" onChange={(enabled) => updateSettings({ enabled })} /></div>
           <label className="news-interval-field">Search interval <span>hours</span><input type="number" min="1" max="24" step="1" value={settings.intervalHours} onChange={(event) => updateSettings({ intervalHours: Math.max(1, Math.min(24, Number(event.target.value) || 1)) })} /></label>
-          <div className="news-next-run"><Clock3 size={15} /><span>Next scheduled scan (Asia/Kolkata)</span><strong>{settings.nextRunAt ? new Date(settings.nextRunAt).toLocaleString(undefined, { timeZone: 'Asia/Kolkata' }) : 'Set when monitoring is enabled'}</strong></div>
+          <div className="news-schedule-status"><div className="news-next-run"><Clock3 size={15} /><span>Next scheduled scan (Asia/Kolkata)</span><strong>{settings.nextRunAt ? formatDate(settings.nextRunAt) : 'Set when monitoring is enabled'}</strong></div><div className="news-next-run"><CheckCheck size={15} /><span>Last successful search (Asia/Kolkata)</span><strong>{formatDate(settings.lastSuccessfulAt)}</strong></div></div>
         </div>
       </section>
       <section className="panel settings-panel news-topics-panel">
-        <div className="panel-heading"><div><div className="panel-title-icon prompt-title-icon"><Search size={16} /></div><div><h2>Your notification topics</h2><p>Stories are searched and filtered using these topics. Add your own, such as crime or politics.</p></div></div><Badge tone="subtle">{settings.categories.length}/15 TOPICS</Badge></div>
-        <form className="news-topic-add" onSubmit={addTopic}><input aria-label="Add a news topic" maxLength="60" placeholder="Enter a topic, e.g. crime, politics, climate change" value={topicDraft} onChange={(event) => setTopicDraft(event.target.value)} /><button className="outline-button small-button" type="submit" disabled={!topicDraft.trim() || settings.categories.length >= 15}><Plus size={14} /> Add topic</button></form>
-        <div className="news-topic-list" aria-label="Selected news topics">
-          {settings.categories.map((category) => <span className="news-topic-chip" key={category}>{category}<button type="button" aria-label={`Remove ${category}`} disabled={settings.categories.length <= 1} onClick={() => updateSettings({ categories: settings.categories.filter((entry) => entry !== category) })}><X size={12} /></button></span>)}
+        <div className="panel-heading"><div><div className="panel-title-icon prompt-title-icon"><Search size={16} /></div><div><h2>Your personalized interests</h2><p>Only enabled interests are searched. High-priority topics are favored in discovery and delivery.</p></div></div><Badge tone="subtle">{settings.interests.length}/25 INTERESTS</Badge></div>
+        <form className="news-topic-add" onSubmit={addTopic}><input aria-label="Add a news topic" maxLength="80" placeholder="Add a topic, company, role, or technology" value={topicDraft} onChange={(event) => setTopicDraft(event.target.value)} /><button className="outline-button small-button" type="submit" disabled={!topicDraft.trim() || settings.interests.length >= 25}><Plus size={14} /> Add interest</button></form>
+        <div className="news-interest-list" aria-label="News interests">
+          {settings.interests.map((interest, index) => <div className={`news-interest-row ${interest.enabled ? '' : 'interest-disabled'}`} key={interest.topic}>
+            <Switch checked={interest.enabled} label={`Enable ${interest.topic}`} onChange={(enabled) => updateInterest(index, { enabled })} />
+            <span className="news-interest-topic">{interest.topic}</span>
+            <label className="news-priority-field">Priority<select aria-label={`Priority for ${interest.topic}`} value={interest.priority} onChange={(event) => updateInterest(index, { priority: event.target.value })}><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
+            <button type="button" className="news-order-button" aria-label={`Move ${interest.topic} up`} disabled={index === 0} onClick={() => moveInterest(index, index - 1)}><ArrowUp size={13} /></button>
+            <button type="button" className="news-order-button" aria-label={`Move ${interest.topic} down`} disabled={index === settings.interests.length - 1} onClick={() => moveInterest(index, index + 1)}><ArrowDown size={13} /></button>
+            <button type="button" className="news-order-button remove-interest" aria-label={`Remove ${interest.topic}`} disabled={settings.interests.length <= 1} onClick={() => updateSettings({ interests: settings.interests.filter((_, itemIndex) => itemIndex !== index) })}><X size={13} /></button>
+          </div>)}
         </div>
-        <div className="news-topics-footer"><span>At least one topic is required. Up to 15 topics, 60 characters each.</span><button type="button" className="text-button" onClick={() => updateSettings({ categories: [...defaultNewsTopics] })}>Restore default topics</button></div>
+        <div className="news-topics-footer"><span>At least one interest is required. Order breaks ties between topics with the same priority.</span><button type="button" className="text-button" onClick={() => updateSettings({ interests: defaultNewsTopics.map((topic, order) => ({ topic, enabled: true, priority: 'medium', order })) })}>Restore defaults</button></div>
       </section>
       <section className="panel settings-panel news-delivery-panel">
         <div className="panel-heading"><div><div className="panel-title-icon telegram-icon"><Send size={15} /></div><div><h2>Delivery preferences</h2><p>Control when and how often news alerts can arrive.</p></div></div></div>
         <div className="news-delivery-controls">
-          <label>Telegram delivery chat ID<input type="text" inputMode="numeric" placeholder="e.g. 1207882899" value={settings.telegramChatId || ''} onChange={(event) => updateSettings({ telegramChatId: event.target.value.trim() })} /></label>
+          <label>Telegram chat ID<input type="text" inputMode="numeric" placeholder="Your numeric Telegram chat ID" value={settings.telegramChatId || ''} onChange={(event) => updateSettings({ telegramChatId: event.target.value.trim() })} /></label>
           <label>Quiet hours start<input type="time" value={settings.quietStart} onChange={(event) => updateSettings({ quietStart: event.target.value })} /></label>
           <label>Quiet hours end<input type="time" value={settings.quietEnd} onChange={(event) => updateSettings({ quietEnd: event.target.value })} /></label>
-          <label>Maximum alerts per day<input type="number" min="1" max="10" value={settings.maxNotificationsPerDay} onChange={(event) => updateSettings({ maxNotificationsPerDay: Math.max(1, Math.min(10, Number(event.target.value) || 1)) })} /></label>
+          <label>Maximum briefings per day<input type="number" min="1" max="20" value={settings.maxNotificationsPerDay} onChange={(event) => updateSettings({ maxNotificationsPerDay: Math.max(1, Math.min(20, Number(event.target.value) || 1)) })} /></label>
+          <label>Maximum articles per briefing<input type="number" min="1" max="10" value={settings.maxArticlesPerNotification} onChange={(event) => updateSettings({ maxArticlesPerNotification: Math.max(1, Math.min(10, Number(event.target.value) || 1)) })} /></label>
+          <label>Groq input token budget<input type="number" min="1000" max="12000" step="500" value={settings.inputTokenBudget} onChange={(event) => updateSettings({ inputTokenBudget: Math.max(1000, Math.min(12000, Number(event.target.value) || 1000)) })} /></label>
+          <label>Groq output token budget<input type="number" min="200" max="3000" step="100" value={settings.outputTokenBudget} onChange={(event) => updateSettings({ outputTokenBudget: Math.max(200, Math.min(3000, Number(event.target.value) || 200)) })} /></label>
         </div>
-        <div className="news-delivery-note">Save your numeric Telegram chat ID here. The service sends up to 4 matching headlines automatically at your interval; no /news_now command is needed. Scans use search-result snippets and no LLM tokens. Keep AgentFlow online for scheduled scans. Quiet hours use Asia/Kolkata.</div>
+        <div className="news-delivery-note">Quiet hours and scheduled times use Asia/Kolkata. Open your bot and tap Start once so Telegram can message you; after that, scans and delivery are automatic while the service is online.</div>
+      </section>
+      <section className="panel settings-panel news-usage-panel">
+        <div className="panel-heading"><div><div className="panel-title-icon model-title-icon"><BarChart3 size={16} /></div><div><h2>News usage · last 30 days</h2><p>Tavily queries and Groq summary-token usage.</p></div></div></div>
+        <div className="news-usage-grid">{['tavily', 'groq'].map((provider) => {
+          const entries = newsData.usage.filter((entry) => entry.provider === provider)
+          const requests = entries.reduce((sum, entry) => sum + entry.requests, 0)
+          const tokens = entries.reduce((sum, entry) => sum + entry.inputTokens + entry.outputTokens, 0)
+          const failed = entries.reduce((sum, entry) => sum + entry.failed, 0)
+          return <div className="news-usage-card" key={provider}><strong>{provider === 'tavily' ? 'Tavily searches' : 'Groq summaries'}</strong><span>{requests} requests · {failed} failed</span>{provider === 'groq' && <small>{tokens.toLocaleString()} tokens recorded</small>}</div>
+        })}</div>
+        {settings.groqCooldownUntil && Date.parse(settings.groqCooldownUntil) > Date.now() && <div className="news-delivery-note">Groq is cooling down until {formatDate(settings.groqCooldownUntil)}; briefings will use source snippets meanwhile.</div>}
+      </section>
+      <section className="panel settings-panel news-history-panel">
+        <div className="panel-heading"><div><div className="panel-title-icon telegram-icon"><Clock3 size={15} /></div><div><h2>Recent Telegram news history</h2><p>Successful briefings and recent scan results.</p></div></div></div>
+        <div className="news-history-list">
+          {newsData.notifications.slice(0, 8).map((notification) => <div className="news-history-row" key={notification.id}><span>{notification.title}</span><small>{formatDate(notification.created_at)}</small></div>)}
+          {!newsData.notifications.length && <p className="news-loading">No news has been sent yet. Check your Telegram chat ID and enable monitoring.</p>}
+        </div>
+        {newsData.history.slice(0, 5).map((run) => <div className="news-run-row" key={run.id}><span>{run.status} · {run.trigger}</span><small>{run.discovered_count} found / {run.delivered_count} delivered · {formatDate(run.started_at)}</small>{run.error && <small>{run.error}</small>}</div>)}
       </section>
     </>}
   </div>
