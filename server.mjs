@@ -15,6 +15,7 @@ import {
 } from './news-intelligence.mjs'
 import {
   buildEventReminderMessage,
+  DEFAULT_COMPANION_CHAT_ID,
   getDueGreeting,
   getFestivalWishTemplate,
   getLocalDateParts,
@@ -1546,7 +1547,7 @@ async function handleCompanionConversation(text, chatId) {
   }
   const created = await companionStore.createLifeEvent(event)
   const settings = await companionStore.getCompanionSettings()
-  if (!settings.notificationChatId) {
+  if (!settings.notificationChatId || settings.notificationChatId === DEFAULT_COMPANION_CHAT_ID) {
     await companionStore.saveCompanionSettings({ ...settings, notificationChatId: String(chatId) })
   }
   await sendTelegramMessage(chatId, `Saved “${created.title}” for ${created.eventDate}${created.eventTime ? ` at ${created.eventTime}` : ''}. I’ll remind you automatically.`)

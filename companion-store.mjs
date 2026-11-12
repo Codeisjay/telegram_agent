@@ -182,7 +182,7 @@ export class PostgresCompanionStore {
     const { rows } = await this.pool.query(`SELECT id, scheduler_name AS "schedulerName",
       trigger, status, started_at AS "startedAt", completed_at AS "completedAt"
       FROM companion_runs
-      WHERE scheduler_name = $1 AND status != 'interval-not-due'
+      WHERE scheduler_name = $1 AND trigger = 'external-cron' AND status != 'interval-not-due'
       ORDER BY id DESC LIMIT 1`, [schedulerName])
     return rows[0] || null
   }

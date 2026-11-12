@@ -829,7 +829,7 @@ export class JobDatabase {
       autoGreetings: Boolean(row.auto_greetings),
       greetingTimes: DEFAULT_COMPANION_SETTINGS.greetingTimes,
       greetings: DEFAULT_COMPANION_SETTINGS.greetings,
-      notificationChatId: settings.notificationChatId || '',
+      notificationChatId: settings.notificationChatId || DEFAULT_COMPANION_SETTINGS.notificationChatId,
     })
   }
 
@@ -916,7 +916,7 @@ export class JobDatabase {
     return this.db.prepare(`SELECT id, scheduler_name AS schedulerName, trigger, status,
       started_at AS startedAt, completed_at AS completedAt
       FROM companion_runs
-      WHERE scheduler_name = ? AND status != 'interval-not-due'
+      WHERE scheduler_name = ? AND trigger = 'external-cron' AND status != 'interval-not-due'
       ORDER BY id DESC LIMIT 1`).get(schedulerName) || null
   }
 

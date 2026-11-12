@@ -6,6 +6,8 @@ import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
+  DEFAULT_COMPANION_CHAT_ID,
+  DEFAULT_COMPANION_SETTINGS,
   getDueEventReminders,
   getDueGreeting,
   getLocalDateParts,
@@ -63,6 +65,13 @@ function startTestBackend(overrides) {
 }
 
 test('companion greeting schedule and natural language parsing work as expected', () => {
+  assert.equal(DEFAULT_COMPANION_CHAT_ID, '1207882899')
+  assert.equal(DEFAULT_COMPANION_SETTINGS.notificationChatId, '1207882899')
+  assert.equal(normalizeCompanionSettings({ notificationChatId: '' }, {
+    ...DEFAULT_COMPANION_SETTINGS,
+    notificationChatId: '',
+  }).notificationChatId, '1207882899')
+
   const settings = normalizeCompanionSettings({
     personalName: 'Jay',
     greetingTimes: { morning: '08:00', afternoon: '13:00', evening: '18:00', night: '22:00' },
@@ -104,6 +113,14 @@ test('companion scheduler records interrupted runs after restart', async () => {
   assert.equal(recovered, 1)
   assert.equal(run.status, 'interrupted')
   assert.equal(run.completedAt, '2026-03-12T00:00:00.000Z')
+})
+
+test('companion settings default to the configured Telegram recipient for fresh and legacy records', async () => {
+  const database = await JobDatabase.open(path.join(tempRoot, 'companion-default-chat.sqlite'))
+  assert.equal(database.getCompanionSettings().notificationChatId, '1207882899')
+  database.db.prepare("UPDATE companion_settings SET settings_json = '{\"notificationChatId\":\"\"}' WHERE id = 1").run()
+  assert.equal(database.getCompanionSettings().notificationChatId, '1207882899')
+  database.close()
 })
 
 before(async () => {
@@ -175,6 +192,8 @@ test('news settings API persists user-selected notification topics', async () =>
 })
 
 test('Personal Assistant API saves, edits, and deletes events', async () => {
+  const companion = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+  assert.equal(companion.settings.notificationChatId, '1207882899')
   const date = getLocalDateParts(new Date(), 'Asia/Kolkata')
   const eventDate = `${date.year}-${String(date.month).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`
   const createdResponse = await fetch(`${baseUrl}/api/events`, {
@@ -1127,7 +1146,7 @@ test('production requires dashboard authentication and serves the built dashboar
       headers: { authorization: 'Bearer test-companion-cron-secret' },
     })
     assert.equal(authorizedCompanionCron.status, 200)
-    assert.equal((await authorizedCompanionCron.json()).status, 'no-recipient')
+    assert.equal((await authorizedCompanionCron.json()).status, 'completed')
 
     const invalidAuthorization = `Basic ${Buffer.from('deploy-admin:wrong-password').toString('base64')}`
     const invalidCron = await fetch(`${productionUrl}/api/cron/jobs`, {

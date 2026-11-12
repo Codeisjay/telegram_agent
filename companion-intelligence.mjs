@@ -1,3 +1,5 @@
+export const DEFAULT_COMPANION_CHAT_ID = '1207882899'
+
 export const DEFAULT_COMPANION_SETTINGS = {
   timezone: 'Asia/Kolkata',
   personalName: 'Jay',
@@ -19,7 +21,7 @@ export const DEFAULT_COMPANION_SETTINGS = {
   festivalEnabled: true,
   reminderIntervalMinutes: 15,
   paused: false,
-  notificationChatId: '',
+  notificationChatId: DEFAULT_COMPANION_CHAT_ID,
 }
 
 const greetingVariants = {
@@ -47,10 +49,17 @@ const greetingVariants = {
 
 export function normalizeCompanionSettings(input = {}, current = DEFAULT_COMPANION_SETTINGS) {
   const fallback = { ...DEFAULT_COMPANION_SETTINGS, ...current }
+  if (typeof fallback.notificationChatId !== 'string' || !/^-?\d{1,20}$/.test(fallback.notificationChatId.trim())) {
+    fallback.notificationChatId = DEFAULT_COMPANION_CHAT_ID
+  }
   const greetingTimes = { ...DEFAULT_COMPANION_SETTINGS.greetingTimes, ...(current.greetingTimes || {}), ...(input.greetingTimes || {}) }
   const greetings = { ...DEFAULT_COMPANION_SETTINGS.greetings, ...(current.greetings || {}), ...(input.greetings || {}) }
   const personalName = typeof input.personalName === 'string' && input.personalName.trim() ? input.personalName.trim().slice(0, 80) : (typeof current.personalName === 'string' ? current.personalName : fallback.personalName)
-  const notificationChatId = typeof input.notificationChatId === 'string' && /^-?\d{1,20}$/.test(input.notificationChatId.trim()) ? input.notificationChatId.trim() : (typeof current.notificationChatId === 'string' ? current.notificationChatId : fallback.notificationChatId)
+  const notificationChatId = typeof input.notificationChatId === 'string' && /^-?\d{1,20}$/.test(input.notificationChatId.trim())
+    ? input.notificationChatId.trim()
+    : (typeof current.notificationChatId === 'string' && /^-?\d{1,20}$/.test(current.notificationChatId.trim())
+      ? current.notificationChatId.trim()
+      : fallback.notificationChatId)
   let timezone = input.timezone || current.timezone || fallback.timezone
   try {
     new Intl.DateTimeFormat('en', { timeZone: timezone })

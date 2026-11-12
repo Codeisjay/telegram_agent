@@ -91,6 +91,8 @@ The **Personal Assistant** dashboard lets you configure four daily greetings,
 festival preferences, a Telegram recipient, and persistent personal events.
 Greeting and reminder text is generated deterministically; routine notifications
 do not call Groq or another AI provider.
+The default Telegram recipient is `1207882899`; set a different chat ID in the
+dashboard to override it.
 
 - **Greetings:** Good morning, afternoon, evening, and night notifications use
   the configured local times, Jay as the default name, Asia/Kolkata, quiet
