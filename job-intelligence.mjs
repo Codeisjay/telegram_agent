@@ -2,7 +2,13 @@ import { createHash } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
-import { DEFAULT_COMPANION_SETTINGS, normalizeCompanionSettings } from './companion-intelligence.mjs'
+import {
+  DEFAULT_COMPANION_SETTINGS,
+  getDueEventReminders,
+  normalizeCompanionSettings,
+  nextOccurrenceDate,
+  zonedDateTimeToDate,
+} from './companion-intelligence.mjs'
 import { DEFAULT_NEWS_CATEGORIES, normalizeNewsSettings } from './news-intelligence.mjs'
 
 export const emptyProfile = {
@@ -208,21 +214,27 @@ export function normalizeJobUrl(value) {
 export function normalizeLifeEvent(input = {}) {
   const dateValue = typeof input.eventDate === 'string' && input.eventDate ? input.eventDate : new Date().toISOString().slice(0, 10)
   const reminderMinutes = Array.isArray(input.reminderMinutes)
-    ? input.reminderMinutes.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
-    : (Array.isArray(input.reminder_schedule) ? input.reminder_schedule.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
-      : (Array.isArray(input.reminderSchedule) ? input.reminderSchedule.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
-        : [Number(input.reminderMinutes ?? 0)]))
+    ? input.reminderMinutes.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0 && value <= 525600)
+    : (Array.isArray(input.reminder_schedule) ? input.reminder_schedule.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0 && value <= 525600)
+      : (Array.isArray(input.reminderSchedule) ? input.reminderSchedule.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0 && value <= 525600)
+        : [Number(input.reminderMinutes ?? 0)].filter((value) => value >= 0 && value <= 525600)))
   const sanitizedReminder = reminderMinutes.length ? [...new Set(reminderMinutes)].slice(0, 8) : [0]
   const eventTime = typeof input.eventTime === 'string' ? input.eventTime.trim() : ''
-  const recurrence = ['None', 'Daily', 'Weekly', 'Monthly', 'Yearly'].includes(input.recurrence) ? input.recurrence : (input.recurrence || 'None')
+  const recurrence = ['None', 'Daily', 'Weekly', 'Monthly', 'Yearly'].includes(input.recurrence) ? input.recurrence : 'None'
   const category = String(input.category || 'Custom event').trim() || 'Custom event'
+  let timezone = typeof input.timezone === 'string' && input.timezone ? input.timezone : 'Asia/Kolkata'
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: timezone })
+  } catch {
+    timezone = 'Asia/Kolkata'
+  }
   return {
     title: String(input.title || 'Personal event').trim().slice(0, 150) || 'Personal event',
     description: String(input.description || '').trim().slice(0, 500),
     category,
     eventDate: dateValue.slice(0, 10),
-    eventTime: /^\d{1,2}:\d{2}$/.test(eventTime) ? eventTime : '',
-    timezone: typeof input.timezone === 'string' && input.timezone ? input.timezone : 'Asia/Kolkata',
+    eventTime: /^([01]\d|2[0-3]):[0-5]\d$/.test(eventTime) ? eventTime : '',
+    timezone,
     recurrence,
     reminderMinutes: sanitizedReminder,
     importance: ['Low', 'Medium', 'High'].includes(input.importance) ? input.importance : 'Medium',
@@ -528,6 +540,40 @@ export class JobDatabase {
         delivered_at TEXT NOT NULL,
         UNIQUE(greeting_kind, day_key)
       );
+      CREATE TABLE IF NOT EXISTS companion_notifications (
+        id INTEGER PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        notification_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT NOT NULL,
+        scheduled_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at TEXT NOT NULL,
+        lease_until TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        delivered_at TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS companion_calendar_cache (
+        region TEXT NOT NULL,
+        year INTEGER NOT NULL,
+        events_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        PRIMARY KEY(region, year)
+      );
+      CREATE TABLE IF NOT EXISTS companion_runs (
+        id INTEGER PRIMARY KEY,
+        scheduler_name TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        delivered_count INTEGER NOT NULL DEFAULT 0,
+        error TEXT NOT NULL DEFAULT ''
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -806,6 +852,115 @@ export class JobDatabase {
     return Boolean(this.db.prepare('SELECT 1 FROM companion_greetings WHERE greeting_kind = ? AND day_key = ?').get(kind, String(dayKey)))
   }
 
+  enqueueCompanionNotification(input) {
+    const now = new Date().toISOString()
+    const scheduledAt = input.scheduledAt instanceof Date ? input.scheduledAt.toISOString() : input.scheduledAt || now
+    const availableAt = input.availableAt instanceof Date ? input.availableAt.toISOString() : input.availableAt || now
+    this.db.prepare(`INSERT OR IGNORE INTO companion_notifications(
+      idempotency_key, notification_type, title, message, scheduled_at, available_at,
+      created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(input.idempotencyKey, input.type, input.title, input.message, scheduledAt, availableAt, now, now)
+  }
+
+  claimCompanionNotification(idempotencyKey, now = new Date(), leaseMs = 5 * 60 * 1000) {
+    const nowIso = now.toISOString()
+    const leaseUntil = new Date(now.getTime() + leaseMs).toISOString()
+    return this.db.prepare(`UPDATE companion_notifications SET
+      status = 'sending', attempts = attempts + 1, lease_until = ?, updated_at = ?
+      WHERE idempotency_key = ?
+        AND ((status IN ('pending', 'failed') AND available_at <= ?)
+          OR (status = 'sending' AND lease_until <= ?))`)
+      .run(leaseUntil, nowIso, idempotencyKey, nowIso, nowIso).changes > 0
+  }
+
+  finishCompanionNotification(idempotencyKey, { delivered, error = '', now = new Date() }) {
+    const nowIso = now.toISOString()
+    if (delivered) {
+      return this.db.prepare(`UPDATE companion_notifications SET
+        status = 'delivered', delivered_at = ?, lease_until = '', last_error = '', updated_at = ?
+        WHERE idempotency_key = ? AND status = 'sending'`)
+        .run(nowIso, nowIso, idempotencyKey).changes > 0
+    }
+    const row = this.db.prepare('SELECT attempts FROM companion_notifications WHERE idempotency_key = ?').get(idempotencyKey)
+    if (!row) return false
+    const retryMinutes = Math.min(60, 5 * (2 ** Math.max(0, Number(row.attempts) - 1)))
+    return this.db.prepare(`UPDATE companion_notifications SET
+      status = 'pending', available_at = ?, lease_until = '', last_error = ?, updated_at = ?
+      WHERE idempotency_key = ? AND status = 'sending'`)
+      .run(new Date(now.getTime() + retryMinutes * 60000).toISOString(), String(error).slice(0, 350), nowIso, idempotencyKey).changes > 0
+  }
+
+  listCompanionNotifications(limit = 50) {
+    return this.db.prepare(`SELECT id, idempotency_key AS idempotencyKey,
+      notification_type AS type, title, message, scheduled_at AS scheduledAt,
+      status, attempts, last_error AS error, created_at AS createdAt,
+      delivered_at AS deliveredAt
+      FROM companion_notifications ORDER BY created_at DESC LIMIT ?`).all(limit)
+  }
+
+  startCompanionRun(schedulerName, trigger, startedAt = new Date()) {
+    const result = this.db.prepare(`INSERT INTO companion_runs(
+      scheduler_name, trigger, status, started_at
+    ) VALUES (?, ?, 'running', ?)`).run(schedulerName, trigger, startedAt.toISOString())
+    return Number(result.lastInsertRowid)
+  }
+
+  recoverInterruptedCompanionRuns(completedAt = new Date()) {
+    return this.db.prepare(`UPDATE companion_runs SET status = 'interrupted',
+      completed_at = ?, error = 'Process stopped during this run.'
+      WHERE status = 'running'`).run(completedAt.toISOString()).changes
+  }
+
+  getLastCompanionRun(schedulerName) {
+    return this.db.prepare(`SELECT id, scheduler_name AS schedulerName, trigger, status,
+      started_at AS startedAt, completed_at AS completedAt
+      FROM companion_runs
+      WHERE scheduler_name = ? AND status != 'interval-not-due'
+      ORDER BY id DESC LIMIT 1`).get(schedulerName) || null
+  }
+
+  finishCompanionRun(id, { status, deliveredCount = 0, error = '', completedAt = new Date() }) {
+    const row = this.db.prepare('SELECT started_at FROM companion_runs WHERE id = ?').get(id)
+    if (!row) return false
+    return this.db.prepare(`UPDATE companion_runs SET status = ?, completed_at = ?,
+      duration_ms = ?, delivered_count = ?, error = ? WHERE id = ?`)
+      .run(status, completedAt.toISOString(), Math.max(0, completedAt.getTime() - Date.parse(row.started_at)), deliveredCount, String(error).slice(0, 350), id).changes > 0
+  }
+
+  listCompanionRuns(limit = 20) {
+    return this.db.prepare(`SELECT id, scheduler_name AS schedulerName, trigger, status,
+      started_at AS startedAt, completed_at AS completedAt, duration_ms AS durationMs,
+      delivered_count AS deliveredCount, error
+      FROM companion_runs ORDER BY id DESC LIMIT ?`).all(limit)
+  }
+
+  getCompanionSchedulerStatus() {
+    const rows = this.db.prepare(`SELECT scheduler_name AS schedulerName, status,
+      started_at AS startedAt, completed_at AS completedAt, delivered_count AS deliveredCount,
+      error FROM companion_runs ORDER BY id DESC LIMIT 20`).all()
+    const latest = {}
+    for (const row of rows) {
+      if (!latest[row.schedulerName]) latest[row.schedulerName] = row
+    }
+    return { schedulers: latest, lastRuns: rows }
+  }
+
+  getFestivalCalendar(region, year, now = new Date()) {
+    const row = this.db.prepare(`SELECT events_json, fetched_at FROM companion_calendar_cache
+      WHERE region = ? AND year = ?`).get(region, year)
+    if (!row || now.getTime() - Date.parse(row.fetched_at) > 86400000) return null
+    return { events: JSON.parse(row.events_json), fetchedAt: row.fetched_at }
+  }
+
+  saveFestivalCalendar(region, year, events, fetchedAt = new Date().toISOString()) {
+    const timestamp = fetchedAt instanceof Date ? fetchedAt.toISOString() : fetchedAt
+    this.db.prepare(`INSERT INTO companion_calendar_cache(region, year, events_json, fetched_at)
+      VALUES (?, ?, ?, ?) ON CONFLICT(region, year) DO UPDATE SET
+      events_json = excluded.events_json, fetched_at = excluded.fetched_at`)
+      .run(region, year, JSON.stringify(events), timestamp)
+  }
+
   createLifeEvent(input = {}) {
     const event = normalizeLifeEvent(input)
     const now = new Date().toISOString()
@@ -849,7 +1004,11 @@ export class JobDatabase {
   updateLifeEvent(id, input = {}) {
     const current = this.getLifeEvent(id)
     if (!current) return null
-    const next = normalizeLifeEvent({ ...current, ...input })
+    const merged = { ...current, ...input }
+    if (input.eventDate && input.eventDate !== current.eventDate && !Object.hasOwn(input, 'nextOccurrence')) {
+      merged.nextOccurrence = input.eventDate
+    }
+    const next = normalizeLifeEvent(merged)
     const updatedAt = new Date().toISOString()
     this.db.prepare(`UPDATE personal_events SET title = ?, description = ?, category = ?, event_date = ?, event_time = ?, timezone = ?, recurrence = ?, reminder_minutes_json = ?, importance = ?, active = ?, updated_at = ?, next_occurrence = ? WHERE id = ?`)
       .run(
@@ -904,24 +1063,48 @@ export class JobDatabase {
   getDueLifeEvents(now = new Date()) {
     const rows = this.db.prepare('SELECT * FROM personal_events WHERE active = 1 ORDER BY next_occurrence ASC').all()
     const due = []
-    const currentTimestamp = now.getTime()
     for (const row of rows) {
       const event = this.deserializeLifeEvent(row)
-      for (const reminderMinutes of event.reminderMinutes) {
-        const notificationKey = `${event.id}:${event.nextOccurrence || event.eventDate}:${reminderMinutes}`
-        if (this.db.prepare('SELECT 1 FROM event_notifications WHERE event_id = ? AND notification_key = ?').get(event.id, notificationKey)) continue
-        const occurrence = new Date(`${event.eventDate}T${event.eventTime || '00:00'}:00`)
-        if (!Number.isFinite(occurrence.getTime())) continue
-        const milestone = new Date(occurrence.getTime() - reminderMinutes * 60 * 1000)
-        if (milestone.getTime() <= currentTimestamp && milestone.getTime() >= currentTimestamp - 1000 * 60 * 60 * 24) {
-          due.push({ ...event, reminderMinutes, notificationKey, dueAt: milestone.toISOString() })
-          break
-        }
+      for (const reminder of getDueEventReminders(event, now)) {
+        const alreadyDelivered = this.db.prepare(`SELECT 1 FROM companion_notifications
+          WHERE idempotency_key = ? AND status = 'delivered'`).get(`event:${reminder.notificationKey}`)
+        const legacyDelivery = this.db.prepare(`SELECT 1 FROM event_notifications
+          WHERE event_id = ? AND notification_key = ?`).get(event.id, reminder.notificationKey)
+        if (!alreadyDelivered && !legacyDelivery) due.push(reminder)
       }
     }
     return due
   }
 
+  advanceDueLifeEvents(now = new Date()) {
+    let advanced = 0
+    for (const event of this.listLifeEvents()) {
+      if (!event.active || event.recurrence === 'None') continue
+      const eventDate = event.nextOccurrence || event.eventDate
+      const eventInstant = zonedDateTimeToDate(eventDate, event.eventTime || '00:00', event.timezone)
+      if (!Number.isFinite(eventInstant.getTime()) || eventInstant.getTime() > now.getTime()) continue
+      let allDueNotificationsDelivered = true
+      for (const reminderMinutes of event.reminderMinutes) {
+        const reminderDueAt = eventInstant.getTime() - reminderMinutes * 60000
+        const elapsed = now.getTime() - reminderDueAt
+        if (elapsed < 0 || elapsed > 7 * 86400000) continue
+        const key = `event:${event.id}:${eventDate}:${reminderMinutes}`
+        const delivery = this.db.prepare('SELECT status FROM companion_notifications WHERE idempotency_key = ?').get(key)
+        const legacyDelivery = this.db.prepare(`SELECT 1 FROM event_notifications
+          WHERE event_id = ? AND notification_key = ?`).get(event.id, `${event.id}:${eventDate}:${reminderMinutes}`)
+        if (delivery?.status !== 'delivered' && !legacyDelivery) {
+          allDueNotificationsDelivered = false
+          break
+        }
+      }
+      if (!allDueNotificationsDelivered) continue
+      const next = nextOccurrenceDate(eventDate, event.recurrence)
+      if (!next) continue
+      this.updateLifeEvent(event.id, { eventDate: next, nextOccurrence: next })
+      advanced += 1
+    }
+    return advanced
+  }
   setNewsNextRun(value) {
     this.db.prepare('UPDATE news_settings SET next_run_at = ?, updated_at = ? WHERE id = 1')
       .run(value, new Date().toISOString())

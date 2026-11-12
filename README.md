@@ -85,6 +85,68 @@ every 3 hours by default without requiring `/news_now`.
   production dashboard's Basic Auth credentials can authorize this endpoint.
   Internal scheduled scans do not require external cron.
 
+## Personal Companion & Intelligent Reminders
+
+The **Personal Assistant** dashboard lets you configure four daily greetings,
+festival preferences, a Telegram recipient, and persistent personal events.
+Greeting and reminder text is generated deterministically; routine notifications
+do not call Groq or another AI provider.
+
+- **Greetings:** Good morning, afternoon, evening, and night notifications use
+  the configured local times, Jay as the default name, Asia/Kolkata, quiet
+  hours, and a database-backed once-per-day key.
+- **Festivals:** dates and names come from Calendarific's India holidays API,
+  filtered to national, local, and religious holidays for the selected region.
+  The service refreshes its calendar cache daily and sends only dates returned by
+  that provider. Configure `CALENDARIFIC_API_KEY`; without it, festival wishes
+  remain disabled rather than guessed. Calendarific requires an API account/key.
+- **Events:** create, edit, and delete events in the dashboard, or send messages
+  such as “my interview is on 12 March at 10 am, one day before” or
+  “remember my birthday on 12 March every year” to the authorized Telegram bot.
+  “List my events” shows saved events; “reschedule interview to 14 March” and
+  “delete my interview” edit or remove a uniquely matched event. Supported
+  recurrence is none, daily, weekly, monthly, or yearly. Reminders include one
+  week before, one day before, on the date, and custom minute offsets.
+- **Scheduling and retries:** greetings, festivals, and event reminders have
+  separate execution histories. The default check interval is 15 minutes.
+  Both the in-process timer and the authenticated `POST /api/cron/companion`
+  endpoint use the same persistent delivery keys. Failed Telegram sends are
+  recorded and retried with bounded exponential delay; overdue reminders are
+  recovered for up to seven days.
+
+### Render Free setup
+
+Render Free instances have ephemeral local filesystems and can sleep. For
+durable companion settings, events, calendar cache, notification history, and
+scheduler history, configure `DATABASE_URL` to a PostgreSQL database and keep
+that database available for the lifetime of the service. Companion records use
+PostgreSQL when `DATABASE_URL` is set and retain SQLite as the local-development
+fallback. The existing job/news runtime remains on SQLite; its persistence
+behavior is unchanged.
+
+Set these Render environment variables:
+
+- `DATABASE_URL`: PostgreSQL connection string for the persistent companion
+  store. The companion tables are initialized on service startup; the optional
+  `npm run db:migrate` command also applies the checked-in PostgreSQL migrations.
+- `AGENTFLOW_COMPANION_CRON_SECRET`: a long random secret, sent as
+  `Authorization: Bearer <secret>`. Do not put this value in the dashboard or
+  commit it to source control.
+- `CALENDARIFIC_API_KEY`: API key from
+  [Calendarific](https://calendarific.com/register). It is only read by the
+  backend and is never returned by dashboard APIs.
+- `TELEGRAM_BOT_TOKEN` if not already saved in Telegram Settings, and the
+  dashboard `AGENTFLOW_USERNAME` / `AGENTFLOW_PASSWORD`.
+
+Configure an external HTTPS cron service to wake the Render web service and
+`POST` to `https://<your-service>.onrender.com/api/cron/companion` every
+15 minutes with the Bearer header above and no request body. This endpoint
+processes greetings, festivals, and events without requiring Telegram polling
+or an AI provider call. Ensure the Telegram recipient has opened the bot and
+sent `/start` once. The endpoint can deliver only while the Render service and
+PostgreSQL database are reachable; Render Free does not guarantee real-time
+delivery while the service is waking.
+
 Render Free instances can sleep and have ephemeral storage. Periodic health
 requests may wake the service, but scans and Telegram polling cannot run while
 it is asleep, and SQLite settings/history can be lost when its filesystem is

@@ -15,7 +15,8 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 COPY --from=build /app/dist ./dist
-COPY server.mjs daily-scheduler.mjs job-extraction.mjs job-intelligence.mjs news-intelligence.mjs companion-intelligence.mjs response-format.mjs backup.mjs ./
+COPY server.mjs daily-scheduler.mjs job-extraction.mjs job-intelligence.mjs news-intelligence.mjs companion-intelligence.mjs companion-store.mjs response-format.mjs backup.mjs migrate-postgres.mjs ./
+COPY migrations ./migrations
 RUN mkdir -p /data && chown node:node /data
 USER node
 EXPOSE 3001

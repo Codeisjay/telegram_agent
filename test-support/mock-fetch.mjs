@@ -21,7 +21,7 @@ globalThis.fetch = async (input, init) => {
           ok: true,
           result: [{
             update_id: 1,
-            message: { text: '/search long telegram test', chat: { id: 123 }, from: { id: 123 } },
+            message: { text: process.env.MOCK_TELEGRAM_UPDATE_TEXT || '/search long telegram test', chat: { id: 123 }, from: { id: 123 } },
           }],
         })
       }
@@ -39,6 +39,30 @@ globalThis.fetch = async (input, init) => {
       }
       return Response.json({ ok: true, result: { message_id: 1 } })
     }
+  }
+
+  if (url.hostname === 'calendarific.com') {
+    if (url.searchParams.get('api_key') !== 'test-calendar-key' || url.searchParams.get('location') !== 'in-up') {
+      return Response.json({ meta: { code: 401 }, response: { holidays: [] } }, { status: 401 })
+    }
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date())
+    const date = `${parts.find((part) => part.type === 'year').value}-${parts.find((part) => part.type === 'month').value}-${parts.find((part) => part.type === 'day').value}`
+    return Response.json({
+      meta: { code: 200 },
+      response: {
+        holidays: [{
+          name: 'Verified Test Festival',
+          date: { iso: date },
+          type: ['Religious holiday'],
+          locations: ['Uttar Pradesh'],
+        }],
+      },
+    })
   }
 
   if (url.hostname === 'api.tavily.com') {

@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { after, before, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { getDueGreeting, normalizeCompanionSettings, parseNaturalLanguageEvent } from '../companion-intelligence.mjs'
+import {
+  getDueEventReminders,
+  getDueGreeting,
+  getLocalDateParts,
+  nextOccurrenceDate,
+  normalizeCompanionSettings,
+  parseNaturalLanguageEvent,
+  zonedDateTimeToDate,
+} from '../companion-intelligence.mjs'
 import { JobDatabase } from '../job-intelligence.mjs'
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
@@ -17,8 +25,9 @@ let baseUrl
 function makeTestEnvironment(overrides = {}) {
   const environment = { ...process.env, LOCALAPPDATA: secretDirectory, AGENTFLOW_PORT: '0' }
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
-  for (const key of [...secretKeys, 'AGENTFLOW_NEWS_CRON_SECRET', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE']) delete environment[key]
+  for (const key of [...secretKeys, 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
+  environment.AGENTFLOW_COMPANION_CRON_SECRET = 'test-companion-cron-secret'
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete environment[key]
     else environment[key] = value
@@ -70,7 +79,31 @@ test('companion greeting schedule and natural language parsing work as expected'
   const event = parseNaturalLanguageEvent("My friend's birthday is on 12 March. Wish them every year.", new Date('2026-01-01T00:00:00Z'))
   assert.equal(event.category, 'Birthday')
   assert.equal(event.recurrence, 'Yearly')
-  assert.equal(event.eventDate.slice(0, 4), '2026')
+  assert.equal(event.title, "friend's birthday")
+  assert.equal(event.eventDate, '2026-03-12')
+  const interview = parseNaturalLanguageEvent('Remind me about my interview on 12 March at 10 am, one day before', new Date('2026-01-01T00:00:00Z'))
+  assert.equal(interview.title, 'interview')
+  assert.equal(interview.eventTime, '10:00')
+  assert.deepEqual(interview.reminderMinutes, [1440, 0])
+  assert.equal(parseNaturalLanguageEvent('Remind me about my exam', new Date('2026-01-01T00:00:00Z')), null)
+  assert.equal(zonedDateTimeToDate('2026-11-12', '08:00').toISOString(), '2026-11-12T02:30:00.000Z')
+  assert.equal(nextOccurrenceDate('2024-02-29', 'Yearly'), '2025-02-28')
+  const due = getDueEventReminders({
+    id: 1, title: 'Interview', eventDate: '2026-03-12', nextOccurrence: '2026-03-12',
+    eventTime: '10:00', timezone: 'Asia/Kolkata', reminderMinutes: [1440, 0],
+  }, new Date('2026-03-11T04:30:00Z'))
+  assert.deepEqual(due.map((reminder) => reminder.reminderMinutes), [1440])
+})
+
+test('companion scheduler records interrupted runs after restart', async () => {
+  const database = await JobDatabase.open(path.join(tempRoot, 'companion-run-recovery.sqlite'))
+  const runId = database.startCompanionRun('events', 'test')
+  const recovered = database.recoverInterruptedCompanionRuns(new Date('2026-03-12T00:00:00Z'))
+  const run = database.listCompanionRuns().find((item) => item.id === runId)
+  database.close()
+  assert.equal(recovered, 1)
+  assert.equal(run.status, 'interrupted')
+  assert.equal(run.completedAt, '2026-03-12T00:00:00.000Z')
 })
 
 before(async () => {
@@ -139,6 +172,234 @@ test('news settings API persists user-selected notification topics', async () =>
   }).then((result) => result.json())
   assert.equal(interests.settings.interests[0].priority, 'high')
   assert.deepEqual(interests.settings.categories, ['Generative AI'])
+})
+
+test('Personal Assistant API saves, edits, and deletes events', async () => {
+  const date = getLocalDateParts(new Date(), 'Asia/Kolkata')
+  const eventDate = `${date.year}-${String(date.month).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`
+  const createdResponse = await fetch(`${baseUrl}/api/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      title: 'Calendar API interview',
+      category: 'Interview',
+      eventDate,
+      eventTime: '10:30',
+      recurrence: 'Yearly',
+      reminderMinutes: [10080, 1440, 0],
+      importance: 'High',
+    }),
+  })
+  assert.equal(createdResponse.status, 200)
+  const created = (await createdResponse.json()).event
+  assert.deepEqual(created.reminderMinutes, [10080, 1440, 0])
+  assert.equal(created.recurrence, 'Yearly')
+  const updateResponse = await fetch(`${baseUrl}/api/events/${created.id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'Updated interview', eventTime: '11:00' }),
+  })
+  assert.equal(updateResponse.status, 200)
+  assert.equal((await updateResponse.json()).event.title, 'Updated interview')
+  assert.equal((await fetch(`${baseUrl}/api/events/${created.id}`, { method: 'DELETE' })).status, 200)
+  const invalidDate = await fetch(`${baseUrl}/api/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'Invalid', eventDate: '2026-02-31' }),
+  })
+  assert.equal(invalidDate.status, 400)
+})
+
+test('authenticated companion cron delivers deduplicated greetings, festivals, and event reminders', async () => {
+  const stop = await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' })
+  assert.equal(stop.status, 200)
+  const token = await fetch(`${baseUrl}/api/secrets`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'TELEGRAM_BOT_TOKEN', value: 'test-telegram-token' }),
+  })
+  assert.equal(token.status, 200)
+  const secretPath = path.join(secretDirectory, 'AgentFlow', '.env')
+  await mkdir(path.dirname(secretPath), { recursive: true })
+  await writeFile(secretPath, 'TELEGRAM_BOT_TOKEN="test-telegram-token"\nCALENDARIFIC_API_KEY="test-calendar-key"\n')
+
+  const now = new Date()
+  const local = getLocalDateParts(now, 'Asia/Kolkata')
+  const date = `${local.year}-${String(local.month).padStart(2, '0')}-${String(local.day).padStart(2, '0')}`
+  const minute = local.hour * 60 + local.minute
+  const greetingMinute = Math.max(0, minute - 1)
+  const greetingTime = `${String(Math.floor(greetingMinute / 60)).padStart(2, '0')}:${String(greetingMinute % 60).padStart(2, '0')}`
+  const settings = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+  const saveSettings = await fetch(`${baseUrl}/api/companion/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...settings.settings,
+      personalName: 'Jay',
+      timezone: 'Asia/Kolkata',
+      notificationChatId: '123',
+      greetings: { morning: true, afternoon: false, evening: false, night: false },
+      greetingTimes: { ...settings.settings.greetingTimes, morning: greetingTime },
+      quietStart: '23:59',
+      quietEnd: '00:00',
+      festivalRegion: 'Uttar Pradesh',
+      festivalEnabled: true,
+      paused: false,
+    }),
+  })
+  assert.equal(saveSettings.status, 200)
+
+  const eventResponse = await fetch(`${baseUrl}/api/events`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      title: 'Automatic test reminder',
+      category: 'Personal milestone',
+      eventDate: date,
+      eventTime: '00:00',
+      timezone: 'Asia/Kolkata',
+      reminderMinutes: [0],
+    }),
+  })
+  assert.equal(eventResponse.status, 200)
+
+  const headers = { authorization: 'Bearer test-companion-cron-secret' }
+  const firstResponse = await fetch(`${baseUrl}/api/cron/companion`, { method: 'POST', headers })
+  assert.equal(firstResponse.status, 200)
+  const first = await firstResponse.json()
+  assert.equal(first.status, 'completed')
+  const history = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+  assert.equal(history.notifications.some((item) => item.type === 'greeting' && item.status === 'delivered'), true)
+  assert.equal(history.notifications.some((item) => item.type === 'festival' && item.title === 'Verified Test Festival' && item.status === 'delivered'), true)
+  assert.equal(history.notifications.some((item) => item.type === 'event' && item.title === 'Automatic test reminder' && item.status === 'delivered'), true)
+  assert.equal(history.calendarConfigured, true)
+  const secondResponse = await fetch(`${baseUrl}/api/cron/companion`, { method: 'POST', headers })
+  assert.equal(secondResponse.status, 200)
+  const secondRun = await secondResponse.json()
+  assert.equal(secondRun.schedulers.find((item) => item.schedulerName === 'events').status, 'interval-not-due')
+  const afterRetry = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+  assert.equal(afterRetry.notifications.filter((item) => item.idempotencyKey.startsWith('greeting:') && item.status === 'delivered').length, 1)
+  assert.equal(afterRetry.notifications.filter((item) => item.idempotencyKey.startsWith('festival:') && item.status === 'delivered').length, 1)
+
+  await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' })
+  await fetch(`${baseUrl}/api/secrets`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'TELEGRAM_BOT_TOKEN', value: '' }),
+  })
+  await fetch(`${baseUrl}/api/companion/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...afterRetry.settings, notificationChatId: '', paused: true }),
+  })
+})
+
+test('Telegram saves a personal event from natural language without a command', async () => {
+  const previousServer = server
+  const previousUrl = baseUrl
+  const backend = startTestBackend({
+    AGENTFLOW_DATA_DIR: path.join(tempRoot, 'telegram-companion-data'),
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
+    MOCK_TELEGRAM_UPDATE_TEXT: 'Remember my birthday on 12 March every year, one week before.',
+  })
+  server = backend.child
+  try {
+    baseUrl = await backend.started
+    let companion
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      companion = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+      if (companion.events.length) break
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(companion.events.length, 1)
+    assert.equal(companion.events[0].category, 'Birthday')
+    assert.equal(companion.events[0].recurrence, 'Yearly')
+    assert.equal(companion.events[0].reminderMinutes.includes(10080), true)
+    assert.equal(companion.settings.notificationChatId, '123')
+  } finally {
+    await fetch(`${baseUrl}/api/agent/stop`, { method: 'POST' }).catch(() => {})
+    if (server && server.exitCode === null) {
+      server.kill()
+      await new Promise((resolve) => server.once('exit', resolve))
+    }
+    server = previousServer
+    baseUrl = previousUrl
+  }
+})
+
+test('Telegram natural-language updates and deletes uniquely matched events', async () => {
+  const previousServer = server
+  const previousUrl = baseUrl
+  const dataDirectory = path.join(tempRoot, 'telegram-event-edit-data')
+  const localDatabase = await JobDatabase.open(path.join(dataDirectory, 'jobs.sqlite'))
+  const today = getLocalDateParts(new Date(), 'Asia/Kolkata')
+  const date = `${today.year}-${String(today.month).padStart(2, '0')}-${String(today.day).padStart(2, '0')}`
+  localDatabase.createLifeEvent({ title: 'Interview', category: 'Interview', eventDate: date, reminderMinutes: [0] })
+  localDatabase.close()
+
+  const startConversation = (message) => startTestBackend({
+    AGENTFLOW_DATA_DIR: dataDirectory,
+    TELEGRAM_BOT_TOKEN: 'test-telegram-token',
+    MOCK_TELEGRAM_UPDATE_TEXT: message,
+  })
+  try {
+    let backend = startConversation('reschedule interview to tomorrow')
+    server = backend.child
+    baseUrl = await backend.started
+    let companion
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      companion = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+      if (companion.events[0]?.eventDate !== date) break
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    const tomorrow = new Date(Date.UTC(today.year, today.month - 1, today.day + 1)).toISOString().slice(0, 10)
+    assert.equal(companion.events[0].eventDate, tomorrow)
+    server.kill('SIGTERM')
+    await new Promise((resolve) => server.once('exit', resolve))
+
+    backend = startConversation('delete my interview')
+    server = backend.child
+    baseUrl = await backend.started
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      companion = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
+      if (!companion.events.length) break
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(companion.events.length, 0)
+  } finally {
+    if (server && server.exitCode === null) {
+      server.kill('SIGTERM')
+      await new Promise((resolve) => server.once('exit', resolve))
+    }
+    server = previousServer
+    baseUrl = previousUrl
+  }
+})
+
+test('companion notification claims retry failures and remain deduplicated after database restart', async () => {
+  const dataDirectory = path.join(tempRoot, 'companion-retry-data')
+  const file = path.join(dataDirectory, 'jobs.sqlite')
+  let store = await JobDatabase.open(file)
+  const startedAt = new Date('2026-03-01T10:00:00.000Z')
+  store.enqueueCompanionNotification({
+    idempotencyKey: 'event:42:2026-03-01:0',
+    type: 'event',
+    title: 'Retry test',
+    message: 'Reminder',
+    scheduledAt: startedAt,
+    availableAt: startedAt,
+  })
+  assert.equal(store.claimCompanionNotification('event:42:2026-03-01:0', startedAt), true)
+  store.finishCompanionNotification('event:42:2026-03-01:0', { delivered: false, error: 'temporary failure', now: startedAt })
+  assert.equal(store.claimCompanionNotification('event:42:2026-03-01:0', new Date(startedAt.getTime() + 4 * 60000)), false)
+  assert.equal(store.claimCompanionNotification('event:42:2026-03-01:0', new Date(startedAt.getTime() + 5 * 60000)), true)
+  store.finishCompanionNotification('event:42:2026-03-01:0', { delivered: true, now: new Date(startedAt.getTime() + 5 * 60000) })
+  store.close()
+
+  store = await JobDatabase.open(file)
+  assert.equal(store.claimCompanionNotification('event:42:2026-03-01:0', new Date(startedAt.getTime() + 10 * 60000)), false)
+  assert.equal(store.listCompanionNotifications().find((item) => item.title === 'Retry test').status, 'delivered')
+  store.close()
 })
 
 test('news cron is authenticated, deduplicates before Groq, and sends automatic briefings', async () => {
@@ -858,6 +1119,15 @@ test('production requires dashboard authentication and serves the built dashboar
     const deniedCron = await fetch(`${productionUrl}/api/cron/jobs`, { method: 'POST' })
     assert.equal(deniedCron.status, 401)
     assert.doesNotMatch(await deniedCron.text(), /test-tavily-key|a-long-test-password-123/)
+
+    const deniedCompanionCron = await fetch(`${productionUrl}/api/cron/companion`, { method: 'POST' })
+    assert.equal(deniedCompanionCron.status, 401)
+    const authorizedCompanionCron = await fetch(`${productionUrl}/api/cron/companion`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-companion-cron-secret' },
+    })
+    assert.equal(authorizedCompanionCron.status, 200)
+    assert.equal((await authorizedCompanionCron.json()).status, 'no-recipient')
 
     const invalidAuthorization = `Basic ${Buffer.from('deploy-admin:wrong-password').toString('base64')}`
     const invalidCron = await fetch(`${productionUrl}/api/cron/jobs`, {

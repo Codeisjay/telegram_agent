@@ -8,11 +8,21 @@ import { formatTelegramAnswer } from './response-format.mjs'
 import { DailyScheduler } from './daily-scheduler.mjs'
 import { cleanJobPageContent, deduplicateExtractedJobs, extractJson, validateExtractedJobs } from './job-extraction.mjs'
 import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAuthorized, nextDailyRun, normalizeCandidateProfile, normalizeLifeEvent, shouldNotifyJob } from './job-intelligence.mjs'
+import { PostgresCompanionStore } from './companion-store.mjs'
 import {
   NewsScheduler, buildNewsSearchQueries, deduplicateNewsResults, isQuietHours,
   normalizeNewsSettings, rankNewsArticles, startOfDayInTimeZone,
 } from './news-intelligence.mjs'
-import { getDueGreeting, isQuietHours as isCompanionQuietHours, parseNaturalLanguageEvent } from './companion-intelligence.mjs'
+import {
+  buildEventReminderMessage,
+  getDueGreeting,
+  getFestivalWishTemplate,
+  getLocalDateParts,
+  isQuietHours as isCompanionQuietHours,
+  normalizeClockTime,
+  parseNaturalLanguageEvent,
+  toMinutesOfDay,
+} from './companion-intelligence.mjs'
 
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
@@ -36,6 +46,7 @@ const projectEnvFile = process.env.AGENTFLOW_ENV_FILE || path.join(path.dirname(
 const jobPromptTokenBudget = readPositiveInteger(process.env.AGENTFLOW_JOB_PROMPT_TOKEN_BUDGET, 6000, 1000, 9000)
 const jobDescriptionMaxCharacters = readPositiveInteger(process.env.AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS, 8000, 1000, 30000)
 const newsCronSecret = process.env.AGENTFLOW_NEWS_CRON_SECRET || ''
+const companionCronSecret = process.env.AGENTFLOW_COMPANION_CRON_SECRET || ''
 const secretNames = new Set([
   'GEMINI_API_KEY',
   'GROQ_API_KEY',
@@ -53,6 +64,13 @@ const defaultWhitelistId = '1207882899'
 const agent = { running: false, status: 'stopped', message: 'Agent is stopped.', events: [], controller: null, task: null, settings: null }
 const userRequests = new Map()
 const database = await JobDatabase.open(databaseFile)
+const companionStore = process.env.DATABASE_URL
+  ? await PostgresCompanionStore.open(process.env.DATABASE_URL)
+  : database
+await companionStore.recoverInterruptedCompanionRuns()
+if (production && !process.env.DATABASE_URL) {
+  console.warn('Personal Companion uses local SQLite without DATABASE_URL; configure PostgreSQL for durable Render storage.')
+}
 let jobResearchRunning = false
 let newsResearchRunning = false
 let agentStartPromise
@@ -162,6 +180,13 @@ function isNewsCronAuthorized(request) {
   return production && isDashboardAuthorized(request)
 }
 
+function isCompanionCronAuthorized(request) {
+  const authorization = request.headers.authorization || ''
+  if (companionCronSecret && authorization.startsWith('Bearer ')
+    && safeStringEqual(authorization.slice(7), companionCronSecret)) return true
+  return !production || isDashboardAuthorized(request)
+}
+
 const contentTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -236,8 +261,8 @@ function sanitizeJobError(message, secrets = {}) {
   return safeMessage.slice(0, 350)
 }
 
-function getCompanionNotificationChatId() {
-  const companion = database.getCompanionSettings()
+async function getCompanionNotificationChatId() {
+  const companion = await companionStore.getCompanionSettings()
   if (typeof companion.notificationChatId === 'string' && companion.notificationChatId.trim()) return companion.notificationChatId.trim()
   const news = database.getNewsSettings()
   if (typeof news.telegramChatId === 'string' && news.telegramChatId.trim()) return news.telegramChatId.trim()
@@ -245,50 +270,172 @@ function getCompanionNotificationChatId() {
   return typeof settings.telegramChatId === 'string' ? settings.telegramChatId : ''
 }
 
-async function notifyCompanion(chatId, text) {
-  if (!chatId) return false
+async function deliverCompanionNotification(chatId, notification) {
+  await companionStore.enqueueCompanionNotification(notification)
+  const claimed = await companionStore.claimCompanionNotification(notification.idempotencyKey)
+  if (!claimed) return false
   try {
-    await sendTelegramMessage(chatId, text)
+    await sendTelegramMessage(chatId, notification.message)
+    await companionStore.finishCompanionNotification(notification.idempotencyKey, { delivered: true })
     return true
   } catch (error) {
     logEvent('ERROR', `Companion notification failed: ${error.message}`, 'errors')
+    await companionStore.finishCompanionNotification(notification.idempotencyKey, { delivered: false, error: error.message })
     return false
   }
 }
 
-async function processCompanionNotifications() {
-  const settings = database.getCompanionSettings()
-  if (settings.paused) return
-  const chatId = getCompanionNotificationChatId()
-  if (!chatId) return
+const companionTasksRunning = new Set()
+
+async function runCompanionScheduler(schedulerName, trigger, work) {
+  if (companionTasksRunning.has(schedulerName)) return { schedulerName, status: 'overlap-skipped' }
+  companionTasksRunning.add(schedulerName)
+  let runId
+  let deliveredCount = 0
+  try {
+    runId = await companionStore.startCompanionRun(schedulerName, trigger)
+    const result = await work()
+    deliveredCount = result.deliveredCount || 0
+    const status = result.status || 'completed'
+    await companionStore.finishCompanionRun(runId, { status, deliveredCount })
+    return { schedulerName, ...result, deliveredCount }
+  } catch (error) {
+    if (runId !== undefined) {
+      await companionStore.finishCompanionRun(runId, { status: 'failed', deliveredCount, error: error.message })
+    }
+    logEvent('500 ERROR', `${schedulerName} scheduler failed: ${error.message}`, 'errors')
+    return { schedulerName, status: 'failed', deliveredCount, error: error.message }
+  } finally {
+    companionTasksRunning.delete(schedulerName)
+  }
+}
+
+function calendarificRegion(region) {
+  const regions = {
+    'Uttar Pradesh': 'IN-UP',
+    'North India': 'IN-UP',
+    'Delhi': 'IN-DL',
+    'Punjab': 'IN-PB',
+    'Haryana': 'IN-HR',
+    'Uttarakhand': 'IN-UT',
+    'Bihar': 'IN-BR',
+    'Rajasthan': 'IN-RJ',
+    'Madhya Pradesh': 'IN-MP',
+    'Himachal Pradesh': 'IN-HP',
+    'Jammu and Kashmir': 'IN-JK',
+  }
+  return regions[region] || ''
+}
+
+async function getFestivalCalendar(settings, year, now) {
+  const region = settings.festivalRegion || 'Uttar Pradesh'
+  const cached = await companionStore.getFestivalCalendar(region, year, now)
+  if (cached) return cached.events
+  const projectEnv = await readEnvFile(projectEnvFile)
+  const secretEnv = await readEnvFile(secretFile)
+  const apiKey = process.env.CALENDARIFIC_API_KEY || secretEnv.CALENDARIFIC_API_KEY || projectEnv.CALENDARIFIC_API_KEY
+  if (!apiKey) return null
+  const location = calendarificRegion(region)
+  if (!location) throw new Error('The selected region is not supported by the configured Indian holiday calendar.')
+  const query = new URLSearchParams({ api_key: apiKey, country: 'IN', year: String(year), location: location.toLowerCase() })
+  let response
+  try {
+    response = await fetch(`https://calendarific.com/api/v2/holidays?${query}`, { signal: AbortSignal.timeout(10000) })
+  } catch {
+    throw new Error('Could not reach the Indian festival calendar provider.')
+  }
+  if (!response.ok) throw new Error(`Indian festival calendar returned HTTP ${response.status}.`)
+  let payload
+  try {
+    payload = await response.json()
+  } catch {
+    throw new Error('Indian festival calendar returned an invalid response.')
+  }
+  if (payload?.meta?.code !== 200 || !Array.isArray(payload?.response?.holidays)) {
+    throw new Error('Indian festival calendar did not return verified festival dates.')
+  }
+  const events = payload.response.holidays
+    .filter((holiday) => {
+      const types = Array.isArray(holiday.type) ? holiday.type : []
+      return typeof holiday.name === 'string'
+        && /^\d{4}-\d{2}-\d{2}$/.test(holiday.date?.iso || '')
+        && types.some((type) => /national holiday|local holiday|religious holiday/i.test(type))
+    })
+    .map((holiday) => ({
+      name: holiday.name.trim().slice(0, 120),
+      date: holiday.date.iso,
+      type: Array.isArray(holiday.type) ? holiday.type : [],
+      locations: Array.isArray(holiday.locations) ? holiday.locations : [],
+    }))
+  await companionStore.saveFestivalCalendar(region, year, events, now)
+  return events
+}
+
+async function processCompanionNotifications(trigger = 'in-process') {
+  const settings = await companionStore.getCompanionSettings()
+  if (settings.paused) return { status: 'paused', schedulers: [] }
+  const chatId = await getCompanionNotificationChatId()
+  if (!chatId) return { status: 'no-recipient', schedulers: [] }
   const now = new Date()
-  const greeting = getDueGreeting(settings, now)
-  if (greeting) {
-    const dayKey = greeting.dayKey || now.toISOString().slice(0, 10)
-    if (!database.hasCompanionGreeting(greeting.kind, dayKey)) {
-      await notifyCompanion(chatId, greeting.message)
-      database.recordCompanionGreeting(greeting.kind, dayKey, now.toISOString())
-    }
-  }
-  for (const event of database.getDueLifeEvents(now)) {
-    const dueAt = event.dueAt || now.toISOString()
-    const text = `${event.title}${event.eventTime ? ` at ${event.eventTime}` : ''} — ${event.description || 'Reminder due now.'}`
-    const notified = database.markLifeEventNotified(event.id, event.notificationKey, dueAt)
-    if (!notified) continue
-    await notifyCompanion(chatId, text)
-    const nextDate = new Date(`${event.eventDate}T${event.eventTime || '00:00'}:00`)
-    if (event.recurrence && event.recurrence !== 'None') {
-      const nextOccurrence = new Date(nextDate)
-      if (event.recurrence === 'Daily') nextOccurrence.setDate(nextOccurrence.getDate() + 1)
-      else if (event.recurrence === 'Weekly') nextOccurrence.setDate(nextOccurrence.getDate() + 7)
-      else if (event.recurrence === 'Monthly') nextOccurrence.setMonth(nextOccurrence.getMonth() + 1)
-      else if (event.recurrence === 'Yearly') nextOccurrence.setFullYear(nextOccurrence.getFullYear() + 1)
-      database.updateLifeEvent(event.id, {
-        eventDate: nextOccurrence.toISOString().slice(0, 10),
-        nextOccurrence: nextOccurrence.toISOString().slice(0, 10),
+  const result = []
+  result.push(await runCompanionScheduler('greetings', trigger, async () => {
+    const greeting = getDueGreeting(settings, now)
+    if (!greeting) return { status: 'not-due' }
+    const delivered = await deliverCompanionNotification(chatId, {
+      idempotencyKey: `greeting:${greeting.kind}:${greeting.dayKey}`,
+      type: 'greeting',
+      title: `${greeting.kind[0].toUpperCase()}${greeting.kind.slice(1)} greeting`,
+      message: greeting.message,
+      scheduledAt: greeting.dueAt,
+    })
+    if (delivered) database.recordCompanionGreeting(greeting.kind, greeting.dayKey, now.toISOString())
+    return { status: delivered ? 'completed' : 'queued-or-duplicate', deliveredCount: Number(delivered) }
+  }))
+  result.push(await runCompanionScheduler('festivals', trigger, async () => {
+    if (!settings.festivalEnabled) return { status: 'disabled' }
+    const parts = getLocalDateParts(now, settings.timezone)
+    const date = `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`
+    const wishTime = normalizeClockTime(settings.greetingTimes.morning, '08:00')
+    if (parts.hour * 60 + parts.minute < (toMinutesOfDay(wishTime) || 0)) return { status: 'not-due' }
+    const calendar = await getFestivalCalendar(settings, parts.year, now)
+    if (!calendar) return { status: 'calendar-not-configured' }
+    let deliveredCount = 0
+    const festivals = calendar.filter((festival) => festival.date === date)
+    for (const festival of festivals) {
+      const slug = festival.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+      const delivered = await deliverCompanionNotification(chatId, {
+        idempotencyKey: `festival:${date}:${settings.festivalRegion}:${slug}`,
+        type: 'festival',
+        title: festival.name,
+        message: getFestivalWishTemplate(festival.name, settings.festivalRegion),
+        scheduledAt: new Date(`${date}T${wishTime}:00+05:30`),
       })
+      deliveredCount += Number(delivered)
     }
-  }
+    return { status: festivals.length ? 'completed' : 'no-festival-today', deliveredCount }
+  }))
+  const eventCheckIntervalMs = Math.max(5, Math.min(180, Number(settings.reminderIntervalMinutes) || 15)) * 60000
+  const lastEventRun = trigger === 'external-cron' ? await companionStore.getLastCompanionRun('events') : null
+  const lastEventRunAt = lastEventRun ? Date.parse(lastEventRun.startedAt) : Number.NaN
+  const eventCheckDue = !Number.isFinite(lastEventRunAt) || now.getTime() - lastEventRunAt >= eventCheckIntervalMs
+  result.push(await runCompanionScheduler('events', trigger, async () => {
+    if (!eventCheckDue) return { status: 'interval-not-due' }
+    const events = await companionStore.getDueLifeEvents(now)
+    let deliveredCount = 0
+    for (const event of events) {
+      const delivered = await deliverCompanionNotification(chatId, {
+        idempotencyKey: `event:${event.notificationKey}`,
+        type: 'event',
+        title: event.title,
+        message: buildEventReminderMessage(event, event.dueAt),
+        scheduledAt: event.dueAt,
+      })
+      deliveredCount += Number(delivered)
+    }
+    const advanced = await companionStore.advanceDueLifeEvents(now)
+    return { status: events.length ? 'completed' : 'not-due', deliveredCount, advancedOccurrences: advanced }
+  }))
+  return { status: 'completed', schedulers: result }
 }
 
 function safeSettings(input = {}) {
@@ -319,6 +466,13 @@ function safeSettings(input = {}) {
       maxChars: input.format?.maxChars !== false,
     },
   }
+}
+
+function isValidEventDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day))
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
 }
 
 function createPrompt(query, settings, searchResults = '') {
@@ -1339,6 +1493,76 @@ async function sendTelegramMessage(chatId, text) {
   for (const chunk of chunks) await telegramRequest('sendMessage', { chat_id: chatId, text: chunk })
 }
 
+async function handleCompanionConversation(text, chatId) {
+  const lower = text.toLowerCase().trim()
+  const recognized = /^(?:please\s+)?(?:delete|remove|cancel|edit|update|change|reschedule)\b/i.test(text)
+    || /\b(?:list|show|what are|upcoming)\b.*\b(events|reminders|dates)\b/.test(lower)
+    || /\b(?:birthday|anniversary|interview|exam|examination|meeting|internship|submission|travel|festival|deadline|assignment|remind me|remember|reminder|milestone)\b/i.test(text)
+  if (!recognized) return false
+  const events = await companionStore.listLifeEvents()
+  if (/\b(list|show|what are|upcoming)\b.*\b(events|reminders|dates)\b/.test(lower)) {
+    const upcoming = events.filter((event) => event.active).slice(0, 8)
+    await sendTelegramMessage(chatId, upcoming.length
+      ? `Your saved events:\n${upcoming.map((event) => `• ${event.title} — ${event.eventDate}${event.eventTime ? ` at ${event.eventTime}` : ''}${event.recurrence !== 'None' ? ` (${event.recurrence})` : ''}`).join('\n')}`
+      : 'You do not have any saved events yet.')
+    return true
+  }
+
+  const deleteMatch = lower.match(/^(?:please\s+)?(?:delete|remove|cancel)\s+(?:my\s+)?(?:event\s+)?(.+)$/i)
+  if (deleteMatch) {
+    const event = findMatchingLifeEvent(events, deleteMatch[1])
+    if (!event) {
+      await sendTelegramMessage(chatId, 'I could not identify one saved event to delete. Send “list my events” or use the Personal Assistant dashboard.')
+      return true
+    }
+    await companionStore.deleteLifeEvent(event.id)
+    await sendTelegramMessage(chatId, `Deleted “${event.title}”.`)
+    return true
+  }
+
+  const editMatch = text.match(/^(?:please\s+)?(?:edit|update|change|reschedule)\s+(?:my\s+)?(.+?)\s+(?:to|on)\s+(.+)$/i)
+  if (editMatch) {
+    const event = findMatchingLifeEvent(events, editMatch[1])
+    const parsed = parseNaturalLanguageEvent(`${editMatch[1]} on ${editMatch[2]}`, new Date())
+    if (!event || !parsed) {
+      await sendTelegramMessage(chatId, 'I could not update that event. Include its current title and a clear new date, such as “reschedule interview to 12 March”.')
+      return true
+    }
+    await companionStore.updateLifeEvent(event.id, {
+      eventDate: parsed.eventDate,
+      eventTime: parsed.eventTime || event.eventTime,
+      nextOccurrence: parsed.eventDate,
+    })
+    await sendTelegramMessage(chatId, `Updated “${event.title}” to ${parsed.eventDate}${parsed.eventTime ? ` at ${parsed.eventTime}` : ''}.`)
+    return true
+  }
+
+  const looksLikeEvent = /\b(?:birthday|anniversary|interview|exam|examination|meeting|internship|submission|travel|festival|deadline|assignment|remind me|remember|reminder|milestone)\b/i.test(text)
+  if (!looksLikeEvent) return false
+  const event = parseNaturalLanguageEvent(text, new Date())
+  if (!event) {
+    await sendTelegramMessage(chatId, 'I can save that reminder—please include a date (for example, “my interview is on 12 March at 10 am”).')
+    return true
+  }
+  const created = await companionStore.createLifeEvent(event)
+  const settings = await companionStore.getCompanionSettings()
+  if (!settings.notificationChatId) {
+    await companionStore.saveCompanionSettings({ ...settings, notificationChatId: String(chatId) })
+  }
+  await sendTelegramMessage(chatId, `Saved “${created.title}” for ${created.eventDate}${created.eventTime ? ` at ${created.eventTime}` : ''}. I’ll remind you automatically.`)
+  return true
+}
+
+function findMatchingLifeEvent(events, query) {
+  const words = String(query || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((word) => word.length > 2)
+  if (!words.length) return null
+  const matches = events.filter((event) => {
+    const searchable = `${event.title} ${event.category}`.toLowerCase()
+    return words.every((word) => searchable.includes(word))
+  })
+  return matches.length === 1 ? matches[0] : null
+}
+
 async function handleTelegramUpdate(update, settings) {
   if (update.callback_query) {
     await handleJobCallback(update.callback_query, settings)
@@ -1359,18 +1583,8 @@ async function handleTelegramUpdate(update, settings) {
     return
   }
 
-  if (!text.startsWith('/') && /birthday|anniversary|interview|exam|examination|meeting|internship|submission|travel|festival|deadline|assignment/i.test(text)) {
-    const event = parseNaturalLanguageEvent(text, new Date())
-    if (event) {
-      const created = database.createLifeEvent({
-        ...event,
-        title: event.title,
-        description: event.description,
-        reminderMinutes: [0, 1440],
-      })
-      await sendTelegramMessage(chatId, `Saved event: ${created.title} for ${created.eventDate}${created.eventTime ? ` at ${created.eventTime}` : ''}.`)
-      return
-    }
+  if (!text.startsWith('/') && await handleCompanionConversation(text, chatId)) {
+    return
   }
 
   if (commandText === '/start') {
@@ -1867,6 +2081,8 @@ async function testCredential(name, secrets, draftValue) {
 
 let scheduler
 let newsScheduler
+let companionInterval
+let lastCompanionCheck = 0
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${host}:${port}`)
   try {
@@ -1882,7 +2098,9 @@ const server = createServer(async (request, response) => {
     const isPublicHealthCheck = request.method === 'GET' && url.pathname === '/api/health'
     const isNewsCronRoute = request.method === 'POST' && url.pathname === '/api/cron/news'
     const isAuthorizedNewsCron = isNewsCronRoute && isNewsCronAuthorized(request)
-    if (production && !isPublicHealthCheck && !isAuthorizedNewsCron && !isDashboardAuthorized(request)) {
+    const isCompanionCronRoute = request.method === 'POST' && url.pathname === '/api/cron/companion'
+    const isAuthorizedCompanionCron = isCompanionCronRoute && isCompanionCronAuthorized(request)
+    if (production && !isPublicHealthCheck && !isAuthorizedNewsCron && !isAuthorizedCompanionCron && !isDashboardAuthorized(request)) {
       response.writeHead(401, {
         'www-authenticate': 'Basic realm="AgentFlow Control Center", charset="UTF-8"',
         'content-type': 'application/json; charset=utf-8',
@@ -1902,37 +2120,65 @@ const server = createServer(async (request, response) => {
         providerUsage: database.listProviderUsage(40),
         scheduler: database.getScheduler(),
         runInProgress: jobResearchRunning,
-        companion: database.getCompanionSettings(),
+        companion: await companionStore.getCompanionSettings(),
       })
     }
 
     if (request.method === 'GET' && url.pathname === '/api/companion') {
       return respond(response, 200, {
-        settings: database.getCompanionSettings(),
-        events: database.listLifeEvents(),
-        chatId: getCompanionNotificationChatId(),
+        settings: await companionStore.getCompanionSettings(),
+        events: await companionStore.listLifeEvents(),
+        notifications: await companionStore.listCompanionNotifications(30),
+        scheduler: await companionStore.getCompanionSchedulerStatus(),
+        chatId: await getCompanionNotificationChatId(),
+        calendarConfigured: Boolean(process.env.CALENDARIFIC_API_KEY
+          || (await readEnvFile(secretFile)).CALENDARIFIC_API_KEY
+          || (await readEnvFile(projectEnvFile)).CALENDARIFIC_API_KEY),
+        persistentStorage: Boolean(process.env.DATABASE_URL),
       })
     }
 
     if (request.method === 'PUT' && url.pathname === '/api/companion/settings') {
       const input = await readJson(request)
-      return respond(response, 200, { settings: database.saveCompanionSettings(input) })
+      if (Object.hasOwn(input, 'notificationChatId')
+        && input.notificationChatId !== ''
+        && (typeof input.notificationChatId !== 'string' || !/^-?\d{1,20}$/.test(input.notificationChatId.trim()))) {
+        return respond(response, 400, { error: 'Telegram notification chat ID must be numeric.' })
+      }
+      return respond(response, 200, { settings: await companionStore.saveCompanionSettings(input) })
     }
 
     if (request.method === 'GET' && url.pathname === '/api/events') {
-      return respond(response, 200, { events: database.listLifeEvents() })
+      return respond(response, 200, { events: await companionStore.listLifeEvents() })
     }
 
     if (request.method === 'POST' && url.pathname === '/api/events') {
       const input = await readJson(request)
-      const event = database.createLifeEvent(normalizeLifeEvent(input))
+      if (!isValidEventDate(input.eventDate) || (input.eventTime && !/^([01]\d|2[0-3]):[0-5]\d$/.test(input.eventTime))) {
+        return respond(response, 400, { error: 'A valid event date and optional 24-hour time are required.' })
+      }
+      const event = await companionStore.createLifeEvent(normalizeLifeEvent(input))
       return respond(response, 200, { event })
+    }
+
+    if (request.method === 'PUT' && url.pathname.startsWith('/api/events/')) {
+      const id = Number(url.pathname.split('/').pop())
+      if (!Number.isInteger(id) || id <= 0) return respond(response, 400, { error: 'Invalid event ID.' })
+      const input = await readJson(request)
+      if (Object.hasOwn(input, 'eventDate') && !isValidEventDate(input.eventDate)) {
+        return respond(response, 400, { error: 'A valid event date is required.' })
+      }
+      if (Object.hasOwn(input, 'eventTime') && input.eventTime !== '' && !/^([01]\d|2[0-3]):[0-5]\d$/.test(input.eventTime)) {
+        return respond(response, 400, { error: 'Event time must use 24-hour HH:MM format.' })
+      }
+      const event = await companionStore.updateLifeEvent(id, input)
+      return respond(response, event ? 200 : 404, event ? { event } : { error: 'Event not found.' })
     }
 
     if (request.method === 'DELETE' && url.pathname.startsWith('/api/events/')) {
       const id = Number(url.pathname.split('/').pop())
       if (!Number.isInteger(id) || id <= 0) return respond(response, 400, { error: 'Invalid event ID.' })
-      const deleted = database.deleteLifeEvent(id)
+      const deleted = await companionStore.deleteLifeEvent(id)
       return respond(response, deleted ? 200 : 404, { deleted })
     }
 
@@ -2009,6 +2255,21 @@ const server = createServer(async (request, response) => {
         'cache-control': 'no-store',
       })
       return response.end(JSON.stringify({ error: 'Use POST to trigger the proactive news scan.' }))
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/cron/companion') {
+      if (!isCompanionCronAuthorized(request)) {
+        return respond(response, 401, { error: 'Personal Companion scheduler authentication required.' })
+      }
+      return respond(response, 200, await processCompanionNotifications('external-cron'))
+    }
+    if (url.pathname === '/api/cron/companion') {
+      response.writeHead(405, {
+        allow: 'POST',
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      })
+      return response.end(JSON.stringify({ error: 'Use POST to run the Personal Companion schedulers.' }))
     }
 
     if (request.method === 'POST' && url.pathname === '/api/cron/jobs') {
@@ -2149,9 +2410,20 @@ server.listen(port, host, () => {
     intervalMs: 30000,
   })
   newsScheduler.start().catch((error) => logEvent('500 ERROR', `Could not initialize proactive news scheduler: ${error.message}`, 'errors'))
-  setInterval(() => {
-    processCompanionNotifications().catch((error) => logEvent('500 ERROR', `Companion monitor failed: ${error.message}`, 'errors'))
-  }, 60 * 1000)
+  processCompanionNotifications('startup-recovery')
+    .catch((error) => logEvent('500 ERROR', `Could not recover Personal Companion notifications: ${error.message}`, 'errors'))
+  companionInterval = setInterval(async () => {
+    try {
+      const settings = await companionStore.getCompanionSettings()
+      const interval = Math.max(5, Math.min(180, Number(settings.reminderIntervalMinutes) || 15)) * 60000
+      if (Date.now() - lastCompanionCheck < interval) return
+      lastCompanionCheck = Date.now()
+      await processCompanionNotifications('in-process')
+    } catch (error) {
+      logEvent('500 ERROR', `Personal Companion scheduler failed: ${error.message}`, 'errors')
+    }
+  }, 60000)
+  companionInterval.unref?.()
   const preferences = database.getAgentPreferences()
   if (preferences.autoStart) {
     startTelegramAgentAutomatically(preferences.settings)
@@ -2160,9 +2432,11 @@ server.listen(port, host, () => {
 
 const shutdown = () => {
   agent.controller?.abort()
-  server.close(() => {
+  server.close(async () => {
     scheduler?.stop()
     newsScheduler?.stop()
+    if (companionInterval) clearInterval(companionInterval)
+    if (companionStore !== database) await companionStore.close()
     database.close()
     process.exit(0)
   })

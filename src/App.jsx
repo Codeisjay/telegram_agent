@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  Activity, AlertTriangle, ArrowDown, ArrowRight, ArrowUp, ArrowUpRight, BarChart3,
+  Activity, AlertTriangle, ArrowDown, ArrowRight, ArrowUp, ArrowUpRight, BarChart3, BellRing,
   Bot, BriefcaseBusiness, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, CircleHelp,
   Clock3, Command, Copy, Cpu, ExternalLink, Eye, EyeOff, FileText, Filter, FlaskConical,
   Globe2, KeyRound, LayoutDashboard, LockKeyhole, Menu, MessageCircle,
@@ -9,6 +9,7 @@ import {
   X, Zap,
 } from 'lucide-react'
 import JobsPage from './JobsPage.jsx'
+import PersonalAssistantPage from './PersonalAssistantPage.jsx'
 import { readApiResponse } from './api.js'
 
 const initialLogs = []
@@ -19,6 +20,7 @@ const navItems = [
   { id: 'rules', label: 'Prompt & Rules', icon: SlidersHorizontal },
   { id: 'models', label: 'LLM & Web Search', icon: Cpu },
   { id: 'news', label: 'News interests', icon: Newspaper },
+  { id: 'personal', label: 'Personal Assistant', icon: BellRing },
   { id: 'telegram', label: 'Telegram Settings', icon: Send },
 ]
 
@@ -341,7 +343,7 @@ function App() {
 
     <main className={`main-content ${collapsed ? 'main-expanded' : ''}`}>
       <div className="page-heading">
-        <div><div className="breadcrumbs">Workspace <ChevronRight size={13} /> <span>{navItems.find((item) => item.id === active)?.label}</span></div><h1>{active === 'overview' ? 'Overview' : active === 'jobs' ? 'Job intelligence' : active === 'rules' ? 'Prompt & rules' : active === 'models' ? 'LLM & web search' : active === 'news' ? 'News interests' : 'Telegram settings'}</h1><p>{active === 'overview' ? 'Monitor your agent’s performance and recent activity.' : active === 'jobs' ? 'Find verified internship and fresher openings against your candidate profile.' : active === 'rules' ? 'Shape how your agent thinks, responds, and formats results.' : active === 'models' ? 'Manage your AI providers, search behavior, and API credentials.' : active === 'news' ? 'Choose the topics AgentFlow monitors and sends to your Telegram chat.' : 'Configure your Telegram connection, commands, and access.'}</p></div>
+        <div><div className="breadcrumbs">Workspace <ChevronRight size={13} /> <span>{navItems.find((item) => item.id === active)?.label}</span></div><h1>{active === 'overview' ? 'Overview' : active === 'jobs' ? 'Job intelligence' : active === 'rules' ? 'Prompt & rules' : active === 'models' ? 'LLM & web search' : active === 'news' ? 'News interests' : active === 'personal' ? 'Personal Assistant' : 'Telegram settings'}</h1><p>{active === 'overview' ? 'Monitor your agent’s performance and recent activity.' : active === 'jobs' ? 'Find verified internship and fresher openings against your candidate profile.' : active === 'rules' ? 'Shape how your agent thinks, responds, and formats results.' : active === 'models' ? 'Manage your AI providers, search behavior, and API credentials.' : active === 'news' ? 'Choose the topics AgentFlow monitors and sends to your Telegram chat.' : active === 'personal' ? 'Manage daily greetings, festival wishes, and automatic event reminders.' : 'Configure your Telegram connection, commands, and access.'}</p></div>
         <div className="heading-actions">
           <button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={15} /><span>Search anything...</span><kbd><Command size={11} /> K</kbd></button>
           <IconButton label="Toggle theme" onClick={() => setDark(!dark)}><Sparkles size={17} /></IconButton>
@@ -354,6 +356,7 @@ function App() {
       {active === 'rules' && <RulesPage config={config} update={update} onToast={setToast} />}
       {active === 'models' && <ModelsPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} />}
       {active === 'news' && <NewsInterestsPage onToast={setToast} />}
+      {active === 'personal' && <PersonalAssistantPage onToast={setToast} />}
       {active === 'telegram' && <TelegramPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} agentRunning={agentStatus.running} onToggleAgent={toggleAgent} />}
       <footer className="page-footer"><span>AgentFlow AI <span className="footer-sep">/</span> Control Center</span><span>All changes saved automatically <span className="save-indicator" /></span></footer>
     </main>

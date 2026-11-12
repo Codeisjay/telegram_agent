@@ -51,8 +51,14 @@ export function normalizeCompanionSettings(input = {}, current = DEFAULT_COMPANI
   const greetings = { ...DEFAULT_COMPANION_SETTINGS.greetings, ...(current.greetings || {}), ...(input.greetings || {}) }
   const personalName = typeof input.personalName === 'string' && input.personalName.trim() ? input.personalName.trim().slice(0, 80) : (typeof current.personalName === 'string' ? current.personalName : fallback.personalName)
   const notificationChatId = typeof input.notificationChatId === 'string' && /^-?\d{1,20}$/.test(input.notificationChatId.trim()) ? input.notificationChatId.trim() : (typeof current.notificationChatId === 'string' ? current.notificationChatId : fallback.notificationChatId)
+  let timezone = input.timezone || current.timezone || fallback.timezone
+  try {
+    new Intl.DateTimeFormat('en', { timeZone: timezone })
+  } catch {
+    timezone = fallback.timezone
+  }
   return {
-    timezone: input.timezone || current.timezone || fallback.timezone,
+    timezone,
     personalName,
     greetingTimes: {
       morning: normalizeClockTime(greetingTimes.morning, DEFAULT_COMPANION_SETTINGS.greetingTimes.morning),
@@ -98,7 +104,7 @@ export function getLocalDateParts(date = new Date(), timeZone = 'Asia/Kolkata') 
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
-    hour12: false,
+    hourCycle: 'h23',
   })
   const parts = formatter.formatToParts(date)
   const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]))
@@ -133,10 +139,10 @@ export function isQuietHours(settings = DEFAULT_COMPANION_SETTINGS, now = new Da
   return currentMinutes >= startMinutes || currentMinutes < endMinutes
 }
 
-export function getGreetingVariant(kind, settings = DEFAULT_COMPANION_SETTINGS) {
+export function getGreetingVariant(kind, settings = DEFAULT_COMPANION_SETTINGS, dayKey = '') {
   const variants = greetingVariants[kind] || greetingVariants.morning
   const personalName = (normalizeCompanionSettings(settings).personalName || 'Jay').trim() || 'Jay'
-  return variants[(Math.abs(hashString(`${kind}:${personalName}`)) % variants.length)]
+  return variants[(Math.abs(hashString(`${kind}:${personalName}:${dayKey}`)) % variants.length)]
     .replace(/Jay/g, personalName)
 }
 
@@ -150,7 +156,7 @@ function hashString(value) {
 
 export function getDueGreeting(settings = DEFAULT_COMPANION_SETTINGS, now = new Date()) {
   const normalized = normalizeCompanionSettings(settings)
-  if (normalized.paused || !normalized.greetings) return null
+  if (normalized.paused || typeof normalized.greetings !== 'object') return null
   const { hour, minute, year, month, day } = getLocalDateParts(now, normalized.timezone)
   const schedule = Object.fromEntries(Object.entries(normalized.greetingTimes).map(([kind, time]) => [kind, toMinutesOfDay(time)]))
   const currentMinutes = hour * 60 + minute
@@ -158,9 +164,11 @@ export function getDueGreeting(settings = DEFAULT_COMPANION_SETTINGS, now = new 
     if (!normalized.greetings[kind]) continue
     const target = schedule[kind]
     if (target == null) continue
-    const minutesAway = Math.abs(currentMinutes - target)
-    if (minutesAway <= 15 && !isQuietHours(normalized, now)) {
-      return { kind, message: getGreetingVariant(kind, normalized), dueAt: new Date(Date.UTC(year, month - 1, day, hour, minute, 0)), dayKey: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}` }
+    const minutesSinceTarget = currentMinutes - target
+    const dayKey = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+    if (minutesSinceTarget >= 0 && minutesSinceTarget <= 30 && !isQuietHours(normalized, now)) {
+      const targetTime = `${String(Math.floor(target / 60)).padStart(2, '0')}:${String(target % 60).padStart(2, '0')}`
+      return { kind, message: getGreetingVariant(kind, normalized, dayKey), dueAt: zonedDateTimeToDate(dayKey, targetTime, normalized.timezone), dayKey }
     }
   }
   return null
@@ -190,55 +198,178 @@ export function parseNaturalLanguageEvent(text, now = new Date()) {
         : /every day|daily/i.test(lower) ? 'Daily'
           : 'None'
 
-  const title = lower.includes('birthday') ? 'Birthday'
-    : lower.includes('anniversary') ? 'Anniversary'
-      : lower.includes('interview') ? 'Interview'
-        : lower.includes('meeting') ? 'Meeting'
-          : lower.includes('exam') || lower.includes('examination') ? 'Examination'
-            : lower.includes('submission') ? 'Project submission'
-              : lower.includes('internship') ? 'Internship'
-                : lower.includes('travel') ? 'Travel'
-                  : lower.split(/\s+(?:is|on|at|for|about|remind|my|i have|i\s*have)\s+/i).find(Boolean)?.slice(0, 48) || 'Personal event'
+  const parsedDate = parseEventDate(normalized, now)
+  if (!parsedDate) return null
 
-  let date = null
-  const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']
-  const monthMatch = normalized.match(/\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b/i)
-  if (monthMatch) {
-    const day = Number(monthMatch[1])
-    const month = monthNames.indexOf(monthMatch[2].toLowerCase()) + 1
-    const year = new Date(now).getFullYear()
-    date = new Date(year, month - 1, day)
-  } else if (/\btomorrow\b/i.test(normalized)) {
-    date = new Date(now)
-    date.setDate(date.getDate() + 1)
-  } else if (/\bnext month\b/i.test(normalized)) {
-    date = new Date(now)
-    date.setMonth(date.getMonth() + 1)
-  }
-
-  const timeMatch = normalized.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i)
+  const timeMatch = normalized.match(/\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i)
+    || normalized.match(/\b(?:at\s*)?([01]?\d|2[0-3]):([0-5]\d)\b/i)
   let eventTime = ''
   if (timeMatch) {
-    let hour = Number(timeMatch[1])
-    const minute = Number(timeMatch[2] || '0')
-    const meridian = timeMatch[3].toLowerCase()
+    let hour = Number(timeMatch[1] || timeMatch[4])
+    const minute = Number(timeMatch[2] || timeMatch[5] || '0')
+    const meridian = timeMatch[3]?.toLowerCase()
+    if (meridian && (hour < 1 || hour > 12 || minute > 59)) return null
     if (meridian === 'am' && hour === 12) hour = 0
     if (meridian === 'pm' && hour !== 12) hour += 12
     eventTime = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
   }
 
-  const description = normalized.replace(/\b(?:my|i have|i\s+have)\b/gi, '').replace(/\b(?:is|on|at|for|about)\b/gi, '').trim()
+  const title = extractEventTitle(normalized, parsedDate)
+  if (!title) return null
+  const reminderMinutes = parseReminderIntervals(lower)
+  const description = normalized.slice(0, 500)
   return {
     title: title.slice(0, 150),
     description: description.slice(0, 500) || `${category} reminder`,
     category,
-    recurrence,
-    eventDate: date ? date.toISOString().slice(0, 10) : new Date(now).toISOString().slice(0, 10),
+    recurrence: recurrence === 'None' && ['Birthday', 'Anniversary'].includes(category) ? 'Yearly' : recurrence,
+    eventDate: parsedDate,
     eventTime,
-    reminderMinutes: [0, 1440],
-    importance: /important|critical|key/i.test(lower) ? 'High' : 'Medium',
+    reminderMinutes,
+    importance: /important|critical|high priority|key event/i.test(lower) ? 'High'
+      : /low priority|not important/i.test(lower) ? 'Low'
+        : 'Medium',
     timezone: 'Asia/Kolkata',
   }
+}
+
+function parseEventDate(text, now) {
+  const dateParts = getLocalDateParts(now, 'Asia/Kolkata')
+  const today = new Date(Date.UTC(dateParts.year, dateParts.month - 1, dateParts.day))
+  const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']
+  let match = text.match(/\b(20\d{2})-(\d{1,2})-(\d{1,2})\b/)
+  if (match) return validDate(Number(match[1]), Number(match[2]), Number(match[3]))
+  match = text.match(/\b(\d{1,2})[/-](\d{1,2})(?:[/-](20\d{2}))?\b/)
+  if (match) {
+    const date = validDate(Number(match[3] || dateParts.year), Number(match[2]), Number(match[1]))
+    return date
+  }
+  match = text.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s+(january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+(20\d{2}))?\b/i)
+    || text.match(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(20\d{2}))?\b/i)
+  if (match) {
+    const monthFirst = /^[a-z]/i.test(match[1])
+    const day = Number(monthFirst ? match[2] : match[1])
+    const monthName = monthFirst ? match[1] : match[2]
+    const year = Number(monthFirst ? match[3] || dateParts.year : match[3] || dateParts.year)
+    let result = validDate(year, monthNames.indexOf(monthName.toLowerCase()) + 1, day)
+    if (!result) return null
+    if (!match[3] && result < today && /birthday|anniversary|yearly|annually|every year/i.test(text)) {
+      result = validDate(year + 1, monthNames.indexOf(monthName.toLowerCase()) + 1, day)
+    }
+    return result
+  }
+  if (/\btoday\b/i.test(text)) return formatDateParts(today)
+  if (/\btomorrow\b/i.test(text)) return formatDateParts(new Date(today.getTime() + 86400000))
+  const relative = text.match(/\bin\s+(\d+)\s+(days?|weeks?|months?|years?)\b/i)
+  if (relative) {
+    const amount = Math.min(3650, Number(relative[1]))
+    const unit = relative[2].toLowerCase()
+    if (unit.startsWith('day')) return formatDateParts(new Date(today.getTime() + amount * 86400000))
+    if (unit.startsWith('week')) return formatDateParts(new Date(today.getTime() + amount * 7 * 86400000))
+    const targetYear = dateParts.year + (unit.startsWith('year') ? amount : 0)
+    const targetMonth = dateParts.month + (unit.startsWith('month') ? amount : 0)
+    const normalized = new Date(Date.UTC(targetYear, targetMonth - 1, 1))
+    const lastDay = new Date(Date.UTC(normalized.getUTCFullYear(), normalized.getUTCMonth() + 1, 0)).getUTCDate()
+    return formatDateParts(new Date(Date.UTC(normalized.getUTCFullYear(), normalized.getUTCMonth(), Math.min(dateParts.day, lastDay))))
+  }
+  if (/\bnext month\b/i.test(text)) {
+    const nextMonth = new Date(Date.UTC(dateParts.year, dateParts.month, 1))
+    const lastDay = new Date(Date.UTC(nextMonth.getUTCFullYear(), nextMonth.getUTCMonth() + 1, 0)).getUTCDate()
+    return formatDateParts(new Date(Date.UTC(nextMonth.getUTCFullYear(), nextMonth.getUTCMonth(), Math.min(dateParts.day, lastDay))))
+  }
+  const weekday = text.match(/\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i)
+  if (weekday) {
+    const weekdays = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+    const offset = (weekdays.indexOf(weekday[1].toLowerCase()) - today.getUTCDay() + 7) % 7 || 7
+    return formatDateParts(new Date(today.getTime() + offset * 86400000))
+  }
+  return null
+}
+
+function validDate(year, month, day) {
+  const date = new Date(Date.UTC(year, month - 1, day))
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+    ? formatDateParts(date)
+    : null
+}
+
+function formatDateParts(date) {
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`
+}
+
+function extractEventTitle(text, eventDate) {
+  let title = text
+    .replace(/^(?:hey\s+)?(?:please\s+)?(?:remember|remind me(?: to| about| of)?|add|save|schedule)\s+/i, '')
+    .replace(/\b(?:on|at)\s+(?:20\d{2}-\d{1,2}-\d{1,2}|\d{1,2}[/-]\d{1,2}(?:[/-]20\d{2})?|\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)|(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?|today|tomorrow|next\s+\w+)\b/ig, ' ')
+    .replace(/\b(?:at\s*)?\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/ig, ' ')
+    .replace(/\b(?:at\s*)?(?:[01]?\d|2[0-3]):[0-5]\d\b/ig, ' ')
+    .replace(/\b(?:today|tomorrow|next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\b/ig, ' ')
+    .replace(/\b(?:every year|yearly|annually|every month|monthly|every week|weekly|every day|daily|one week before|a week before|week before|one day before|a day before|day before|on the day|at the event|important|critical|high priority|low priority|not important|key event|remind me|reminder|please|for me|my)\b/ig, ' ')
+    .replace(/\b(?:wish(?:ing)?(?:\s+them)?|send\s+(?:a\s+)?(?:wish|greeting)s?)\b.*$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s,.:;'-]+|[\s,.:;'-]+$/g, '')
+  title = title.replace(/(?:\s+|\b)(?:is|will be|happens|falls)\s*$/i, '').replace(/[.?!]+$/g, '').trim()
+  return title || (eventDate ? text.replace(/\b(?:on|at)\b.*$/i, '').trim() : '')
+}
+
+function parseReminderIntervals(text) {
+  const reminders = new Set([0])
+  if (/\b(?:one week|a week|week)\s+before\b/.test(text)) reminders.add(10080)
+  if (/\b(?:one day|a day|day)\s+before\b/.test(text)) reminders.add(1440)
+  for (const match of text.matchAll(/\b(\d+)\s*(minutes?|hours?|days?)\s+before\b/g)) {
+    const amount = Number(match[1])
+    const unit = match[2].toLowerCase()
+    const minutes = amount * (unit.startsWith('day') ? 1440 : unit.startsWith('hour') ? 60 : 1)
+    if (minutes > 0 && minutes <= 525600) reminders.add(minutes)
+  }
+  return [...reminders].sort((a, b) => b - a).slice(0, 8)
+}
+
+export function zonedDateTimeToDate(dateValue, timeValue = '00:00', timeZone = 'Asia/Kolkata') {
+  const dateMatch = String(dateValue).match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  const timeMatch = String(timeValue).match(/^(\d{1,2}):(\d{2})$/)
+  if (!dateMatch || !timeMatch) return new Date(Number.NaN)
+  const [year, month, day] = dateMatch.slice(1).map(Number)
+  const [hour, minute] = timeMatch.slice(1).map(Number)
+  if (!validDate(year, month, day) || hour > 23 || minute > 59) return new Date(Number.NaN)
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute)
+  const local = getLocalDateParts(new Date(utcGuess), timeZone)
+  const represented = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute)
+  return new Date(utcGuess - (represented - utcGuess))
+}
+
+export function nextOccurrenceDate(dateValue, recurrence) {
+  const match = String(dateValue).match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (!match) return null
+  const [year, month, day] = match.slice(1).map(Number)
+  if (recurrence === 'Daily') return formatDateParts(new Date(Date.UTC(year, month - 1, day + 1)))
+  if (recurrence === 'Weekly') return formatDateParts(new Date(Date.UTC(year, month - 1, day + 7)))
+  if (!['Monthly', 'Yearly'].includes(recurrence)) return null
+  const targetYear = recurrence === 'Yearly' ? year + 1 : year
+  const targetMonth = recurrence === 'Monthly' ? month + 1 : month
+  const normalized = new Date(Date.UTC(targetYear, targetMonth - 1, 1))
+  const lastDay = new Date(Date.UTC(normalized.getUTCFullYear(), normalized.getUTCMonth() + 1, 0)).getUTCDate()
+  return formatDateParts(new Date(Date.UTC(normalized.getUTCFullYear(), normalized.getUTCMonth(), Math.min(day, lastDay))))
+}
+
+export function getDueEventReminders(event, now = new Date(), recoveryWindowMs = 7 * 86400000) {
+  const occurrenceDate = event.nextOccurrence || event.eventDate
+  const occurrence = zonedDateTimeToDate(occurrenceDate, event.eventTime || '00:00', event.timezone || 'Asia/Kolkata')
+  if (!Number.isFinite(occurrence.getTime())) return []
+  return (event.reminderMinutes || [0]).map(Number).filter((minutes) => Number.isFinite(minutes) && minutes >= 0)
+    .map((reminderMinutes) => {
+      const dueAt = new Date(occurrence.getTime() - reminderMinutes * 60000)
+      return {
+        ...event,
+        reminderMinutes,
+        notificationKey: `${event.id}:${occurrenceDate}:${reminderMinutes}`,
+        dueAt: dueAt.toISOString(),
+      }
+    })
+    .filter((reminder) => {
+      const elapsed = now.getTime() - Date.parse(reminder.dueAt)
+      return elapsed >= 0 && elapsed <= recoveryWindowMs
+    })
 }
 
 export function buildEventReminderMessage(event, occurrenceDate = new Date()) {
@@ -250,9 +381,9 @@ export function buildEventReminderMessage(event, occurrenceDate = new Date()) {
 
 export function getFestivalWishTemplate(festivalName, region = 'Uttar Pradesh') {
   const templates = [
-    `Wishing you a joyful ${festivalName} celebration in ${region}! May this auspicious day bring happiness, peace, and prosperity.`,
-    `Happy ${festivalName}! May this special occasion fill your home with warmth, light, and meaningful blessings.`,
-    `${festivalName} greetings! May this day bring peace, happiness, and fresh strength for the journey ahead.`,
+    `Wishing you and your loved ones a peaceful, joyful ${festivalName}.`,
+    `Warm ${festivalName} wishes to you and your family. May the day bring peace and togetherness.`,
+    `Happy ${festivalName}! Wishing you a meaningful celebration filled with joy and goodwill.`,
   ]
   return templates[Math.abs(hashString(`${festivalName}:${region}`)) % templates.length]
 }
