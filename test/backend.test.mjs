@@ -21,15 +21,19 @@ import { JobDatabase } from '../job-intelligence.mjs'
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const tempRoot = await mkdtemp(path.join(tmpdir(), 'agentflow-backend-test-'))
 const secretDirectory = path.join(tempRoot, 'local-app-data')
-const secretKeys = ['GEMINI_API_KEY', 'GROQ_API_KEY', 'OPENROUTER_API_KEY', 'TAVILY_SEARCH_KEY', 'TELEGRAM_BOT_TOKEN']
+const secretKeys = ['GEMINI_API_KEY', 'GROQ_API_KEY', 'OPENROUTER_API_KEY', 'TAVILY_SEARCH_KEY', 'TELEGRAM_BOT_TOKEN', 'GITHUB_TOKEN', 'YOUTUBE_API_KEY']
 let server
 let baseUrl
 function makeTestEnvironment(overrides = {}) {
   const environment = { ...process.env, LOCALAPPDATA: secretDirectory, AGENTFLOW_PORT: '0' }
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
-  for (const key of [...secretKeys, 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE']) delete environment[key]
+  for (const key of [...secretKeys, 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
   environment.AGENTFLOW_COMPANION_CRON_SECRET = 'test-companion-cron-secret'
+  environment.GOOGLE_CLIENT_ID = 'test-youtube-client.apps.googleusercontent.com'
+  environment.GOOGLE_CLIENT_SECRET = 'test-youtube-client-secret'
+  environment.YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY = 'a'.repeat(64)
+  environment.GOOGLE_REDIRECT_URI = 'http://localhost:3001/api/digital-footprint/youtube/oauth/callback'
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) delete environment[key]
     else environment[key] = value
@@ -165,6 +169,7 @@ test('news settings API persists user-selected notification topics', async () =>
       outputTokenBudget: 900,
     }),
   })
+
   assert.equal(update.status, 200)
   const saved = (await update.json()).settings
   assert.deepEqual(saved.categories, ['crime', 'politics'])
@@ -189,6 +194,129 @@ test('news settings API persists user-selected notification topics', async () =>
   }).then((result) => result.json())
   assert.equal(interests.settings.interests[0].priority, 'high')
   assert.deepEqual(interests.settings.categories, ['Generative AI'])
+})
+
+test('digital footprint API persists isolated settings, polls official endpoints, and excludes credentials', async () => {
+  const initialResponse = await fetch(`${baseUrl}/api/digital-footprint`)
+  assert.equal(initialResponse.status, 200)
+  const initial = await initialResponse.json()
+  assert.equal(initial.settings.enabled, false)
+  assert.equal(initial.sources.youtubeApiKeyConfigured, false)
+  assert.equal(JSON.stringify(initial).includes('environment-stale-test-key'), false)
+
+  const invalid = await fetch(`${baseUrl}/api/digital-footprint/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true, githubUsername: 'invalid username' }),
+  })
+  assert.equal(invalid.status, 400)
+
+  const update = await fetch(`${baseUrl}/api/digital-footprint/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true, githubUsername: 'octocat', youtubeChannelId: '' }),
+  })
+  assert.equal(update.status, 200)
+  assert.equal((await update.json()).settings.enabled, true)
+
+  const run = await fetch(`${baseUrl}/api/digital-footprint/run`, { method: 'POST' })
+  assert.equal(run.status, 200)
+  const result = await run.json()
+  assert.equal(result.status, 'completed')
+  assert.equal(result.githubCount, 1)
+  assert.equal(result.state.activities[0].source, 'github')
+
+  const stopped = await fetch(`${baseUrl}/api/digital-footprint/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  })
+  assert.equal(stopped.status, 200)
+  assert.equal((await stopped.json()).settings.enabled, false)
+
+  const connectResponse = await fetch(`${baseUrl}/api/digital-footprint/youtube/oauth/connect`, { method: 'POST' })
+  assert.equal(connectResponse.status, 200)
+  const { authorizationUrl } = await connectResponse.json()
+  const authorization = new URL(authorizationUrl)
+  assert.equal(authorization.origin, 'https://accounts.google.com')
+  assert.equal(authorization.searchParams.get('redirect_uri'), 'http://localhost:3001/api/digital-footprint/youtube/oauth/callback')
+  assert.equal(authorization.searchParams.get('code_challenge_method'), 'S256')
+  assert.deepEqual(
+    authorization.searchParams.get('scope').split(' '),
+    [
+      'https://www.googleapis.com/auth/youtube.readonly',
+      'https://www.googleapis.com/auth/yt-analytics.readonly',
+    ],
+  )
+
+  const callback = await fetch(
+    `${baseUrl}/api/digital-footprint/youtube/oauth/callback?state=${encodeURIComponent(authorization.searchParams.get('state'))}&code=mock-authorization-code`,
+    { redirect: 'manual' },
+  )
+  assert.equal(callback.status, 302)
+  assert.equal(callback.headers.get('location'), 'http://localhost:5173/?digitalFootprintOAuth=connected#digital-footprint')
+
+  const analyticsResponse = await fetch(`${baseUrl}/api/digital-footprint/youtube/analytics/refresh`, { method: 'POST' })
+  const analyticsPayload = await analyticsResponse.json()
+  assert.equal(analyticsResponse.status, 200, JSON.stringify(analyticsPayload))
+  assert.equal(analyticsPayload.youtubeSync.status, 'completed')
+  const analytics = analyticsPayload.youtubeAnalytics
+  assert.equal(analytics.views, 321)
+  assert.equal(analytics.watchMinutes, 654.5)
+  assert.equal(analytics.subscribersGained, 12)
+  assert.deepEqual(analytics.audience.map((item) => item.gender), ['FEMALE', 'MALE'])
+  const channelAnalytics = analyticsPayload.state.youtubeIntelligence
+  assert.equal(channelAnalytics.channel.channelId, 'UC1234567890123456789012')
+  assert.equal(channelAnalytics.channel.title, 'Caash Aminati')
+  assert.equal(channelAnalytics.channel.views, 12345)
+  assert.equal(channelAnalytics.channel.subscribers, 789)
+  assert.equal(channelAnalytics.videoCount, 2)
+  assert.deepEqual(channelAnalytics.videos.map((video) => video.videoId).sort(), ['mock-video-1', 'mock-video-2'])
+  assert.deepEqual(channelAnalytics.videos.map((video) => video.analytics.views), [321, 321])
+  assert.deepEqual(channelAnalytics.videos.map((video) => video.analytics.subscribersGained), [12, 12])
+  assert.equal(channelAnalytics.reports.demographics.rows.length, 2)
+  assert.equal(channelAnalytics.availability.thumbnailImpressions.startsWith('unavailable'), true)
+
+  const oauthState = await fetch(`${baseUrl}/api/digital-footprint`).then((response) => response.json())
+  assert.equal(oauthState.youtubeOAuth.connected, true)
+  assert.equal(oauthState.youtubeOAuth.channel.channelId, 'UC1234567890123456789012')
+  assert.equal(JSON.stringify(oauthState).includes('oauth-access'), false)
+  assert.equal(JSON.stringify(oauthState).includes('oauth-refresh'), false)
+  assert.equal(JSON.stringify(oauthState).includes('test-youtube-client-secret'), false)
+
+  const telegramCredential = await fetch(`${baseUrl}/api/secrets`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'TELEGRAM_BOT_TOKEN', value: 'youtube-test-telegram-token' }),
+  })
+  assert.equal(telegramCredential.status, 200)
+  const youtubeMonitoring = await fetch(`${baseUrl}/api/digital-footprint/youtube/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: true, alertsEnabled: true, dailyReportEnabled: true, weeklyReportEnabled: true }),
+  })
+  assert.equal(youtubeMonitoring.status, 200)
+  const analyticsRun = await fetch(`${baseUrl}/api/digital-footprint/run`, { method: 'POST' })
+  assert.equal(analyticsRun.status, 200)
+  const runState = await analyticsRun.json()
+  assert.equal(runState.status, 'completed')
+  assert.equal(runState.githubCount, 0)
+  assert.equal(runState.state.settings.enabled, false)
+  assert.equal(runState.state.youtubeIntelligence.monitoring.enabled, true)
+  assert.equal(runState.state.youtubeAnalytics.subscribersGained, 12)
+  assert.equal(runState.state.youtubeIntelligence.notifications.some((item) => item.type === 'subscriber-growth' && item.status === 'delivered'), true)
+  const secondAnalyticsRun = await fetch(`${baseUrl}/api/digital-footprint/run`, { method: 'POST' }).then((response) => response.json())
+  assert.equal(secondAnalyticsRun.state.youtubeIntelligence.notifications.filter((item) => item.type === 'subscriber-growth' && item.status === 'delivered').length, 1)
+  await fetch(`${baseUrl}/api/digital-footprint/youtube/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ enabled: false }),
+  })
+  await fetch(`${baseUrl}/api/secrets`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'TELEGRAM_BOT_TOKEN', value: '' }),
+  })
 })
 
 test('Personal Assistant API saves, edits, and deletes events', async () => {

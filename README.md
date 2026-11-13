@@ -254,9 +254,17 @@ deploy it as a Static Site). In the service's Environment settings, add:
 - `AGENTFLOW_DATA_DIR`: `/data`.
 - Any provider or Telegram credentials you want available, such as
   `GEMINI_API_KEY`, `GROQ_API_KEY`, `TAVILY_SEARCH_KEY`, or
-  `TELEGRAM_BOT_TOKEN`.
+  `TELEGRAM_BOT_TOKEN`. Digital Footprint uses optional `GITHUB_TOKEN` and
+  `YOUTUBE_API_KEY` values set only in this server environment. Configure
+  `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` for
+  YouTube Analytics OAuth. Legacy `GOOGLE_OAUTH_CLIENT_ID`,
+  `GOOGLE_OAUTH_CLIENT_SECRET`, and `YOUTUBE_OAUTH_REDIRECT_URI` are also
+  supported.
 - `AGENTFLOW_NEWS_CRON_SECRET`: optional long random secret for an external
   news scan trigger; keep it private and send as `Authorization: Bearer ...`.
+- `AGENTFLOW_FOOTPRINT_CRON_SECRET`: optional long random secret for the
+  external Digital Footprint scheduler; keep it private and send as
+  `Authorization: Bearer ...`.
 
 Render supplies `PORT`; leave `AGENTFLOW_PORT` unset so the app listens on
 Render's assigned port. Configure Render's health check path as `/api/health`.
@@ -302,6 +310,145 @@ separate request:
 - **Body:** none
 - **Schedule:** use the same interval selected in News interests, or leave this
   endpoint unused to avoid extra searches.
+
+### Digital Footprint Intelligence
+
+The dashboard's **Digital Footprint** page monitors a configured GitHub username
+through GitHub's official public Events API and a YouTube channel ID through
+YouTube Data API v3. It runs independently of job research, Personal Assistant,
+news monitoring, and Telegram command handling. Its settings, activity, and run
+history use dedicated `digital_footprint_*` tables in the existing SQLite
+database. The first successful scan establishes a baseline; later new activity
+is delivered as a Telegram notification when the bot and notification chat are
+configured. Configure `GITHUB_TOKEN` and `YOUTUBE_API_KEY` only in the server's
+environment (or the existing private server-side `.env` store); the dashboard
+only receives configured/not-configured status.
+
+The GitHub token is optional for public activity and helps avoid the public API's
+lower unauthenticated rate limit. YouTube Data API v3 requires a Google API key;
+the module uses its standard free quota and does not call paid APIs. Create and
+restrict the key to YouTube Data API v3.
+
+On Render Free, the in-process hourly poller cannot run while the service sleeps.
+An external scheduler such as cron-job.org can call the authenticated endpoint:
+
+- **URL:** `https://<your-render-service>.onrender.com/api/cron/digital-footprint`
+- **Method:** `POST`
+- **Authentication:** `Authorization: Bearer <AGENTFLOW_FOOTPRINT_CRON_SECRET>`
+- **Body:** none
+- **Schedule:** hourly
+
+Set `AGENTFLOW_FOOTPRINT_CRON_SECRET` in Render before configuring the scheduler.
+The module skips polling while disabled. Render's filesystem is still ephemeral
+on the free tier, so SQLite activity history and settings may be lost on restart.
+This optional external scheduler does not ensure continuous uptime or persistent
+storage.
+
+LinkedIn is not scraped or accessed by this module. For LinkedIn notifications,
+use only its official permitted channels or email notifications.
+
+#### YouTube Analytics OAuth setup
+
+The existing YouTube Data API key integration remains unchanged. OAuth is a
+separate connection used only to retrieve private analytics for the Google
+account's own channel. Enable **YouTube Analytics API** in the Google Cloud
+project and create an OAuth client with application type **Web application**.
+Set these server-side environment variables (never add them to React or a
+browser bundle):
+
+- `GOOGLE_CLIENT_ID`: Google OAuth Web client ID.
+- `GOOGLE_CLIENT_SECRET`: Google OAuth Web client secret.
+- `GOOGLE_REDIRECT_URI`: exact registered callback URL. The legacy names
+  `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, and
+  `YOUTUBE_OAUTH_REDIRECT_URI` remain supported.
+- `YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY`: optional 64-character hexadecimal
+  32-byte key. Generate with
+  `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"`.
+  If omitted, the backend generates one in its private server-side secrets file.
+  Set it explicitly in Render if the service's filesystem may be replaced; the
+  key must be retained with the SQLite database to decrypt saved OAuth tokens.
+
+Register this exact local callback URI in Google Cloud for local development:
+
+```text
+http://localhost:3001/api/digital-footprint/youtube/oauth/callback
+```
+
+The local callback returns to the Vite dashboard at
+`http://localhost:5173/#digital-footprint` by default.
+
+For the deployed Render service, register this exact callback URI:
+
+```text
+https://telegram-agent-c1rm.onrender.com/api/digital-footprint/youtube/oauth/callback
+```
+
+Set `GOOGLE_REDIRECT_URI` in Render to that same complete URL. The backend can
+also derive it from Render's `RENDER_EXTERNAL_HOSTNAME` when the variable is
+unset. The callback path is
+`/api/digital-footprint/youtube/oauth/callback`; production callbacks require
+HTTPS. Google requires an exact match between the registered and configured
+redirect URI.
+
+The authorization asks only for these read-only YouTube scopes:
+
+- `https://www.googleapis.com/auth/youtube.readonly`
+- `https://www.googleapis.com/auth/yt-analytics.readonly`
+
+Google's current Reports query reference requires `youtube.readonly` and also
+documents `yt-analytics.readonly` for channel analytics. No upload, edit,
+monetization, or content-owner scopes are requested. The authorization flow
+uses state and PKCE; OAuth credentials and tokens never go to the dashboard.
+The backend automatically refreshes access tokens server-side.
+
+In the dashboard, open **Digital Footprint**, choose **Connect Google**, and
+approve access. The backend calls `channels.list(mine=true)` and uses the
+authorized channel ID as its identity. It prefers a unique exact match for
+“Caash Aminati,” auto-selects when the account exposes one channel, and asks you
+to select by ID if several channels are available. It does not treat the
+display name as a unique identifier.
+
+The separate YouTube Analytics switch is independent of the existing Digital
+Footprint, job, companion, and scheduler settings. Enabling it performs a first
+sync and then syncs every six hours. It indexes the channel's uploads,
+retrieves available channel history from the channel creation date through
+YouTube's latest available reporting date, and records daily snapshots. The
+dashboard includes channel views, public subscriber/video counts, daily and
+monthly trends, subscriber gain/loss, watch time, average view duration and
+percentage, likes/comments/shares, per-video performance, 7-day momentum,
+retention, upload-month comparisons, geography, demographics, devices, and
+traffic sources. Per-video reports are paginated with a safety cap; the UI
+identifies when that API result limit is reached.
+
+YouTube can omit rows or metrics because of privacy thresholds, channel
+settings, account eligibility, or API/report limits. The dashboard represents
+those as unavailable rather than zero. Current subscriber counts from the Data
+API may be rounded or hidden. Shorts and long-form uploads are both included
+in the upload and analytics reports; the Data API does not expose a reliable
+per-video Shorts classification through these endpoints.
+
+Thumbnail impressions and impression click-through rate are intentionally
+unavailable: Google's documentation provides those in channel Reach reports
+through the YouTube Reporting API, not the Analytics API query reports used
+here. No Reporting API, paid analytics service, or paid AI provider is used.
+The weekly summary is computed locally from the returned metrics and is
+descriptive rather than AI-generated.
+
+Daily and weekly Telegram reports use Asia/Kolkata time and can be configured
+independently in the dashboard. Important alerts are deduplicated in the
+module's notification-history table. Delivery requires the existing Telegram
+bot and notification chat to be configured. In the Google OAuth consent
+screen's Testing mode, add the authorizing account as a test user. Google may
+require app verification before general users can authorize the sensitive
+YouTube read scopes.
+
+The new data is isolated in `digital_footprint_youtube_*` SQLite tables. On
+Render Free, SQLite and a generated encryption key are ephemeral; after a
+restart/deploy, data and OAuth tokens may need to be recreated unless the
+deployment supplies durable storage and a stable encryption-key environment
+variable. The existing external scheduler endpoint remains available for
+sleeping services; it does not make ephemeral storage persistent or guarantee
+continuous uptime.
 
 When a Telegram bot token is configured, polling starts automatically at
 service startup. Render Free web services spin down after 15 minutes without

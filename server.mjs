@@ -1,11 +1,12 @@
 import { createServer } from 'node:http'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { formatTelegramAnswer } from './response-format.mjs'
 import { DailyScheduler } from './daily-scheduler.mjs'
+import { DigitalFootprintIntelligence, YOUTUBE_OAUTH_CALLBACK_PATH } from './digital-footprint.mjs'
 import { cleanJobPageContent, deduplicateExtractedJobs, extractJson, validateExtractedJobs } from './job-extraction.mjs'
 import { JobDatabase, classifyEligibility, isTelegramUserAdmin, isTelegramUserAuthorized, nextDailyRun, normalizeCandidateProfile, normalizeLifeEvent, shouldNotifyJob } from './job-intelligence.mjs'
 import { PostgresCompanionStore } from './companion-store.mjs'
@@ -48,12 +49,16 @@ const jobPromptTokenBudget = readPositiveInteger(process.env.AGENTFLOW_JOB_PROMP
 const jobDescriptionMaxCharacters = readPositiveInteger(process.env.AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS, 8000, 1000, 30000)
 const newsCronSecret = process.env.AGENTFLOW_NEWS_CRON_SECRET || ''
 const companionCronSecret = process.env.AGENTFLOW_COMPANION_CRON_SECRET || ''
+const footprintCronSecret = process.env.AGENTFLOW_FOOTPRINT_CRON_SECRET || ''
 const secretNames = new Set([
   'GEMINI_API_KEY',
   'GROQ_API_KEY',
   'OPENROUTER_API_KEY',
   'TAVILY_SEARCH_KEY',
   'TELEGRAM_BOT_TOKEN',
+  'GITHUB_TOKEN',
+  'YOUTUBE_API_KEY',
+  'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY',
 ])
 
 function readPositiveInteger(value, fallback, minimum, maximum) {
@@ -69,6 +74,42 @@ const companionStore = process.env.DATABASE_URL
   ? await PostgresCompanionStore.open(process.env.DATABASE_URL)
   : database
 await companionStore.recoverInterruptedCompanionRuns()
+const youtubeOAuthEnvironment = {
+  ...await readEnvFile(projectEnvFile),
+  ...process.env,
+  ...await readEnvFile(secretFile),
+}
+if ((youtubeOAuthEnvironment.GOOGLE_CLIENT_ID || youtubeOAuthEnvironment.GOOGLE_OAUTH_CLIENT_ID)
+  && (youtubeOAuthEnvironment.GOOGLE_CLIENT_SECRET || youtubeOAuthEnvironment.GOOGLE_OAUTH_CLIENT_SECRET)
+  && !youtubeOAuthEnvironment.YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY) {
+  const secrets = await readSecrets()
+  secrets.YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY = randomBytes(32).toString('hex')
+  await writeSecrets(secrets)
+  youtubeOAuthEnvironment.YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY = secrets.YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY
+}
+const digitalFootprint = new DigitalFootprintIntelligence({
+  database,
+  getCredentials: readSecrets,
+  getOAuthConfig: () => ({
+    clientId: youtubeOAuthEnvironment.GOOGLE_CLIENT_ID || youtubeOAuthEnvironment.GOOGLE_OAUTH_CLIENT_ID || '',
+    clientSecret: youtubeOAuthEnvironment.GOOGLE_CLIENT_SECRET || youtubeOAuthEnvironment.GOOGLE_OAUTH_CLIENT_SECRET || '',
+    tokenEncryptionKey: youtubeOAuthEnvironment.YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY || '',
+    redirectUri: youtubeOAuthEnvironment.GOOGLE_REDIRECT_URI
+      || youtubeOAuthEnvironment.YOUTUBE_OAUTH_REDIRECT_URI
+      || (youtubeOAuthEnvironment.RENDER_EXTERNAL_HOSTNAME
+        ? `https://${youtubeOAuthEnvironment.RENDER_EXTERNAL_HOSTNAME}${YOUTUBE_OAUTH_CALLBACK_PATH}`
+        : `http://localhost:${port === 0 ? 3001 : port}${YOUTUBE_OAUTH_CALLBACK_PATH}`),
+    production,
+  }),
+  notify: async ({ message }) => {
+    const secrets = await readSecrets()
+    const chatId = await getCompanionNotificationChatId()
+    if (!secrets.TELEGRAM_BOT_TOKEN || !chatId) return false
+    await sendTelegramMessage(chatId, message)
+    return true
+  },
+  onError: (error) => console.warn(`Digital Footprint Intelligence: ${error.message}`),
+})
 if (production && !process.env.DATABASE_URL) {
   console.warn('Personal Companion uses local SQLite without DATABASE_URL; configure PostgreSQL for durable Render storage.')
 }
@@ -188,6 +229,18 @@ function isCompanionCronAuthorized(request) {
   return !production || isDashboardAuthorized(request)
 }
 
+function isFootprintCronAuthorized(request) {
+  const authorization = request.headers.authorization || ''
+  if (footprintCronSecret && authorization.startsWith('Bearer ')
+    && safeStringEqual(authorization.slice(7), footprintCronSecret)) return true
+  return !production || isDashboardAuthorized(request)
+}
+
+function digitalFootprintDashboardRedirect(status) {
+  const dashboardUrl = production ? '' : (process.env.AGENTFLOW_DASHBOARD_URL || 'http://localhost:5173').replace(/\/$/, '')
+  return `${dashboardUrl}/?digitalFootprintOAuth=${status}#digital-footprint`
+}
+
 const contentTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -269,6 +322,15 @@ async function getCompanionNotificationChatId() {
   if (typeof news.telegramChatId === 'string' && news.telegramChatId.trim()) return news.telegramChatId.trim()
   const settings = database.getSettings()
   return typeof settings.telegramChatId === 'string' ? settings.telegramChatId : ''
+}
+
+async function getDigitalFootprintState() {
+  const secrets = await readSecrets()
+  return digitalFootprint.getState({
+    githubTokenConfigured: Boolean(secrets.GITHUB_TOKEN),
+    youtubeApiKeyConfigured: Boolean(secrets.YOUTUBE_API_KEY),
+    telegramConfigured: Boolean(secrets.TELEGRAM_BOT_TOKEN && await getCompanionNotificationChatId()),
+  })
 }
 
 async function deliverCompanionNotification(chatId, notification) {
@@ -2097,11 +2159,15 @@ const server = createServer(async (request, response) => {
     }
 
     const isPublicHealthCheck = request.method === 'GET' && url.pathname === '/api/health'
+    const isYoutubeOAuthCallback = request.method === 'GET' && url.pathname === YOUTUBE_OAUTH_CALLBACK_PATH
     const isNewsCronRoute = request.method === 'POST' && url.pathname === '/api/cron/news'
     const isAuthorizedNewsCron = isNewsCronRoute && isNewsCronAuthorized(request)
     const isCompanionCronRoute = request.method === 'POST' && url.pathname === '/api/cron/companion'
     const isAuthorizedCompanionCron = isCompanionCronRoute && isCompanionCronAuthorized(request)
-    if (production && !isPublicHealthCheck && !isAuthorizedNewsCron && !isAuthorizedCompanionCron && !isDashboardAuthorized(request)) {
+    const isFootprintCronRoute = request.method === 'POST' && url.pathname === '/api/cron/digital-footprint'
+    const isAuthorizedFootprintCron = isFootprintCronRoute && isFootprintCronAuthorized(request)
+    if (production && !isPublicHealthCheck && !isYoutubeOAuthCallback && !isAuthorizedNewsCron && !isAuthorizedCompanionCron
+      && !isAuthorizedFootprintCron && !isDashboardAuthorized(request)) {
       response.writeHead(401, {
         'www-authenticate': 'Basic realm="AgentFlow Control Center", charset="UTF-8"',
         'content-type': 'application/json; charset=utf-8',
@@ -2218,6 +2284,81 @@ const server = createServer(async (request, response) => {
         history: database.listNewsRuns(10),
         usage: database.getNewsUsageStats(),
       })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/digital-footprint') {
+      return respond(response, 200, await getDigitalFootprintState())
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/digital-footprint/youtube/oauth/connect') {
+      return respond(response, 200, { authorizationUrl: digitalFootprint.beginYoutubeAuthorization() })
+    }
+
+    if (isYoutubeOAuthCallback) {
+      try {
+        await digitalFootprint.completeYoutubeAuthorization({
+          state: url.searchParams.get('state'),
+          code: url.searchParams.get('code'),
+          error: url.searchParams.get('error'),
+        })
+      } catch (error) {
+        console.warn(`YouTube OAuth callback failed: ${error.message}`)
+        response.writeHead(302, {
+          location: digitalFootprintDashboardRedirect('failed'),
+          'cache-control': 'no-store',
+          'referrer-policy': 'no-referrer',
+        })
+        return response.end()
+      }
+      response.writeHead(302, {
+        location: digitalFootprintDashboardRedirect('connected'),
+        'cache-control': 'no-store',
+        'referrer-policy': 'no-referrer',
+      })
+      return response.end()
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/digital-footprint/youtube/analytics/refresh') {
+      const youtubeSync = await digitalFootprint.refreshYoutubeAnalytics()
+      return respond(response, 200, {
+        youtubeSync,
+        youtubeAnalytics: digitalFootprint.getYoutubeAnalytics(),
+        state: await getDigitalFootprintState(),
+      })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/digital-footprint/youtube/channel/select') {
+      const input = await readJson(request)
+      const state = await digitalFootprint.selectYoutubeChannel(input.channelId)
+      return respond(response, 200, { state })
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/api/digital-footprint/youtube/settings') {
+      const input = await readJson(request)
+      const settings = digitalFootprint.saveYoutubeMonitoringSettings(input)
+      return respond(response, 200, { settings })
+    }
+
+    if (request.method === 'PUT' && url.pathname === '/api/digital-footprint/settings') {
+      const input = await readJson(request)
+      const settings = digitalFootprint.saveSettings(input)
+      return respond(response, 200, { settings })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/digital-footprint/run') {
+      const result = await digitalFootprint.run('manual')
+      return respond(response, result.status === 'failed' ? 502 : 200, {
+        ...result,
+        state: await getDigitalFootprintState(),
+      })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/cron/digital-footprint') {
+      if (!isFootprintCronAuthorized(request)) {
+        return respond(response, 401, { error: 'Digital Footprint scheduler authentication required.' })
+      }
+      const result = await digitalFootprint.run('external-cron')
+      return respond(response, result.status === 'failed' ? 502 : 200, result)
     }
 
     if (request.method === 'PUT' && url.pathname === '/api/news/settings') {
@@ -2411,6 +2552,7 @@ server.listen(port, host, () => {
     intervalMs: 30000,
   })
   newsScheduler.start().catch((error) => logEvent('500 ERROR', `Could not initialize proactive news scheduler: ${error.message}`, 'errors'))
+  digitalFootprint.start()
   processCompanionNotifications('startup-recovery')
     .catch((error) => logEvent('500 ERROR', `Could not recover Personal Companion notifications: ${error.message}`, 'errors'))
   companionInterval = setInterval(async () => {
@@ -2436,6 +2578,7 @@ const shutdown = () => {
   server.close(async () => {
     scheduler?.stop()
     newsScheduler?.stop()
+    digitalFootprint.stop()
     if (companionInterval) clearInterval(companionInterval)
     if (companionStore !== database) await companionStore.close()
     database.close()
