@@ -23,20 +23,45 @@ const loginPage = `<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
 const authenticatedStudentPage = `<html><head><title>Notice Dashboard For Student</title></head><body>
   <a href="/Student/Logout">Logout</a><a href="/Student/Profile">My Profile</a>
   <a href="/Student/Attendance">Attendance</a><a href="/Student/TimeTable">Timetable</a>
+  <a href="/Student/TestSubjectMarksReport">My Marks</a>
   <a href="/Student/ExamCalender/2026">Exam Calendar</a>
   <a href="/assets/Notice/notice-a.pdf">Important test notice</a>
 </body></html>`
 const authenticatedTimetablePage = `<a href="/Student/Logout">Logout</a><table>
-  <thead><tr><th>Day/ Lecture</th><th>1st 09.15-10.05</th><th>2nd 10.05-10.55</th></tr></thead>
+  <thead><tr><th>Day/ Lecture</th><th>1st<br>09.15-10.05</th><th>2nd<br>10.05-10.55</th>
+    <th>3rd<br>11.10-12.00</th><th>4th<br>12.00-12.50</th><th>5th<br>01.40-02.25</th>
+    <th>6th<br>02.25-03.10</th><th>7th<br>03.25-04.10</th><th>8th<br>04.10-04.55</th><th>9th</th></tr></thead>
   <tbody>
-    <tr><td>Monday</td><td><h5>Subject A<br>Faculty A<br>Room 101</h5></td><td></td></tr>
-    <tr><td>Tuesday</td><td></td><td><h5>Subject B<br>Faculty B<br>Room 102</h5></td></tr>
+    <tr><td>Monday</td><td><h5>Faculty A<br>Subject A<br>Room 101</h5></td>
+      <td><h5>Faculty B<br>Subject B<br>Room 102</h5></td><td><h5>Faculty C<br>Subject C<br>Room 103</h5></td>
+      <td><h5>Faculty D<br>Subject D<br>Room 104</h5></td><td><h5>Faculty E<br>Subject E<br>Room 105</h5></td>
+      <td><h5>Faculty F<br>Subject F<br>Room 106</h5></td><td><h5>Faculty G<br>Subject G<br>Room 107</h5></td>
+      <td><h5>Faculty H<br>Subject H<br>Room 108</h5></td><td></td></tr>
+    <tr><td>Tuesday</td><td></td><td><h5>Faculty I<br>Subject I<br>Room 109</h5></td>
+      <td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
   </tbody>
 </table>`
+const authenticatedAttendancePage = `<a href="/Student/Logout">Logout</a>
+  <strong>Total Lecture : 200</strong><strong>Total Absent + OAA: 30</strong>
+  <strong>O.A. Attendance : 5</strong><strong>Attendance % without PF : 87.5 %</strong>
+  <strong>Total PF : 2</strong><strong>Attendance % with PF : 88.5 %</strong>`
+const authenticatedMarksPage = `<a href="/Student/Logout">Logout</a>
+  <form action="/Student/TestSubjectMarksReport" method="post"><select name="cTest">
+    <option value="">Select Test Here</option><option value="ct-2-token">CT-2</option>
+    <option value="assignment-token">ASG-1</option></select><button>Show</button></form>
+  <table><thead><tr><th>Semester</th><th>Marks</th><th>Percentage (%)</th></tr></thead><tbody>
+    <tr><td>Semester-I</td><td>720</td><td>80</td></tr></tbody></table>`
 const authenticatedExamCalendarPage = `<a href="/Student/Logout">Logout</a><table>
   <thead><tr><th>Examination</th><th>CT I</th><th>CT II</th><th>PU</th></tr></thead>
   <tbody><tr><td>Semester Test</td><td>2026-11-20</td><td>2026-12-10</td><td>2027-01-05</td></tr></tbody>
 </table>`
+
+function authenticatedTestMarksPage(subject, score) {
+  return `<a href="/Student/Logout">Logout</a><table><tbody><tr>
+    <td>Student_Id</td><td>RollNo</td><td>Student_Name</td><td>${subject}</td>
+  </tr><tr><td>private-id</td><td>another-student</td><td>Other Student</td><td>999</td>
+  </tr><tr><td>private-id</td><td>student-12345</td><td>Test Student</td><td>${score}</td></tr></tbody></table>`
+}
 
 after(async () => {
   for (const database of databases) database.close()
@@ -67,17 +92,23 @@ test('natural-language ERP requests resolve only to validated local operations',
   assert.match(formatErpAnswer('attendance', {
     connected: false,
     dataRetrievalAvailable: false,
-  }), /No academic data has been retrieved or fabricated/)
+  }), /No data for this section has been retrieved or fabricated/)
   const cachedState = {
     connected: true,
-    availability: { timetable: true, notices: true, examCalendar: true },
+    availability: { attendance: true, timetable: true, marks: true, notices: true, examCalendar: true },
     data: {
+      attendance: { percentageWithoutPf: 85.5, percentageWithPf: 86, totalLectures: 200, totalAbsentPlusOaa: 30, oaAttendance: 5 },
       timetable: { days: [{ day: 'Monday', periods: [{ startTime: '09:15', endTime: '10:05', subject: 'Computer Science', faculty: 'Faculty A', room: 'Room 101' }] }] },
-      academic: { examCalendar: { exams: [{ Examination: 'CT I', Date: '2026-11-20' }] } },
+      academic: {
+        examCalendar: { exams: [{ Examination: 'CT I', Date: '2026-11-20' }] },
+        marks: { semesters: [{ semester: 'Semester-I', marks: '720', percentage: '80' }], assessments: [{ test: 'CT-1', subjects: [{ subject: 'BCS-072', score: '17' }] }] },
+      },
       notices: [{ title: 'Assignment deadline notice' }],
     },
   }
+  assert.match(formatErpAnswer('attendance', cachedState), /85\.5%/)
   assert.match(formatErpAnswer('timetable-week', cachedState), /Computer Science/)
+  assert.match(formatErpAnswer('marks', cachedState), /BCS-072 17/)
   assert.match(formatErpAnswer('notices', cachedState), /Assignment deadline notice/)
   assert.match(formatErpAnswer('academic-summary', cachedState), /CT I/)
   assert.equal(resolveErpOperation('Tell me a joke'), null)
@@ -90,6 +121,7 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   const diagnostics = []
   let studentPageReceivedCookie = false
   let timetablePageReceivedCookie = false
+  let transientDataFailure = false
   const fetchImpl = async (url, options = {}) => {
     const requestUrl = new URL(url)
     requests.push({ url: requestUrl, options })
@@ -102,6 +134,20 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
     if (requestUrl.pathname === '/Student/MyTimeTable') {
       timetablePageReceivedCookie = new Headers(options.headers).get('cookie') === 'ci_session=verified-session'
       return new Response(authenticatedTimetablePage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/MyAttendanceDetail') {
+      if (transientDataFailure) return new Response('Temporary failure', { status: 503 })
+      return new Response(authenticatedAttendancePage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/TestSubjectMarksReport') {
+      if (transientDataFailure && options.method !== 'POST') return new Response('Temporary failure', { status: 503 })
+      if (options.method === 'POST') {
+        const selectedTest = new URLSearchParams(options.body).get('cTest')
+        return new Response(selectedTest === 'ct-2-token'
+          ? authenticatedTestMarksPage('BCS-072', '17')
+          : authenticatedTestMarksPage('BCS-072', '9'), { status: 200 })
+      }
+      return new Response(authenticatedMarksPage, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/ExamCalender/2026') {
       return new Response(authenticatedExamCalendarPage, { status: 200 })
@@ -141,6 +187,7 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(JSON.stringify(diagnostics).includes('private-test-password'), false)
   assert.equal(JSON.stringify(diagnostics).includes('student-12345'), false)
   assert.equal(JSON.stringify(diagnostics).includes('verified-session'), false)
+  assert.equal(JSON.stringify(diagnostics).includes('ct-2-token'), false)
   const resultSync = await service.sync()
   assert.equal(resultSync.status, 'partial')
   assert.equal(timetablePageReceivedCookie, true)
@@ -150,11 +197,33 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(syncedState.availability.timetable, true)
   assert.equal(syncedState.availability.examCalendar, true)
   assert.equal(syncedState.availability.notices, true)
-  assert.equal(syncedState.availability.attendance, false)
+  assert.equal(syncedState.availability.attendance, true)
+  assert.equal(syncedState.availability.marks, true)
+  assert.equal(syncedState.data.attendance.percentageWithoutPf, 87.5)
+  assert.equal(syncedState.data.attendance.percentageWithPf, 88.5)
+  assert.equal(syncedState.data.attendance.subjectWise, null)
   assert.equal(syncedState.data.timetable.days[0].periods[0].subject, 'Subject A')
+  assert.equal(syncedState.data.timetable.days[0].periods[0].faculty, 'Faculty A')
+  assert.equal(syncedState.data.timetable.days[0].periods[1].startTime, '10:05')
+  assert.equal(syncedState.data.timetable.days[0].periods[2].startTime, '11:10')
+  assert.equal(syncedState.data.timetable.days[0].periods[3].startTime, '12:00')
+  assert.equal(syncedState.data.timetable.days[0].periods[4].startTime, '13:40')
+  assert.deepEqual(syncedState.data.academic.marks.semesters[0], {
+    semester: 'Semester-I',
+    marks: '720',
+    percentage: '80',
+  })
+  assert.deepEqual(syncedState.data.academic.marks.assessments.map((assessment) => assessment.test), ['CT-2', 'ASG-1'])
+  assert.deepEqual(syncedState.data.academic.marks.assessments[0].subjects, [{ subject: 'BCS-072', score: '17' }])
+  assert.equal(JSON.stringify(syncedState).includes('Other Student'), false)
+  assert.equal(JSON.stringify(syncedState).includes('student-12345'), false)
+  assert.equal(database.db.prepare('SELECT overall_percent FROM psit_erp_attendance_snapshots ORDER BY id DESC LIMIT 1').get().overall_percent, 88.5)
   assert.equal(syncedState.data.academic.examCalendar.exams[0]['CT I'], '2026-11-20')
   assert.equal(syncedState.data.notices.length, 1)
+  transientDataFailure = true
   await service.sync()
+  assert.equal(service.getState().data.attendance.percentageWithPf, 88.5)
+  assert.equal(service.getState().data.academic.marks.assessments[0].subjects[0].score, '17')
   assert.equal(database.db.prepare('SELECT COUNT(*) AS count FROM psit_erp_notices').get().count, 1)
   assert.equal(service.disconnect().disconnected, true)
   assert.equal(service.getState().connected, false)

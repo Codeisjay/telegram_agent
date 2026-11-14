@@ -74,12 +74,14 @@ The public PSIT login page includes a portal-wide password-expiry notice; that
 generic text is not treated as an account-specific password-change requirement.
 The connector reports success only for a verified student dashboard response
 and logs sanitized HTTP status, redirect, page type, and authentication-state
-diagnostics. Manual sync reads the authenticated weekly timetable, notice links,
-and exam calendar. Attendance percentages, internal marks, library account
-details, scheduled synchronization, and academic Telegram notifications remain
-inactive because their data sources or semantics are not yet verified. ERP
-questions return only cached verified sources and explicitly report unavailable
-data rather than guessing. No additional paid service or library is used.
+diagnostics. Manual sync reads the authenticated attendance summary, weekly
+timetable, semester and test/assignment marks, notice links, and exam calendar.
+Attendance percentages come directly from the portal summary; subject-wise
+attendance and current library dues remain unavailable because their values
+cannot be reliably mapped. Scheduled synchronization and academic Telegram
+notifications are not enabled. ERP questions return only cached verified
+sources and explicitly report unavailable data rather than guessing. No
+additional paid service or library is used.
 
 ## Autonomous personalized news
 

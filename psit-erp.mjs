@@ -167,6 +167,7 @@ const diagnosticPaths = new Map([
   ['/student', '/Student'],
   ['/student/myattendancedetail', '/Student/MyAttendanceDetail'],
   ['/student/mytimetable', '/Student/MyTimeTable'],
+  ['/student/testsubjectmarksreport', '/Student/TestSubjectMarksReport'],
   ['/student/library', '/Student/Library'],
 ])
 
@@ -260,19 +261,25 @@ function htmlLines(value) {
     .filter(Boolean)
 }
 
+function tableRows(table) {
+  return [...table.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi)].map(([, row]) => (
+    [...row.matchAll(/<(th|td)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi)]
+      .map(([, tag, contents]) => ({
+        tag: tag.toLowerCase(),
+        lines: htmlLines(contents),
+      }))
+  ))
+}
+
 function readTable(html, headerPattern) {
   for (const [table] of html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<table\b[^>]*>[\s\S]*?<\/table\s*>/gi)) {
-    const header = table.match(/<thead\b[^>]*>([\s\S]*?)<\/thead\s*>/i)?.[1] || ''
-    const headerRow = header.match(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/i)?.[1] || ''
-    const headers = [...headerRow.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th\s*>/gi)]
-      .map(([, contents]) => htmlLines(contents).join(' '))
-    if (!headerPattern(headers)) continue
-    const body = table.match(/<tbody\b[^>]*>([\s\S]*?)<\/tbody\s*>/i)?.[1] || ''
-    const rows = [...body.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi)].map(([, row]) => (
-      [...row.matchAll(/<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)\s*>/gi)]
-        .map(([, cell]) => htmlLines(cell))
-    ))
-    return { headers, rows }
+    const rows = tableRows(table)
+    const headerIndex = rows.findIndex((row) => headerPattern(row.map((cell) => cell.lines.join(' '))))
+    if (headerIndex < 0) continue
+    return {
+      headers: rows[headerIndex].map((cell) => cell.lines.join(' ')),
+      rows: rows.slice(headerIndex + 1).map((row) => row.map((cell) => cell.lines)),
+    }
   }
   return null
 }
@@ -280,18 +287,20 @@ function readTable(html, headerPattern) {
 function parseTimetable(html) {
   const table = readTable(html, (headers) => /day\s*\/?\s*lecture/i.test(headers[0] || ''))
   if (!table || table.rows.length === 0) return null
-  const slots = table.headers.slice(1).map((header, index) => {
-    const match = header.match(/(\d+)(?:st|nd|rd|th)?\s*(\d{1,2})[.:](\d{2})-(\d{1,2})[.:](\d{2})/i)
-    if (!match) return null
-    let startHour = Number(match[2])
-    let endHour = Number(match[4])
-    if (index >= 4 && startHour < 12) startHour += 12
-    if (index >= 4 && endHour < 12) endHour += 12
+  const slots = table.headers.slice(1).map((header) => {
+    const periodMatch = header.match(/^\s*(\d+)(?:st|nd|rd|th)?\b/i)
+    const timeMatch = header.match(/(\d{1,2})[.:](\d{2})\s*-\s*(\d{1,2})[.:](\d{2})/i)
+    if (!periodMatch || !timeMatch) return null
+    const period = Number(periodMatch[1])
+    let startHour = Number(timeMatch[1])
+    let endHour = Number(timeMatch[3])
+    if (period >= 5 && startHour < 12) startHour += 12
+    if (period >= 5 && endHour < 12) endHour += 12
     const pad = (value) => String(value).padStart(2, '0')
     return {
-      period: Number(match[1]),
-      startTime: `${pad(startHour)}:${match[3]}`,
-      endTime: `${pad(endHour)}:${match[5]}`,
+      period,
+      startTime: `${pad(startHour)}:${timeMatch[2]}`,
+      endTime: `${pad(endHour)}:${timeMatch[4]}`,
     }
   })
   const days = table.rows.map((row) => {
@@ -301,14 +310,81 @@ function parseTimetable(html) {
       if (!lines.length || !slots[index]) return []
       return [{
         ...slots[index],
-        subject: lines[0] || '',
-        faculty: lines[1] || '',
+        faculty: lines[0] || '',
+        subject: lines[1] || '',
         room: lines[2] || '',
       }]
     })
     return { day, periods }
   }).filter(Boolean)
   return days.length ? { headers: table.headers, days } : null
+}
+
+function captureAttendanceValue(text, label) {
+  const match = text.match(new RegExp(`${label}\\s*:\\s*([\\d,]+(?:\\.\\d+)?)`, 'i'))
+  if (!match) return null
+  const value = Number(match[1].replace(/,/g, ''))
+  return Number.isFinite(value) ? value : null
+}
+
+function parseAttendance(html) {
+  const text = pageText(html)
+  const attendance = {
+    totalLectures: captureAttendanceValue(text, 'Total\\s+Lecture'),
+    totalAbsentPlusOaa: captureAttendanceValue(text, 'Total\\s+Absent\\s*\\+\\s*OAA'),
+    oaAttendance: captureAttendanceValue(text, 'O\\.A\\.\\s*Attendance'),
+    percentageWithoutPf: captureAttendanceValue(text, 'Attendance\\s*%\\s*without\\s*PF'),
+    totalPf: captureAttendanceValue(text, 'Total\\s+PF'),
+    percentageWithPf: captureAttendanceValue(text, 'Attendance\\s*%\\s*with\\s*PF'),
+    subjectWise: null,
+  }
+  return attendance.percentageWithoutPf !== null || attendance.percentageWithPf !== null
+    ? attendance
+    : null
+}
+
+function parseTestOptions(html) {
+  const select = [...html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select\s*>/gi)]
+    .find(([, attributes]) => attribute(`<select ${attributes}>`, 'name') === 'cTest')
+  if (!select) return []
+  return [...select[2].matchAll(/<option\b([^>]*)>([\s\S]*?)<\/option\s*>/gi)]
+    .map(([, attributes, contents]) => ({
+      value: attribute(`<option ${attributes}>`, 'value'),
+      label: htmlLines(contents).join(' ').trim(),
+    }))
+    .filter((option) => option.value && option.label)
+}
+
+function parseMarks(html, rollNo) {
+  const semesterTable = readTable(html, (headers) => (
+    /semester/i.test(headers[0] || '')
+    && /marks/i.test(headers[1] || '')
+    && /percentage/i.test(headers[2] || '')
+  ))
+  const semesterHeaders = semesterTable?.headers || []
+  const semesters = (semesterTable?.rows || []).map((row) => ({
+    semester: row[0]?.join(' ').trim() || '',
+    marks: row[semesterHeaders.findIndex((header) => /^marks$/i.test(header.trim()))]?.join(' ').trim() || null,
+    percentage: row[semesterHeaders.findIndex((header) => /percentage/i.test(header))]?.join(' ').trim() || null,
+  })).filter((semester) => semester.semester)
+  const testOptions = parseTestOptions(html)
+  return { semesters, testOptions }
+}
+
+function parseTestMarks(html, test, rollNo) {
+  const table = readTable(html, (headers) => (
+    headers.some((header) => /^rollno$/i.test(header.trim()))
+    && headers.some((header) => /^student_name$/i.test(header.trim()))
+  ))
+  if (!table) return null
+  const rollIndex = table.headers.findIndex((header) => /^rollno$/i.test(header.trim()))
+  const student = table.rows.find((row) => row[rollIndex]?.join(' ').trim() === rollNo)
+  if (!student) return null
+  const subjects = table.headers.slice(3).flatMap((subject, index) => {
+    const score = student[index + 3]?.join(' ').trim()
+    return subject.trim() && score ? [{ subject: subject.trim(), score }] : []
+  })
+  return subjects.length ? { test, subjects } : null
 }
 
 function parseExamCalendar(html) {
@@ -432,8 +508,8 @@ function authenticationMessage(status, syncing = false) {
   }
   if (status === 'connected') {
     return syncing
-      ? 'PSIT login is valid, but authenticated student data pages have not yet been mapped. No academic data was retrieved.'
-      : 'PSIT login was verified using the authenticated student dashboard, and credentials were encrypted on this server. Academic data retrieval remains pending page/API mapping.'
+      ? 'PSIT login is valid, but no academic data was retrieved in this operation.'
+      : 'PSIT login was verified using the authenticated student dashboard, and credentials were encrypted on this server. Run a manual sync to retrieve mapped academic data.'
   }
   return messages[status] || messages.unknown_response
 }
@@ -526,9 +602,9 @@ function reportStudentPageDiagnostic(onDiagnostic, trace, pageType, status) {
   })
 }
 
-async function fetchStudentPage(path, cookies, fetchImpl, onDiagnostic) {
+async function fetchStudentPage(path, cookies, fetchImpl, onDiagnostic, requestOptions = {}) {
   const trace = []
-  const result = await requestOfficial(new URL(path, PSIT_ERP_URL), {}, cookies, fetchImpl, trace)
+  const result = await requestOfficial(new URL(path, PSIT_ERP_URL), requestOptions, cookies, fetchImpl, trace)
   if (result.networkError) {
     reportStudentPageDiagnostic(onDiagnostic, trace, 'unreachable', 'network_error')
     return { status: 'network_error' }
@@ -587,7 +663,9 @@ export class PsitErpService {
     const snapshots = {
       attendance: this.database.db.prepare('SELECT captured_at AS capturedAt, data_json AS dataJson FROM psit_erp_attendance_snapshots ORDER BY id DESC LIMIT 1').get(),
       timetable: this.database.db.prepare('SELECT captured_at AS capturedAt, data_json AS dataJson FROM psit_erp_timetable_snapshots ORDER BY id DESC LIMIT 1').get(),
-      academic: this.database.db.prepare('SELECT updated_at AS updatedAt, data_json AS dataJson FROM psit_erp_academic_records ORDER BY id DESC LIMIT 1').get(),
+      academic: this.database.db.prepare(`SELECT updated_at AS updatedAt, data_json AS dataJson
+        FROM psit_erp_academic_records WHERE record_type IN ('academic', 'exam-calendar', 'marks')
+        ORDER BY updated_at`).all(),
       notices: this.database.db.prepare('SELECT published_at AS publishedAt, data_json AS dataJson FROM psit_erp_notices ORDER BY id DESC LIMIT 10').all(),
     }
     const history = this.database.db.prepare(`SELECT id, status, started_at AS startedAt,
@@ -595,7 +673,9 @@ export class PsitErpService {
     const credentialsStored = Boolean(this.getCredentialRecord()?.credentialCiphertext)
     const connected = credentialsStored && connection?.status === 'connected'
     const timetable = snapshots.timetable ? JSON.parse(snapshots.timetable.dataJson) : null
-    const academic = snapshots.academic ? JSON.parse(snapshots.academic.dataJson) : null
+    const academic = snapshots.academic.reduce((result, snapshot) => (
+      Object.assign(result, JSON.parse(snapshot.dataJson))
+    ), {})
     const noticesData = snapshots.notices.map((notice) => JSON.parse(notice.dataJson))
     const availability = {
       attendance: Boolean(snapshots.attendance),
@@ -613,19 +693,20 @@ export class PsitErpService {
       connectedAt: connection?.connectedAt || null,
       lastSyncAt: connection?.lastSyncAt || null,
       encryptionConfigured: this.hasEncryptionKey(),
-      dataRetrievalAvailable: availability.timetable || availability.examCalendar || availability.notices,
+      dataRetrievalAvailable: availability.attendance || availability.timetable
+        || availability.marks || availability.examCalendar || availability.notices,
       availability,
       data: {
         attendance: snapshots.attendance ? JSON.parse(snapshots.attendance.dataJson) : null,
         attendanceUpdatedAt: snapshots.attendance?.capturedAt || null,
         timetable,
         timetableUpdatedAt: snapshots.timetable?.capturedAt || null,
-        academic,
-        academicUpdatedAt: snapshots.academic?.updatedAt || null,
+        academic: Object.keys(academic).length ? academic : null,
+        academicUpdatedAt: snapshots.academic.at(-1)?.updatedAt || null,
         notices: noticesData,
       },
       history,
-      limitation: 'Timetable, academic notices and the exam calendar can be synced from the authenticated student portal. Attendance percentages, internal marks and library account details remain unavailable because their values cannot yet be reliably mapped.',
+      limitation: 'Overall attendance, semester and test marks, timetable, academic notices, and the exam calendar are retrieved from authenticated PSIT pages. Subject-wise attendance and current library dues are not available from the mapped pages.',
     }
   }
 
@@ -717,6 +798,15 @@ export class PsitErpService {
     }
     const capturedAt = new Date().toISOString()
     const notices = parseNotices(result.studentHtml, capturedAt)
+    const attendancePage = await fetchStudentPage('/Student/MyAttendanceDetail', result.cookies, this.fetchImpl, this.onDiagnostic)
+    if (attendancePage.status === 'session_expired') {
+      const message = authenticationMessage('session_expired', true)
+      this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.recordSync('session_expired', message)
+      return { status: 'session_expired', message }
+    }
+    const attendance = attendancePage.status === 'connected' ? parseAttendance(attendancePage.html) : null
+
     const timetablePage = await fetchStudentPage('/Student/MyTimeTable', result.cookies, this.fetchImpl, this.onDiagnostic)
     if (timetablePage.status === 'session_expired') {
       const message = authenticationMessage('session_expired', true)
@@ -725,6 +815,52 @@ export class PsitErpService {
       return { status: 'session_expired', message }
     }
     const timetable = timetablePage.status === 'connected' ? parseTimetable(timetablePage.html) : null
+
+    const marksPage = await fetchStudentPage('/Student/TestSubjectMarksReport', result.cookies, this.fetchImpl, this.onDiagnostic)
+    if (marksPage.status === 'session_expired') {
+      const message = authenticationMessage('session_expired', true)
+      this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.recordSync('session_expired', message)
+      return { status: 'session_expired', message }
+    }
+    let marks = null
+    let failedMarkReports = 0
+    let missingMarkRows = 0
+    let skippedMarkReports = 0
+    if (marksPage.status === 'connected') {
+      const parsedMarks = parseMarks(marksPage.html, credentials.userId)
+      const assessments = []
+      skippedMarkReports = Math.max(0, parsedMarks.testOptions.length - 20)
+      for (const option of parsedMarks.testOptions.slice(0, 20)) {
+        const reportPage = await fetchStudentPage(
+          '/Student/TestSubjectMarksReport',
+          result.cookies,
+          this.fetchImpl,
+          this.onDiagnostic,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ cTest: option.value }).toString(),
+          },
+        )
+        if (reportPage.status === 'session_expired') {
+          const message = authenticationMessage('session_expired', true)
+          this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+          this.recordSync('session_expired', message)
+          return { status: 'session_expired', message }
+        }
+        if (reportPage.status !== 'connected') {
+          failedMarkReports += 1
+          continue
+        }
+        const assessment = parseTestMarks(reportPage.html, option.label, credentials.userId)
+        if (assessment) assessments.push(assessment)
+        else missingMarkRows += 1
+      }
+      if (parsedMarks.semesters.length || assessments.length) {
+        marks = { semesters: parsedMarks.semesters, assessments }
+      }
+    }
     let examCalendar = null
     const examHref = findAnchorByText(result.studentHtml, /^Exam Calendar$/i)
     if (examHref) {
@@ -748,15 +884,24 @@ export class PsitErpService {
     }
 
     const database = this.database.db
+    if (attendance) {
+      const overallPercent = attendance.percentageWithPf ?? attendance.percentageWithoutPf
+      database.prepare(`INSERT INTO psit_erp_attendance_snapshots(captured_at, overall_percent, data_json)
+        VALUES (?, ?, ?)`).run(capturedAt, overallPercent, JSON.stringify(attendance))
+    }
     if (timetable) {
       database.prepare(`INSERT INTO psit_erp_timetable_snapshots(captured_at, week_of, data_json)
         VALUES (?, ?, ?)`).run(capturedAt, '', JSON.stringify(timetable))
     }
-    if (examCalendar) {
+    const academicRecords = [
+      examCalendar ? ['exam-calendar', { examCalendar }] : null,
+      marks ? ['marks', { marks }] : null,
+    ].filter(Boolean)
+    for (const [recordType, academic] of academicRecords) {
       database.prepare(`INSERT INTO psit_erp_academic_records(record_type, source_id, data_json, updated_at)
-        VALUES ('exam-calendar', 'student', ?, ?)
+        VALUES (?, 'student', ?, ?)
         ON CONFLICT(record_type, source_id) DO UPDATE SET data_json = excluded.data_json,
-          updated_at = excluded.updated_at`).run(JSON.stringify({ examCalendar }), capturedAt)
+          updated_at = excluded.updated_at`).run(recordType, JSON.stringify(academic), capturedAt)
     }
     const insertNotice = database.prepare(`INSERT OR IGNORE INTO psit_erp_notices(
       fingerprint, title, published_at, data_json
@@ -766,17 +911,32 @@ export class PsitErpService {
     }
 
     const sources = [
+      attendance ? 'attendance summary' : null,
       timetable ? 'weekly timetable' : null,
+      marks?.semesters.length ? 'semester marks' : null,
+      marks?.assessments.length ? `${marks.assessments.length} test/assignment mark reports` : null,
       examCalendar ? 'exam calendar' : null,
       notices.length ? `${notices.length} notices` : null,
     ].filter(Boolean)
     if (!sources.length) {
-      const message = 'Login was verified, but none of the mapped timetable, exam-calendar or notice pages returned recognizable data.'
+      const message = 'Login was verified, but none of the mapped attendance, timetable, marks, exam-calendar, or notice pages returned recognizable data.'
       this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
       this.recordSync('data-source-pending', message)
       return { status: 'data-source-pending', message }
     }
-    const message = `Synced ${sources.join(', ')}. Attendance percentages, internal marks and library account details remain unmapped; no values were inferred.`
+    const unavailablePages = [
+      attendance ? null : `attendance summary (${attendancePage.status === 'connected' ? 'content not recognized' : attendancePage.status})`,
+      timetable ? null : `timetable (${timetablePage.status === 'connected' ? 'content not recognized' : timetablePage.status})`,
+      marks ? null : `marks (${marksPage.status === 'connected' ? 'content not recognized' : marksPage.status})`,
+    ].filter(Boolean)
+    const details = [
+      failedMarkReports ? `${failedMarkReports} selected mark reports could not be fetched` : null,
+      missingMarkRows ? `${missingMarkRows} selected mark reports had no verified row for this account` : null,
+      skippedMarkReports ? `${skippedMarkReports} additional mark reports were skipped at the safety limit` : null,
+      unavailablePages.length ? `Could not map ${unavailablePages.join(', ')}` : null,
+      'subject-wise attendance and current library dues remain unavailable',
+    ].filter(Boolean)
+    const message = `Synced ${sources.join(', ')}. ${details.join('; ')}.`
     this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
     database.prepare('UPDATE psit_erp_connection SET last_sync_at = ? WHERE id = 1').run(capturedAt)
     this.recordSync('partial', message)
@@ -810,13 +970,43 @@ export function formatErpAnswer(operation, state) {
   if (!label) return null
   if (operation === 'status') {
     return state.connected
-      ? `PSIT ERP is connected for ${state.userIdMasked}. ${state.lastSyncAt ? `Last data sync: ${state.lastSyncAt}.` : 'No data sync has completed.'} Verified sources: ${['timetable', 'notices', 'examCalendar'].filter((source) => state.availability?.[source]).join(', ') || 'none synced'}.`
+      ? `PSIT ERP is connected for ${state.userIdMasked}. ${state.lastSyncAt ? `Last data sync: ${state.lastSyncAt}.` : 'No data sync has completed.'} Verified sources: ${['attendance', 'timetable', 'marks', 'notices', 'examCalendar'].filter((source) => state.availability?.[source]).join(', ') || 'none synced'}.`
       : 'PSIT ERP is not connected. Connect it from the dashboard’s PSIT ERP section; never send ERP credentials in Telegram.'
   }
-  const unavailable = () => `I can’t provide ${label} yet: that information has not been verified from the authenticated ERP pages. No academic data has been retrieved or fabricated.`
+  const unavailable = () => `I can’t provide ${label} yet: that information has not been verified from the authenticated ERP pages. No data for this section has been retrieved or fabricated.`
   const timeTable = state.data?.timetable
   const examCalendar = state.data?.academic?.examCalendar
+  const marks = state.data?.academic?.marks
+  const attendance = state.data?.attendance
   const notices = state.data?.notices || []
+  const formatAttendance = () => {
+    if (!attendance) return ''
+    const percent = (value) => typeof value === 'number' ? `${value}%` : null
+    const count = (value) => typeof value === 'number' ? String(value) : null
+    const values = [
+      percent(attendance.percentageWithoutPf) && `without PF: ${percent(attendance.percentageWithoutPf)}`,
+      percent(attendance.percentageWithPf) && `with PF: ${percent(attendance.percentageWithPf)}`,
+      count(attendance.totalLectures) && `total lectures: ${count(attendance.totalLectures)}`,
+      count(attendance.totalAbsentPlusOaa) && `absent + OAA: ${count(attendance.totalAbsentPlusOaa)}`,
+      count(attendance.oaAttendance) && `O.A. attendance: ${count(attendance.oaAttendance)}`,
+    ].filter(Boolean)
+    return values.length
+      ? `Verified PSIT attendance summary: ${values.join('; ')}. Subject-wise attendance is not available.`
+      : ''
+  }
+  const formatMarks = () => {
+    if (!marks) return ''
+    const semesters = (marks.semesters || []).map((semester) => {
+      const hasMarks = semester.marks !== null && typeof semester.marks !== 'undefined'
+      const hasPercentage = semester.percentage !== null && typeof semester.percentage !== 'undefined'
+      return `• ${semester.semester}: ${hasMarks ? `${semester.marks} marks` : 'marks not listed'}${hasPercentage ? ` (${semester.percentage}%)` : ''}`
+    })
+    const assessments = (marks.assessments || []).map((assessment) => (
+      `• ${assessment.test}: ${assessment.subjects.map((subject) => `${subject.subject} ${subject.score}`).join(', ')}`
+    ))
+    const lines = [...semesters, ...assessments]
+    return lines.length ? `Verified PSIT marks:\n${lines.join('\n')}` : ''
+  }
   const weekday = (offset = 0) => {
     const parts = new Intl.DateTimeFormat('en-US', {
       timeZone: 'Asia/Kolkata',
@@ -845,8 +1035,8 @@ export function formatErpAnswer(operation, state) {
     ? `Recent verified notices:\n${notices.slice(0, 8).map((notice) => `• ${notice.title}`).join('\n')}`
     : unavailable()
 
-  if (operation === 'attendance') return unavailable()
-  if (operation === 'marks') return unavailable()
+  if (operation === 'attendance') return formatAttendance() || unavailable()
+  if (operation === 'marks') return formatMarks() || unavailable()
   if (operation === 'student-services') return unavailable()
   if (operation === 'notices') return formatNotices()
   if (operation === 'timetable-today') return timeTable ? formatDay(weekday()) : unavailable()
@@ -876,13 +1066,16 @@ export function formatErpAnswer(operation, state) {
   }
   if (operation === 'academic-summary') {
     const sections = []
+    if (formatAttendance()) sections.push(formatAttendance())
     if (timeTable) sections.push(formatDay(weekday()))
+    if (formatMarks()) sections.push(formatMarks())
     if (examCalendar?.exams?.length) {
       sections.push(`Verified exam calendar:\n${examCalendar.exams.map((exam) => Object.entries(exam).map(([name, value]) => `${name}: ${value}`).join(' · ')).join('\n')}`)
     }
     if (notices.length) sections.push(formatNotices())
     if (!sections.length) return unavailable()
-    sections.push('Attendance percentages and internal marks are not available from the mapped pages.')
+    if (!attendance) sections.push('Attendance is not available from the mapped pages.')
+    if (!marks) sections.push('Marks are not available from the mapped pages.')
     return sections.join('\n\n')
   }
   return null

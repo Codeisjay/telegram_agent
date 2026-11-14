@@ -16,6 +16,10 @@ function formatStatus(value) {
   return String(value || '').replace(/[-_]/g, ' ')
 }
 
+function formatAcademicValue(value) {
+  return value === null || value === undefined || value === '' ? 'Not available' : String(value)
+}
+
 export default function PsitErpPage({ onToast }) {
   const [state, setState] = useState(null)
   const [userId, setUserId] = useState('')
@@ -139,13 +143,38 @@ export default function PsitErpPage({ onToast }) {
     <section className="panel psit-panel psit-limitation">
       <div className="psit-panel-heading"><div className="psit-title-icon"><AlertTriangle size={17} /><div><h3>{hasVerifiedData ? 'Verified ERP data' : 'Data retrieval not active yet'}</h3><p>{hasVerifiedData ? 'Only data parsed from authenticated PSIT pages is shown.' : 'Run a manual sync to retrieve data from mapped authenticated pages.'}</p></div></div></div>
       <p>{state.limitation}</p>
-      <p>Attendance percentages, subject-wise attendance, internal marks, and library account details remain unavailable until their values can be reliably mapped. No values are inferred for those sections.</p>
+      <p>Subject-wise attendance and current library dues remain unavailable because their values have not been reliably mapped. No values are inferred for those sections.</p>
       <div className="psit-data-preview">
         <div><GraduationCap size={15} /><span>Attendance</span><strong>{state.availability.attendance ? 'Cached' : 'Not mapped'}</strong></div>
         <div><CalendarDays size={15} /><span>Timetable</span><strong>{state.availability.timetable ? 'Cached' : 'Not synced'}</strong></div>
         <div><BookOpen size={15} /><span>Marks &amp; notices</span><strong>{state.availability.marks ? 'Marks cached' : state.availability.notices ? 'Notices cached' : 'Not mapped'}</strong></div>
       </div>
     </section>
+
+    {state.data.attendance && <section className="panel psit-panel">
+      <div className="psit-panel-heading"><div className="psit-title-icon"><GraduationCap size={17} /><div><h3>Attendance summary</h3><p>Official totals from the authenticated PSIT attendance page.</p></div></div></div>
+      <div className="psit-status-grid">
+        <div className="psit-status-card"><span>Attendance without PF</span><strong>{formatAcademicValue(state.data.attendance.percentageWithoutPf)}{state.data.attendance.percentageWithoutPf === null ? '' : '%'}</strong></div>
+        <div className="psit-status-card"><span>Attendance with PF</span><strong>{formatAcademicValue(state.data.attendance.percentageWithPf)}{state.data.attendance.percentageWithPf === null ? '' : '%'}</strong></div>
+        <div className="psit-status-card"><span>Total lectures</span><strong>{formatAcademicValue(state.data.attendance.totalLectures)}</strong></div>
+        <div className="psit-status-card"><span>Absent + OAA</span><strong>{formatAcademicValue(state.data.attendance.totalAbsentPlusOaa)}</strong></div>
+        <div className="psit-status-card"><span>O.A. attendance</span><strong>{formatAcademicValue(state.data.attendance.oaAttendance)}</strong></div>
+        <div className="psit-status-card"><span>Total PF</span><strong>{formatAcademicValue(state.data.attendance.totalPf)}</strong></div>
+      </div>
+      <p>Subject-wise attendance is not shown because the portal page does not identify subjects for each attendance total.</p>
+    </section>}
+
+    {state.data.academic?.marks && <section className="panel psit-panel">
+      <div className="psit-panel-heading"><div className="psit-title-icon"><BookOpen size={17} /><div><h3>Academic marks</h3><p>Semester summaries and test/assignment reports returned by PSIT.</p></div></div></div>
+      {state.data.academic.marks.semesters.map((semester) => <div className="psit-history-row" key={semester.semester}>
+        <strong>{semester.semester}</strong>
+        <span>Marks: {formatAcademicValue(semester.marks)} · Percentage: {formatAcademicValue(semester.percentage)}{semester.percentage === null ? '' : '%'}</span>
+      </div>)}
+      {state.data.academic.marks.assessments.map((assessment) => <div className="psit-history-row" key={assessment.test}>
+        <strong>{assessment.test}</strong>
+        <span>{assessment.subjects.map((subject) => `${subject.subject}: ${subject.score}`).join(' · ')}</span>
+      </div>)}
+    </section>}
 
     {state.data.timetable?.days?.length > 0 && <section className="panel psit-panel">
       <div className="psit-panel-heading"><div className="psit-title-icon"><CalendarDays size={17} /><div><h3>Weekly timetable</h3><p>Retrieved from the authenticated student timetable page.</p></div></div></div>
