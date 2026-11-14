@@ -2362,7 +2362,7 @@ const server = createServer(async (request, response) => {
       const result = await psitErp.connect(input.userId, input.password)
       return respond(response, 200, {
         ...result,
-        ...(result.status === 'password-change-required' ? { passwordChangeUrl: PSIT_ERP_PASSWORD_RESET_URL } : {}),
+        ...(result.status === 'password_change_required' ? { passwordChangeUrl: PSIT_ERP_PASSWORD_RESET_URL } : {}),
       })
     }
 

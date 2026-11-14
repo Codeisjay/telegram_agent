@@ -17,6 +17,13 @@ import { JobDatabase } from '../job-intelligence.mjs'
 const key = '2a'.repeat(32)
 const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'agentflow-psit-erp-'))
 const databases = []
+const loginPage = `<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
+  <input name="username"><input name="password" type="password">
+</form>`
+const authenticatedStudentPage = `<html><head><title>Notice Dashboard For Student</title></head><body>
+  <a href="/Student/Logout">Logout</a><a href="/Student/Profile">My Profile</a>
+  <a href="/Student/Attendance">Attendance</a><a href="/Student/TimeTable">Timetable</a>
+</body></html>`
 
 after(async () => {
   for (const database of databases) database.close()
@@ -55,29 +62,31 @@ test('ERP connection stores encrypted credentials, reports unmapped pages, and d
   const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-connection.sqlite'))
   databases.push(database)
   const requests = []
+  const diagnostics = []
+  let studentPageReceivedCookie = false
   const fetchImpl = async (url, options = {}) => {
     const requestUrl = new URL(url)
     requests.push({ url: requestUrl, options })
     if (options.method === 'POST' && requestUrl.pathname === '/Erp/Auth') {
       return new Response('', {
         status: 302,
-        headers: { location: '/Erp/Student/Home', 'set-cookie': 'ERPSESSION=private-session; Path=/; HttpOnly' },
+        headers: { location: '/Student/', 'set-cookie': 'ci_session=verified-session; Path=/; HttpOnly' },
       })
     }
-    if (requestUrl.pathname === '/Erp/Student/Home') {
-      return new Response('<h1>Student portal</h1>', { status: 200 })
+    if (requestUrl.pathname === '/Student/') {
+      studentPageReceivedCookie = new Headers(options.headers).get('cookie') === 'ci_session=verified-session'
+      return new Response(authenticatedStudentPage, { status: 200 })
     }
-    return new Response(`<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
-      <input name="username"><input name="password" type="password">
-    </form>`, {
+    return new Response(`${loginPage}<p>All user passwords have expired. Please change your password to continue.</p>`, {
       status: 200,
-      headers: { 'set-cookie': 'ERPSESSION=login-session; Path=/; HttpOnly' },
+      headers: { 'set-cookie': 'ci_session=login-session; Path=/; HttpOnly' },
     })
   }
-  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl })
+  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl, onDiagnostic: (entry) => diagnostics.push(entry) })
   const result = await service.connect('student-12345', 'private-test-password')
   assert.equal(result.status, 'connected')
   assert.equal(result.message.includes('private-test-password'), false)
+  assert.equal(studentPageReceivedCookie, true)
   const state = service.getState()
   assert.equal(state.connected, true)
   assert.equal(state.credentialsStored, true)
@@ -92,6 +101,13 @@ test('ERP connection stores encrypted credentials, reports unmapped pages, and d
   assert.equal(loginRequest.url.origin, 'https://erp.psit.ac.in')
   assert.match(new Headers(loginRequest.options.headers).get('content-type'), /application\/x-www-form-urlencoded/)
   assert.match(loginRequest.options.body, /private-test-password/)
+  assert.deepEqual(diagnostics[0].responses.map(({ httpStatus }) => httpStatus), [200, 302, 200])
+  assert.equal(diagnostics[0].responses[1].redirectUrl, 'https://erp.psit.ac.in/Student/')
+  assert.equal(diagnostics[0].pageType, 'authenticated_student')
+  assert.equal(diagnostics[0].authenticationState, 'connected')
+  assert.equal(JSON.stringify(diagnostics).includes('private-test-password'), false)
+  assert.equal(JSON.stringify(diagnostics).includes('student-12345'), false)
+  assert.equal(JSON.stringify(diagnostics).includes('verified-session'), false)
   const resultSync = await service.sync()
   assert.equal(resultSync.status, 'data-source-pending')
   assert.equal(service.getState().history[0].status, 'data-source-pending')
@@ -110,35 +126,80 @@ test('expired ERP passwords are not stored and get an explicit password-change s
       return new Response('', { status: 302, headers: { location: '/Erp/ForgetPassword' } })
     }
     if (requestUrl.pathname === '/Erp/ForgetPassword') {
-      return new Response('<h1>Password change required</h1>', { status: 200 })
+      return new Response(`<h1>Change password</h1><p>Your account requires a password change.</p>
+        <form><input type="password" name="oldPassword"><input type="password" name="newPassword"></form>`, { status: 200 })
     }
-    return new Response(`<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
-      <input name="username"><input name="password" type="password">
-    </form>`, { status: 200 })
+    return new Response(loginPage, { status: 200 })
   }
   const service = new PsitErpService({ database, encryptionKey: key, fetchImpl })
   const result = await service.connect('student-67890', 'expired-password')
-  assert.equal(result.status, 'password-change-required')
+  assert.equal(result.status, 'password_change_required')
   assert.equal(service.getState().connected, false)
   assert.equal(service.getCredentialRecord().credentialCiphertext, null)
   assert.equal(service.getState().history[0].message.includes('expired-password'), false)
 })
 
-test('the portal-wide expired-password notice stops login before credentials are submitted', async () => {
+test('the portal-wide expiry notice is not account evidence and ambiguous login responses are not saved', async () => {
   const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-portal-expiry.sqlite'))
   databases.push(database)
   let submitted = false
-  const fetchImpl = async () => new Response(`<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
-    <input name="username"><input name="password" type="password">
-  </form><p>All user passwords have expired. Please change your password to continue.</p>`, { status: 200 })
-  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl: async (url, options) => {
-    if (options?.method === 'POST') submitted = true
-    return fetchImpl(url, options)
-  } })
+  const fetchImpl = async (_url, options = {}) => {
+    if (options.method === 'POST') submitted = true
+    return new Response(`${loginPage}<p>All user passwords have expired. Please change your password to continue.</p>`, { status: 200 })
+  }
+  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl })
   const result = await service.connect('student-11111', 'not-submitted-password')
-  assert.equal(result.status, 'password-change-required')
-  assert.equal(submitted, false)
+  assert.equal(result.status, 'unknown_response')
+  assert.equal(submitted, true)
   assert.equal(service.getState().connected, false)
+  assert.equal(service.getCredentialRecord().credentialCiphertext, null)
+})
+
+test('invalid credentials are reported only when the portal explicitly rejects them', async () => {
+  const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-invalid-credentials.sqlite'))
+  databases.push(database)
+  const fetchImpl = async (_url, options = {}) => new Response(options.method === 'POST'
+    ? `${loginPage}<p>Invalid username or password.</p>`
+    : loginPage, { status: 200 })
+  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl, onDiagnostic: () => {} })
+  const result = await service.connect('student-33333', 'invalid-password')
+  assert.equal(result.status, 'invalid_credentials')
+  assert.equal(service.getCredentialRecord().credentialCiphertext, null)
+})
+
+test('session expiration and network failures have distinct states', async () => {
+  const expiredDatabase = await JobDatabase.open(path.join(temporaryDirectory, 'erp-session-expired.sqlite'))
+  databases.push(expiredDatabase)
+  const expiredFetch = async (_url, options = {}) => new Response(options.method === 'POST'
+    ? `<p>Your session has expired. Please log in again.</p>${loginPage}`
+    : loginPage, { status: 200 })
+  const expiredService = new PsitErpService({ database: expiredDatabase, encryptionKey: key, fetchImpl: expiredFetch, onDiagnostic: () => {} })
+  assert.equal((await expiredService.connect('student-44444', 'test-password')).status, 'session_expired')
+  assert.equal(expiredService.getCredentialRecord().credentialCiphertext, null)
+
+  const networkDatabase = await JobDatabase.open(path.join(temporaryDirectory, 'erp-network-error.sqlite'))
+  databases.push(networkDatabase)
+  const networkService = new PsitErpService({
+    database: networkDatabase,
+    encryptionKey: key,
+    fetchImpl: async () => { throw new Error('test network failure') },
+    onDiagnostic: () => {},
+  })
+  assert.equal((await networkService.connect('student-55555', 'test-password')).status, 'network_error')
+  assert.equal(networkService.getCredentialRecord().credentialCiphertext, null)
+})
+
+test('generic non-login pages are unknown rather than successful authentication', async () => {
+  const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-unknown-page.sqlite'))
+  databases.push(database)
+  const fetchImpl = async (url, options = {}) => {
+    const requestUrl = new URL(url)
+    if (options.method === 'POST') return new Response('', { status: 302, headers: { location: '/Student/Home' } })
+    if (requestUrl.pathname === '/Student/Home') return new Response('<h1>Student portal</h1>', { status: 200 })
+    return new Response(loginPage, { status: 200 })
+  }
+  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl, onDiagnostic: () => {} })
+  assert.equal((await service.connect('student-66666', 'test-password')).status, 'unknown_response')
   assert.equal(service.getCredentialRecord().credentialCiphertext, null)
 })
 
@@ -153,13 +214,11 @@ test('security challenges are left for manual completion without saving credenti
     if (requestUrl.pathname === '/Erp/SecurityChallenge') {
       return new Response('<h1>Enter verification code</h1><input name="otp">', { status: 200 })
     }
-    return new Response(`<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
-      <input name="username"><input name="password" type="password">
-    </form>`, { status: 200 })
+    return new Response(loginPage, { status: 200 })
   }
-  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl })
+  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl, onDiagnostic: () => {} })
   const result = await service.connect('student-22222', 'manual-challenge-password')
-  assert.equal(result.status, 'manual-auth-required')
+  assert.equal(result.status, 'manual_auth_required')
   assert.match(result.message, /will not bypass CAPTCHA or MFA/)
   assert.equal(service.getCredentialRecord().credentialCiphertext, null)
 })

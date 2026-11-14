@@ -70,17 +70,16 @@ the `/erp`, `/attendance`, `/timetable`, `/tomorrow`, `/marks`, `/notices`, and
 to Gemini, Groq, or another model. Credential-like text is rejected from the
 general AI request path.
 
-**Important limitation:** the public PSIT login page currently states that all
-user passwords have expired and links to the official password-change page.
-Only the login form is public; no student pages or supported data API were
-available to inspect during implementation. Consequently the integration can
-securely validate/store a login and show sync-attempt history, but attendance,
-timetable, marks, notices, scheduled sync, and academic notifications are not
-active. ERP questions explicitly report that limitation rather than returning
-guessed values. Change the password on PSIT's official portal, then provide
-access to authenticated student pages for data-source mapping before enabling
-retrieval or recurring synchronization. No additional paid service or library
-is used.
+**Important limitation:** the public PSIT login page includes a portal-wide
+password-expiry notice; that generic text is not treated as an account-specific
+password-change requirement. An authenticated student notice dashboard was
+verified in the browser. The connector reports success only for a verified
+student dashboard response and logs sanitized HTTP status, redirect, page type,
+and authentication-state diagnostics. Attendance, timetable, marks, notices,
+scheduled sync, and academic notifications are still inactive until their
+authenticated data sources are mapped. ERP questions report that limitation
+rather than returning guessed values. No additional paid service or library is
+used.
 
 ## Autonomous personalized news
 

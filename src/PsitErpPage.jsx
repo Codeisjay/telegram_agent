@@ -12,6 +12,10 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
+function formatStatus(value) {
+  return String(value || '').replace(/[-_]/g, ' ')
+}
+
 export default function PsitErpPage({ onToast }) {
   const [state, setState] = useState(null)
   const [userId, setUserId] = useState('')
@@ -103,11 +107,11 @@ export default function PsitErpPage({ onToast }) {
     <section className="panel psit-panel">
       <div className="psit-panel-heading">
         <div className="psit-title-icon"><Shield size={17} /><div><h3>Secure connection</h3><p>PSIT portal login is verified before credentials are saved.</p></div></div>
-        <span className={`pa-status ${state.connected ? 'pa-status-ok' : 'pa-status-warning'}`}>{state.connected ? 'CONNECTED' : state.status.replaceAll('-', ' ').toUpperCase()}</span>
+        <span className={`pa-status ${state.connected ? 'pa-status-ok' : 'pa-status-warning'}`}>{state.connected ? 'CONNECTED' : formatStatus(state.status).toUpperCase()}</span>
       </div>
       {!state.encryptionConfigured && <div className="psit-warning"><AlertTriangle size={15} />Server encryption is not configured. Set <code>PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY</code> on the backend before connecting.</div>}
-      {state.status === 'password-change-required' && <div className="psit-warning"><AlertTriangle size={15} />PSIT requires a password change. Update it on the official portal, then reconnect here.</div>}
-      {state.status === 'manual-auth-required' && <div className="psit-warning"><AlertTriangle size={15} />PSIT requires a manual security challenge. Complete it on the official portal; AgentFlow will not bypass CAPTCHA or MFA.</div>}
+      {state.status === 'password_change_required' && <div className="psit-warning"><AlertTriangle size={15} />PSIT explicitly requires a password change for this account. Update it on the official portal, then reconnect here.</div>}
+      {state.status === 'manual_auth_required' && <div className="psit-warning"><AlertTriangle size={15} />PSIT requires a manual security challenge. Complete it on the official portal; AgentFlow will not bypass CAPTCHA or MFA.</div>}
       <form className="psit-connection-form" onSubmit={submit}>
         <label>ERP User ID / Roll Number<input required autoComplete="username" maxLength="120" value={userId} onChange={(event) => setUserId(event.target.value)} /></label>
         <label>ERP password<input required autoComplete="current-password" type="password" maxLength="1024" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
@@ -116,7 +120,7 @@ export default function PsitErpPage({ onToast }) {
             {working ? <RefreshCw className="spin" size={14} /> : <LockKeyhole size={14} />}
             {working ? 'Connecting…' : state.credentialsStored ? 'Reconnect account' : 'Connect account'}
           </button>
-          {state.status === 'password-change-required' && <a className="psit-inline-link" href={passwordResetUrl} target="_blank" rel="noreferrer">Change password on PSIT</a>}
+          {state.status === 'password_change_required' && <a className="psit-inline-link" href={passwordResetUrl} target="_blank" rel="noreferrer">Change password on PSIT</a>}
         </div>
       </form>
       <div className="psit-security-note"><LockKeyhole size={14} /><span>Stored credentials use AES-256-GCM. The encryption key is server environment configuration, not SQLite. Do not send your ERP password in Telegram.</span></div>
@@ -127,14 +131,14 @@ export default function PsitErpPage({ onToast }) {
     </section>
 
     <div className="psit-status-grid">
-      <section className="panel psit-panel psit-status-card"><span>Connection</span><strong>{state.status.replaceAll('-', ' ')}</strong><small>Account: {state.userIdMasked || 'Not connected'}</small></section>
+      <section className="panel psit-panel psit-status-card"><span>Connection</span><strong>{formatStatus(state.status)}</strong><small>Account: {state.userIdMasked || 'Not connected'}</small></section>
       <section className="panel psit-panel psit-status-card"><span>Last successful data sync</span><strong>{formatDate(state.lastSyncAt)}</strong><small>Login validation does not count as a data sync.</small></section>
     </div>
 
     <section className="panel psit-panel psit-limitation">
       <div className="psit-panel-heading"><div className="psit-title-icon"><AlertTriangle size={17} /><div><h3>Data retrieval is not active yet</h3><p>Honest status: no academic data has been accessed or inferred.</p></div></div></div>
       <p>{state.limitation}</p>
-      <p>The public PSIT sign-in page currently announces that all user passwords have expired. Change your password using the official portal first. After authenticated pages are available for inspection, attendance, timetable, marks, notices, and safe scheduled synchronization can be mapped to verified sources.</p>
+      <p>The public sign-in page includes a portal-wide password-expiry notice; that notice alone is not treated as an account password error. An authenticated student notice dashboard has been verified, but attendance, timetable, marks, notices, and scheduled synchronization still need their data sources mapped before retrieval can be enabled.</p>
       <div className="psit-data-preview">
         <div><GraduationCap size={15} /><span>Attendance</span><strong>{state.data.attendance ? 'Cached' : 'No verified data'}</strong></div>
         <div><CalendarDays size={15} /><span>Timetable</span><strong>{state.data.timetable ? 'Cached' : 'No verified data'}</strong></div>
@@ -145,7 +149,7 @@ export default function PsitErpPage({ onToast }) {
     <section className="panel psit-panel">
       <div className="psit-panel-heading"><div className="psit-title-icon"><Check size={17} /><div><h3>Synchronization history</h3><p>Recent connection and sync checks.</p></div></div></div>
       {state.history.length
-        ? state.history.map((item) => <div className="psit-history-row" key={item.id}><strong>{item.status.replaceAll('-', ' ')}</strong><span>{item.message}</span><small>{formatDate(item.completedAt)}</small></div>)
+        ? state.history.map((item) => <div className="psit-history-row" key={item.id}><strong>{formatStatus(item.status)}</strong><span>{item.message}</span><small>{formatDate(item.completedAt)}</small></div>)
         : <p className="psit-empty">No synchronization attempts recorded yet.</p>}
     </section>
   </div>

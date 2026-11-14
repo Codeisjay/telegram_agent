@@ -114,7 +114,8 @@ function attribute(tag, name) {
 }
 
 function readLoginForm(html) {
-  for (const match of html.matchAll(/<form\b[^>]*>[\s\S]*?<\/form\s*>/gi)) {
+  const uncommentedHtml = html.replace(/<!--[\s\S]*?-->/g, '')
+  for (const match of uncommentedHtml.matchAll(/<form\b[^>]*>[\s\S]*?<\/form\s*>/gi)) {
     const formHtml = match[0]
     const formTag = formHtml.match(/<form\b[^>]*>/i)?.[0] || ''
     const fields = [...formHtml.matchAll(/<input\b[^>]*>/gi)].map(([tag]) => ({
@@ -156,13 +157,88 @@ function storeResponseCookies(headers, cookies) {
   }
 }
 
-async function requestOfficial(urlValue, options, cookies, fetchImpl) {
+const diagnosticPaths = new Map([
+  ['/erp/', '/Erp/'],
+  ['/erp', '/Erp'],
+  ['/erp/auth', '/Erp/Auth'],
+  ['/erp/forgetpassword', '/Erp/ForgetPassword'],
+  ['/student/', '/Student/'],
+  ['/student', '/Student'],
+])
+
+function safeDiagnosticUrl(url) {
+  if (url.protocol !== 'https:' || url.hostname !== 'erp.psit.ac.in') return '[external origin blocked]'
+  const pathname = diagnosticPaths.get(url.pathname.toLowerCase()) || '/<redacted>'
+  return `https://erp.psit.ac.in${pathname}`
+}
+
+function pageText(html) {
+  return decodeHtml(html
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<[^>]+>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function hasSessionExpiredMessage(html) {
+  return /\b(?:session (?:has )?expired|session timeout|please (?:log|sign) in again)\b/i.test(pageText(html))
+}
+
+function hasInvalidCredentialsMessage(html) {
+  return /\b(?:invalid (?:credentials?|username|user id|password)|incorrect (?:username|user id|password)|wrong (?:username|user id|password)|username or password is incorrect)\b/i.test(pageText(html))
+}
+
+function hasPasswordChangeEvidence(html) {
+  const passwordFields = [...html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<input\b[^>]*>/gi)]
+    .map(([tag]) => ({
+      name: attribute(tag, 'name').toLowerCase().replace(/[^a-z]/g, ''),
+      type: (attribute(tag, 'type') || 'text').toLowerCase(),
+    }))
+    .filter((field) => field.type === 'password')
+  const names = passwordFields.map((field) => field.name)
+  const hasCurrentPassword = names.some((name) => /(?:old|current).*password|password.*(?:old|current)/.test(name))
+  const hasNewPassword = names.some((name) => /(?:new|confirm).*password|password.*(?:new|confirm)/.test(name))
+  const text = pageText(html)
+  const accountSpecificMessage = /\b(?:your password (?:has expired|must be changed|needs? to be changed)|you (?:must|are required to) change your password|your account (?:requires|needs) a password change)\b/i.test(text)
+  return (hasCurrentPassword && hasNewPassword) || accountSpecificMessage
+}
+
+function hasAuthenticatedStudentPage(html, url) {
+  if (!['/student', '/student/'].includes(url.pathname.toLowerCase()) || readLoginForm(html)) return false
+  const title = pageText(html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] || '')
+  const anchors = [...html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)]
+    .map(([, attributes, contents]) => ({
+      href: attribute(`<a ${attributes}>`, 'href').toLowerCase(),
+      text: pageText(contents).toLowerCase(),
+    }))
+  const hasLink = (pattern) => anchors.some(({ href, text }) => pattern.test(`${href} ${text}`))
+  return /(?:dashboard.*student|student.*dashboard)/i.test(title)
+    && hasLink(/(?:logout|log out|sign out)/)
+    && hasLink(/profile|my account/)
+    && hasLink(/attendance/)
+    && hasLink(/timetable|time table/)
+}
+
+function detectPageType(html, url) {
+  if (/<input\b[^>]*(?:captcha|one.?time|verification.?code|otp)/i.test(html)
+    || /(?:captcha verification required|enter (?:the )?(?:otp|one.?time password|verification code)|two.factor authentication required)/i.test(pageText(html))) {
+    return 'security_challenge'
+  }
+  if (url.pathname.toLowerCase() === '/erp/forgetpassword' && hasPasswordChangeEvidence(html)) return 'password_change'
+  if (hasSessionExpiredMessage(html)) return 'session_expired'
+  if (readLoginForm(html)) return 'login'
+  if (hasAuthenticatedStudentPage(html, url)) return 'authenticated_student'
+  return 'unknown'
+}
+
+async function requestOfficial(urlValue, options, cookies, fetchImpl, trace) {
   let url = new URL(urlValue)
   let method = options.method || 'GET'
   let body = options.body
   for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
     if (url.protocol !== 'https:' || url.hostname !== 'erp.psit.ac.in') {
-      throw new Error('The PSIT ERP redirected outside its official HTTPS origin.')
+      return { blockedRedirect: true, url, trace }
     }
     const headers = new Headers(options.headers || {})
     if (cookies.size) headers.set('cookie', cookieHeader(cookies))
@@ -176,40 +252,108 @@ async function requestOfficial(urlValue, options, cookies, fetchImpl) {
         signal: AbortSignal.timeout(20000),
       })
     } catch {
-      const error = new Error('Could not reach the official PSIT ERP. Try again later.')
-      error.status = 502
-      throw error
+      trace.push({ method, status: null, requestUrl: safeDiagnosticUrl(url), redirectUrl: null, redirectPath: null })
+      return { networkError: true, url, trace }
     }
     storeResponseCookies(response.headers, cookies)
+    const isRedirect = [301, 302, 303, 307, 308].includes(response.status)
+    const location = isRedirect ? response.headers.get('location') : null
+    let target
+    try {
+      target = location ? new URL(location, url) : null
+    } catch {
+      trace.push({ method, status: response.status, requestUrl: safeDiagnosticUrl(url), redirectUrl: '[invalid redirect]', redirectPath: null })
+      return { invalidRedirect: true, url, trace }
+    }
+    const targetIsOfficial = !target || (target.protocol === 'https:' && target.hostname === 'erp.psit.ac.in')
+    trace.push({
+      method,
+      status: response.status,
+      requestUrl: safeDiagnosticUrl(url),
+      redirectUrl: target ? safeDiagnosticUrl(target) : null,
+      redirectPath: targetIsOfficial ? target?.pathname || null : null,
+    })
     if (![301, 302, 303, 307, 308].includes(response.status)) return { response, url }
-    const location = response.headers.get('location')
     if (!location) return { response, url }
-    if (redirectCount === 5) throw new Error('The official PSIT ERP returned too many redirects.')
-    url = new URL(location, url)
+    if (!targetIsOfficial) return { blockedRedirect: true, url, trace }
+    if (redirectCount === 5) return { tooManyRedirects: true, url, trace }
+    url = target
     if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
       method = 'GET'
       body = undefined
     }
   }
-  throw new Error('The official PSIT ERP could not complete its login redirect.')
+  return { tooManyRedirects: true, url, trace }
 }
 
-async function authenticate(credentials, fetchImpl) {
-  const cookies = new Map()
-  const login = await requestOfficial(PSIT_ERP_URL, {}, cookies, fetchImpl)
-  const loginHtml = await login.response.text()
-  if (login.response.status < 200 || login.response.status >= 400) {
-    const error = new Error('The official PSIT ERP login page could not be loaded.')
-    error.status = 502
-    throw error
+function finishAuthentication(status, pageType, trace, onDiagnostic) {
+  const diagnostic = {
+    responses: trace.map(({ method, status: httpStatus, requestUrl, redirectUrl }) => ({
+      method,
+      httpStatus,
+      requestUrl,
+      redirectUrl,
+    })),
+    pageType,
+    authenticationState: status,
   }
-  if (/all user passwords have expired/i.test(loginHtml)) {
-    return { status: 'password-change-required' }
+  onDiagnostic(diagnostic)
+  return { status, pageType }
+}
+
+function isTemporaryHttpFailure(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500
+}
+
+function authenticationMessage(status, syncing = false) {
+  const messages = {
+    invalid_credentials: syncing
+      ? 'PSIT explicitly rejected the saved credentials. Check the user ID and password on the official portal, then reconnect.'
+      : 'PSIT explicitly rejected the submitted login. Check the user ID and password on the official portal, then reconnect.',
+    password_change_required: 'PSIT explicitly requires a password change for this account. Update it on the official portal, then reconnect.',
+    session_expired: 'PSIT reported an expired session. Reconnect from the dashboard to verify the account again.',
+    network_error: 'Could not reach or read a response from the official PSIT ERP. Try again later.',
+    unknown_response: 'PSIT returned an unrecognized login response. No new credentials were saved and login was not confirmed.',
+    manual_auth_required: 'PSIT requires a manual security challenge. Complete it on the official portal; AgentFlow will not bypass CAPTCHA or MFA.',
+  }
+  if (status === 'connected') {
+    return syncing
+      ? 'PSIT login is valid, but authenticated student data pages have not yet been mapped. No academic data was retrieved.'
+      : 'PSIT login was verified using the authenticated student dashboard, and credentials were encrypted on this server. Academic data retrieval remains pending page/API mapping.'
+  }
+  return messages[status] || messages.unknown_response
+}
+
+async function authenticate(credentials, fetchImpl, onDiagnostic) {
+  const cookies = new Map()
+  const trace = []
+  const login = await requestOfficial(PSIT_ERP_URL, {}, cookies, fetchImpl, trace)
+  if (login.networkError) return finishAuthentication('network_error', 'unreachable', trace, onDiagnostic)
+  if (login.blockedRedirect || login.tooManyRedirects || login.invalidRedirect || !login.response) {
+    return finishAuthentication('unknown_response', 'unknown', trace, onDiagnostic)
+  }
+  let loginHtml
+  try {
+    loginHtml = await login.response.text()
+  } catch {
+    return finishAuthentication('network_error', 'unreadable_response', trace, onDiagnostic)
+  }
+  const loginPageType = detectPageType(loginHtml, login.url)
+  if (isTemporaryHttpFailure(login.response.status)) {
+    return finishAuthentication('network_error', loginPageType, trace, onDiagnostic)
+  }
+  if (!login.response.ok || loginPageType !== 'login') {
+    return finishAuthentication('unknown_response', loginPageType, trace, onDiagnostic)
   }
   const form = readLoginForm(loginHtml)
-  const action = new URL(form?.action || '', login.url)
+  let action
+  try {
+    action = new URL(form?.action || '', login.url)
+  } catch {
+    return finishAuthentication('unknown_response', 'unknown', trace, onDiagnostic)
+  }
   if (!form || form.method !== 'post' || action.origin !== new URL(PSIT_ERP_URL).origin) {
-    throw new Error('The official PSIT ERP login form has changed; no credentials were submitted.')
+    return finishAuthentication('unknown_response', 'unknown', trace, onDiagnostic)
   }
   const fields = new URLSearchParams()
   for (const field of form.fields) {
@@ -222,28 +366,48 @@ async function authenticate(credentials, fetchImpl) {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: fields.toString(),
-  }, cookies, fetchImpl)
-  const html = await result.response.text()
-  if (html.length > 2_000_000) throw new Error('The official PSIT ERP returned an unexpectedly large login response.')
-  if (/<input\b[^>]*(?:captcha|one.?time|verification.?code|otp)/i.test(html)
-    || /(?:captcha verification required|enter (?:the )?(?:otp|one.?time password|verification code)|two.factor authentication required)/i.test(html)) {
-    return { status: 'manual-auth-required' }
+  }, cookies, fetchImpl, trace)
+  if (result.networkError) return finishAuthentication('network_error', 'unreachable', trace, onDiagnostic)
+  if (result.blockedRedirect || result.tooManyRedirects || result.invalidRedirect || !result.response) {
+    return finishAuthentication('unknown_response', 'unknown', trace, onDiagnostic)
   }
-  if (result.url.pathname.toLowerCase().includes('/forgetpassword')
-    || /password.{0,60}(expired|change|reset|required)|(?:expired|change|reset).{0,60}password/i.test(html)) {
-    return { status: 'password-change-required' }
+  let html
+  try {
+    html = await result.response.text()
+  } catch {
+    return finishAuthentication('network_error', 'unreadable_response', trace, onDiagnostic)
   }
-  if (!result.response.ok || readLoginForm(html) || result.url.pathname.toLowerCase() === '/erp/auth') {
-    return { status: 'authentication-failed' }
+  if (html.length > 2_000_000) return finishAuthentication('unknown_response', 'oversized_response', trace, onDiagnostic)
+  const pageType = detectPageType(html, result.url)
+  let status = 'unknown_response'
+  if (isTemporaryHttpFailure(result.response.status)) {
+    status = 'network_error'
+  } else if (pageType === 'security_challenge') {
+    status = 'manual_auth_required'
+  } else if (pageType === 'session_expired') {
+    status = 'session_expired'
+  } else if (pageType === 'password_change'
+    && trace.some((entry) => entry.method === 'POST' && entry.redirectPath?.toLowerCase() === '/erp/forgetpassword')) {
+    status = 'password_change_required'
+  } else if (pageType === 'login' && hasInvalidCredentialsMessage(html)) {
+    status = 'invalid_credentials'
+  } else if (result.response.ok && pageType === 'authenticated_student') {
+    status = 'connected'
   }
-  return { status: 'authenticated' }
+  return finishAuthentication(status, pageType, trace, onDiagnostic)
 }
 
 export class PsitErpService {
-  constructor({ database, encryptionKey = process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY, fetchImpl = fetch }) {
+  constructor({
+    database,
+    encryptionKey = process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY,
+    fetchImpl = fetch,
+    onDiagnostic = (diagnostic) => console.info(`[PSIT ERP auth] ${JSON.stringify(diagnostic)}`),
+  }) {
     this.database = database
     this.encryptionKey = encryptionKey
     this.fetchImpl = fetchImpl
+    this.onDiagnostic = onDiagnostic
   }
 
   getState() {
@@ -326,13 +490,9 @@ export class PsitErpService {
       throw error
     }
     const credentials = { userId: userId.trim(), password }
-    const result = await authenticate(credentials, this.fetchImpl)
-    if (result.status !== 'authenticated') {
-      const message = result.status === 'password-change-required'
-        ? 'PSIT requires a password change. Use the official password-change page, then connect again.'
-        : result.status === 'manual-auth-required'
-          ? 'PSIT requires a manual security challenge. Complete it on the official portal; AgentFlow will not bypass CAPTCHA or MFA.'
-          : 'PSIT did not verify this login. Check the credentials on the official portal and try again.'
+    const result = await authenticate(credentials, this.fetchImpl, this.onDiagnostic)
+    if (result.status !== 'connected') {
+      const message = authenticationMessage(result.status)
       this.updateConnection({ status: result.status, userIdMasked: maskErpUserId(credentials.userId) })
       this.recordSync(result.status, message)
       return { status: result.status, message }
@@ -345,7 +505,7 @@ export class PsitErpService {
     })
     return {
       status: 'connected',
-      message: 'PSIT login verified and credentials encrypted on this server. Academic data retrieval remains pending page/API mapping.',
+      message: authenticationMessage('connected'),
     }
   }
 
@@ -365,21 +525,15 @@ export class PsitErpService {
       error.status = 503
       throw error
     }
-    const result = await authenticate(credentials, this.fetchImpl)
-    if (result.status !== 'authenticated') {
-      const status = ['password-change-required', 'manual-auth-required'].includes(result.status)
-        ? result.status
-        : 'reauthentication-required'
-      const message = result.status === 'password-change-required'
-        ? 'PSIT requires a password change. Update it on the official portal, then reconnect from the dashboard.'
-        : result.status === 'manual-auth-required'
-          ? 'PSIT requires a manual security challenge. Complete it on the official portal; AgentFlow will not bypass CAPTCHA or MFA.'
-          : 'PSIT did not accept the saved login. The password may have changed; reconnect from the dashboard.'
+    const result = await authenticate(credentials, this.fetchImpl, this.onDiagnostic)
+    if (result.status !== 'connected') {
+      const status = result.status
+      const message = authenticationMessage(status, true)
       this.updateConnection({ status, userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
       this.recordSync(status, message)
       return { status, message }
     }
-    const message = 'PSIT login is valid, but authenticated student data pages have not yet been mapped. No academic data was retrieved.'
+    const message = authenticationMessage('connected', true)
     this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
     this.recordSync('data-source-pending', message)
     return { status: 'data-source-pending', message }
