@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -25,13 +25,6 @@ import {
   parseNaturalLanguageEvent,
   toMinutesOfDay,
 } from './companion-intelligence.mjs'
-import {
-  formatErpAnswer,
-  PSIT_ERP_PASSWORD_RESET_URL,
-  PsitErpService,
-  resolveErpOperation,
-} from './psit-erp.mjs'
-
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
 const port = Number(process.env.AGENTFLOW_PORT || process.env.PORT || 3001)
@@ -51,11 +44,29 @@ const secretDirectory = process.env.AGENTFLOW_DATA_DIR || (process.env.LOCALAPPD
 const secretFile = process.env.AGENTFLOW_SECRET_FILE || path.join(secretDirectory, '.env')
 const databaseFile = process.env.AGENTFLOW_DB_PATH || path.join(secretDirectory, 'jobs.sqlite')
 const projectEnvFile = process.env.AGENTFLOW_ENV_FILE || path.join(path.dirname(fileURLToPath(import.meta.url)), '.env')
+const psitErpEnvironment = await readEnvFile(projectEnvFile)
+for (const name of [
+  'PSIT_ERP_BASE_URL',
+  'PSIT_ERP_USER_ID',
+  'PSIT_ERP_PASSWORD',
+  'PSIT_ERP_SYNC_INTERVAL_MINUTES',
+]) {
+  if (process.env[name] === undefined && psitErpEnvironment[name] !== undefined) {
+    process.env[name] = psitErpEnvironment[name]
+  }
+}
+const {
+  formatErpAnswer,
+  PSIT_ERP_PASSWORD_RESET_URL,
+  PsitErpService,
+  resolveErpOperation,
+} = await import('./psit-erp.mjs')
 const jobPromptTokenBudget = readPositiveInteger(process.env.AGENTFLOW_JOB_PROMPT_TOKEN_BUDGET, 6000, 1000, 9000)
 const jobDescriptionMaxCharacters = readPositiveInteger(process.env.AGENTFLOW_JOB_DESCRIPTION_MAX_CHARS, 8000, 1000, 30000)
 const newsCronSecret = process.env.AGENTFLOW_NEWS_CRON_SECRET || ''
 const companionCronSecret = process.env.AGENTFLOW_COMPANION_CRON_SECRET || ''
 const footprintCronSecret = process.env.AGENTFLOW_FOOTPRINT_CRON_SECRET || ''
+const psitErpCronSecret = process.env.AGENTFLOW_PSIT_ERP_CRON_SECRET || ''
 const secretNames = new Set([
   'GEMINI_API_KEY',
   'GROQ_API_KEY',
@@ -76,7 +87,6 @@ const defaultWhitelistId = '1207882899'
 const agent = { running: false, status: 'stopped', message: 'Agent is stopped.', events: [], controller: null, task: null, settings: null }
 const userRequests = new Map()
 const database = await JobDatabase.open(databaseFile)
-const psitErpEnvironment = await readEnvFile(projectEnvFile)
 const psitErpSyncIntervalMinutes = readPositiveInteger(
   process.env.PSIT_ERP_SYNC_INTERVAL_MINUTES,
   15,
@@ -96,9 +106,17 @@ const psitErp = new PsitErpService({
         'attendance-request': 'Attendance request',
         'online-training': 'Online training result',
         'od-request': 'OD request',
+        attendance: 'Attendance',
+        timetable: 'Timetable',
+        marks: 'Academic marks',
+        'exam-calendar': 'Exam calendar',
+        notices: 'Academic notice',
       }[change.page] || 'Student record'
-      const action = change.action === 'new' ? 'New record' : 'Record updated'
-      return `• ${source}: ${action}${change.label ? ` — ${change.label}` : ''}${change.status ? ` (${change.status})` : ''}`
+      const action = change.action === 'new'
+        ? 'New record'
+        : change.action === 'deleted' ? 'Record removed or withdrawn' : 'Record updated'
+      const timestamp = change.sourceTimestamp ? ` [${change.sourceTimestamp}]` : ''
+      return `• ${source}: ${action}${change.label ? ` — ${change.label}` : ''}${change.status ? ` (${change.status})` : ''}${timestamp}`
     }).join('\n')}`
     await sendTelegramMessage(chatId, message)
     return true
@@ -188,6 +206,11 @@ async function readSecrets() {
       .filter((name) => process.env[name])
       .map((name) => [name, process.env[name]])),
     ...await readEnvFile(secretFile),
+  }
+  for (const name of Object.keys(secrets)) {
+    if (name.startsWith('PSIT_ERP_') || name === 'AGENTFLOW_PSIT_ERP_CRON_SECRET') {
+      delete secrets[name]
+    }
   }
   return secrets
 }
@@ -294,6 +317,13 @@ function isFootprintCronAuthorized(request) {
   const authorization = request.headers.authorization || ''
   if (footprintCronSecret && authorization.startsWith('Bearer ')
     && safeStringEqual(authorization.slice(7), footprintCronSecret)) return true
+  return !production || isDashboardAuthorized(request)
+}
+
+function isPsitErpCronAuthorized(request) {
+  const authorization = request.headers.authorization || ''
+  if (psitErpCronSecret && authorization.startsWith('Bearer ')
+    && safeStringEqual(authorization.slice(7), psitErpCronSecret)) return true
   return !production || isDashboardAuthorized(request)
 }
 
@@ -2232,9 +2262,205 @@ let newsScheduler
 let companionInterval
 let psitErpInterval
 let lastCompanionCheck = 0
-let lastPsitErpSyncAt = 0
 let psitErpSyncRunning = false
-let psitErpFailureNoticeStatus = ''
+const psitErpWorkerId = randomUUID()
+
+function getPsitSchedulerState() {
+  database.db.prepare(`INSERT OR IGNORE INTO psit_erp_scheduler_state(
+    id, next_sync_at, last_successful_sync_at, last_attempt_at, status, failure_count,
+    failure_category, paused, last_error, updated_at
+  ) VALUES (1, '', '', '', 'idle', 0, '', 0, '', ?)`).run(new Date().toISOString())
+  return database.db.prepare(`SELECT next_sync_at AS nextSyncAt,
+    last_successful_sync_at AS lastSuccessfulSyncAt, last_attempt_at AS lastAttemptAt,
+    status, failure_count AS failureCount, failure_category AS failureCategory, paused,
+    last_error AS lastError
+    FROM psit_erp_scheduler_state WHERE id = 1`).get()
+}
+
+function updatePsitSchedulerState(changes) {
+  const current = getPsitSchedulerState()
+  const next = {
+    ...current,
+    ...changes,
+    updatedAt: new Date().toISOString(),
+  }
+  database.db.prepare(`UPDATE psit_erp_scheduler_state SET next_sync_at = ?,
+    last_successful_sync_at = ?, last_attempt_at = ?, status = ?, failure_count = ?,
+    failure_category = ?, paused = ?, last_error = ?, updated_at = ? WHERE id = 1`).run(
+    next.nextSyncAt || '',
+    next.lastSuccessfulSyncAt || '',
+    next.lastAttemptAt || '',
+    next.status || 'idle',
+    next.failureCount || 0,
+    next.failureCategory || '',
+    next.paused ? 1 : 0,
+    next.lastError || '',
+    next.updatedAt,
+  )
+}
+
+function acquirePsitSchedulerLease(now, leaseMilliseconds) {
+  database.db.prepare(`INSERT OR IGNORE INTO psit_erp_scheduler_lock(id, owner, lease_until)
+    VALUES (1, '', 0)`).run()
+  return database.db.prepare(`UPDATE psit_erp_scheduler_lock SET owner = ?, lease_until = ?
+    WHERE id = 1 AND lease_until < ?`).run(psitErpWorkerId, now + leaseMilliseconds, now).changes > 0
+}
+
+function releasePsitSchedulerLease() {
+  database.db.prepare(`UPDATE psit_erp_scheduler_lock SET owner = '', lease_until = 0
+    WHERE id = 1 AND owner = ?`).run(psitErpWorkerId)
+}
+
+function psitFailureMessage(category, retryMinutes = 0) {
+  if (category === 'invalid_credentials') return 'PSIT ERP rejected the configured credentials. Update the backend environment secrets; automatic sync is paused.'
+  if (category === 'password_change_required') return 'PSIT ERP requires a password change. Complete it on the official portal; automatic sync is paused.'
+  if (category === 'manual_auth_required') return 'PSIT ERP requires a manual security challenge. Complete it on the official portal; AgentFlow will not bypass it.'
+  if (category === 'configuration_error') return 'PSIT ERP environment configuration is incomplete. Set both user ID and password in backend secrets.'
+  if (category === 'credential_decryption_error') return 'Saved PSIT ERP dashboard credentials could not be decrypted. Reconnect using the configured encryption key.'
+  if (category === 'unknown_response') return 'PSIT ERP returned an unrecognized authentication response. Automatic sync is paused for manual review.'
+  if (category === 'session_expired') return 'PSIT ERP session could not be restored. Automatic sync is paused; review the PSIT ERP dashboard.'
+  return `PSIT ERP could not be reached. Automatic sync will retry in ${retryMinutes} minute${retryMinutes === 1 ? '' : 's'}.`
+}
+
+async function runPsitErpScheduledSync(trigger = 'timer', force = false) {
+  if (psitErpSyncRunning) return { status: 'already_running' }
+  let schedulerState = getPsitSchedulerState()
+  const erpState = psitErp.getState()
+  if (schedulerState.paused && !force) {
+    const retryOnStartup = trigger === 'startup'
+      && erpState.credentialsAvailable
+      && ['configuration_error', 'invalid_credentials', 'password_change_required', 'unknown_response', 'session_expired']
+        .includes(schedulerState.failureCategory)
+    if (!retryOnStartup) return { status: 'paused', category: schedulerState.failureCategory }
+    updatePsitSchedulerState({ status: 'startup_recheck', failureCategory: '', paused: false })
+    schedulerState = getPsitSchedulerState()
+  }
+  if (!erpState.credentialsAvailable && erpState.status === 'configuration_error') {
+    const message = 'Set both PSIT_ERP_USER_ID and PSIT_ERP_PASSWORD in the backend environment.'
+    updatePsitSchedulerState({
+      nextSyncAt: '',
+      status: 'paused',
+      failureCount: 0,
+      failureCategory: 'configuration_error',
+      paused: true,
+      lastError: message,
+    })
+    if (schedulerState.failureCategory !== 'configuration_error') {
+      const chatId = await getCompanionNotificationChatId()
+      const secrets = await readSecrets()
+      if (secrets.TELEGRAM_BOT_TOKEN && chatId) {
+        await sendTelegramMessage(chatId, psitFailureMessage('configuration_error'))
+      }
+    }
+    return { status: 'configuration_error' }
+  }
+  if (!erpState.credentialsAvailable) {
+    updatePsitSchedulerState({ status: 'waiting_for_credentials', nextSyncAt: '', paused: false, lastError: '' })
+    return { status: 'waiting_for_credentials' }
+  }
+  const now = Date.now()
+  const dueAt = Date.parse(schedulerState.nextSyncAt || '')
+  if (!force && psitErp.hasCachedSession() === false && !schedulerState.paused) {
+    // A restart drops the in-memory ERP session; authenticate immediately to restore it.
+  } else if (!force && Number.isFinite(dueAt) && dueAt > now) {
+    return { status: 'not_due', nextSyncAt: schedulerState.nextSyncAt }
+  }
+  const leaseMilliseconds = Math.max(15, psitErpSyncIntervalMinutes * 2) * 60000
+  if (!acquirePsitSchedulerLease(now, leaseMilliseconds)) return { status: 'locked' }
+
+  psitErpSyncRunning = true
+  const attemptedAt = new Date(now).toISOString()
+  updatePsitSchedulerState({ status: 'running', lastAttemptAt: attemptedAt })
+  try {
+    const result = await psitErp.sync()
+    const completedAt = new Date().toISOString()
+    const previous = getPsitSchedulerState()
+    const priorCategory = previous.failureCategory
+    if (result.retryable) {
+      const failureCount = previous.failureCount + 1
+      const retryMinutes = Math.min(15, 2 ** Math.min(failureCount - 1, 4))
+      const nextSyncAt = new Date(Date.now() + retryMinutes * 60000).toISOString()
+      updatePsitSchedulerState({
+        nextSyncAt,
+        status: 'retry_wait',
+        failureCount,
+        failureCategory: 'network_error',
+        paused: false,
+        lastError: result.message || 'Temporary ERP network or server error.',
+      })
+      if (priorCategory !== 'network_error') {
+        const chatId = await getCompanionNotificationChatId()
+        const secrets = await readSecrets()
+        if (secrets.TELEGRAM_BOT_TOKEN && chatId) {
+          await sendTelegramMessage(chatId, psitFailureMessage('network_error', retryMinutes))
+        }
+      }
+      logEvent('WARN', `PSIT ERP scheduled sync retry in ${retryMinutes} minute(s) after a temporary failure (${trigger}).`, 'errors')
+      return { ...result, retryMinutes }
+    }
+
+    const requiresManualAction = [
+      'invalid_credentials',
+      'password_change_required',
+      'manual_auth_required',
+      'unknown_response',
+      'session_expired',
+      'configuration_error',
+      'credential_decryption_error',
+    ].includes(result.status)
+    if (requiresManualAction) {
+      updatePsitSchedulerState({
+        nextSyncAt: '',
+        status: 'paused',
+        failureCount: 0,
+        failureCategory: result.status,
+        paused: true,
+        lastError: result.message || psitFailureMessage(result.status),
+      })
+      if (priorCategory !== result.status) {
+        const chatId = await getCompanionNotificationChatId()
+        const secrets = await readSecrets()
+        if (secrets.TELEGRAM_BOT_TOKEN && chatId) {
+          await sendTelegramMessage(chatId, psitFailureMessage(result.status))
+        }
+      }
+      return result
+    }
+
+    const successfulSync = result.status === 'completed' || result.status === 'partial'
+    const nextSyncAt = new Date(Date.now() + psitErpSyncIntervalMinutes * 60000).toISOString()
+    updatePsitSchedulerState({
+      nextSyncAt,
+      lastSuccessfulSyncAt: successfulSync ? completedAt : previous.lastSuccessfulSyncAt,
+      status: result.status,
+      failureCount: 0,
+      failureCategory: '',
+      paused: false,
+      lastError: result.status === 'completed' ? '' : result.message || 'ERP data was not retrieved.',
+    })
+    if (result.status === 'partial') logEvent('WARN', `PSIT ERP scheduled sync incomplete: ${result.message}`, 'errors')
+    return { ...result, nextSyncAt }
+  } catch {
+    const previous = getPsitSchedulerState()
+    const failureCount = previous.failureCount + 1
+    const retryMinutes = Math.min(15, 2 ** Math.min(failureCount - 1, 4))
+    const nextSyncAt = new Date(Date.now() + retryMinutes * 60000).toISOString()
+    updatePsitSchedulerState({
+      nextSyncAt,
+      status: 'retry_wait',
+      failureCount,
+      failureCategory: 'network_error',
+      paused: false,
+      lastError: 'Unexpected synchronization error. Check sanitized backend logs for details.',
+    })
+    logEvent('500 ERROR', `PSIT ERP scheduled sync failed; retrying in ${retryMinutes} minute(s).`, 'errors')
+    return { status: 'network_error', retryable: true, retryMinutes }
+  } finally {
+    psitErpSyncRunning = false
+    releasePsitSchedulerLease()
+  }
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${host}:${port}`)
   try {
@@ -2259,8 +2485,10 @@ const server = createServer(async (request, response) => {
     const isAuthorizedCompanionCron = isCompanionCronRoute && isCompanionCronAuthorized(request)
     const isFootprintCronRoute = request.method === 'POST' && url.pathname === '/api/cron/digital-footprint'
     const isAuthorizedFootprintCron = isFootprintCronRoute && isFootprintCronAuthorized(request)
+    const isPsitErpCronRoute = request.method === 'POST' && url.pathname === '/api/cron/psit-erp'
+    const isAuthorizedPsitErpCron = isPsitErpCronRoute && isPsitErpCronAuthorized(request)
     if (production && !isPublicHealthCheck && !isYoutubeOAuthCallback && !isAuthorizedNewsCron && !isAuthorizedCompanionCron
-      && !isAuthorizedFootprintCron && !isDashboardAuthorized(request)) {
+      && !isAuthorizedFootprintCron && !isAuthorizedPsitErpCron && !isDashboardAuthorized(request)) {
       response.writeHead(401, {
         'www-authenticate': 'Basic realm="AgentFlow Control Center", charset="UTF-8"',
         'content-type': 'application/json; charset=utf-8',
@@ -2383,6 +2611,11 @@ const server = createServer(async (request, response) => {
       return respond(response, 200, psitErp.getState())
     }
 
+    if (isPsitErpCronRoute) {
+      if (!isAuthorizedPsitErpCron) return respond(response, 401, { error: 'Authorized PSIT ERP cron access is required.' })
+      return respond(response, 200, await runPsitErpScheduledSync('external'))
+    }
+
     if (request.method === 'POST' && url.pathname === '/api/psit-erp/connect') {
       validateErpDashboardRequest(request)
       const input = await readJson(request)
@@ -2395,7 +2628,14 @@ const server = createServer(async (request, response) => {
 
     if (request.method === 'POST' && url.pathname === '/api/psit-erp/sync') {
       validateErpDashboardRequest(request)
-      return respond(response, 200, await psitErp.sync())
+      if (!psitErp.getState().credentialsAvailable) {
+        return respond(response, 200, await psitErp.sync())
+      }
+      const result = await runPsitErpScheduledSync('manual', true)
+      if (result.status === 'locked' || result.status === 'already_running') {
+        return respond(response, 409, { error: 'A PSIT ERP synchronization is already running.' })
+      }
+      return respond(response, 200, result)
     }
 
     if (request.method === 'DELETE' && url.pathname === '/api/psit-erp/connection') {
@@ -2684,33 +2924,12 @@ server.listen(port, host, () => {
     }
   }, 60000)
   companionInterval.unref?.()
-  psitErpInterval = setInterval(async () => {
-    if (psitErpSyncRunning || Date.now() - lastPsitErpSyncAt < psitErpSyncIntervalMinutes * 60000) return
-    if (!psitErp.getState().credentialsStored) return
-    lastPsitErpSyncAt = Date.now()
-    psitErpSyncRunning = true
-    try {
-      const result = await psitErp.sync({ monitorOnly: true })
-      if (result.status === 'completed') {
-        psitErpFailureNoticeStatus = ''
-      } else if (psitErpFailureNoticeStatus !== result.status) {
-        const secrets = await readSecrets()
-        const chatId = await getCompanionNotificationChatId()
-        if (secrets.TELEGRAM_BOT_TOKEN && chatId) {
-          const message = result.status === 'session_expired'
-            ? 'PSIT ERP session expired. Reconnect your account from the dashboard to resume automatic updates.'
-            : 'PSIT ERP automatic sync could not read all monitored pages. Check the PSIT ERP dashboard sync history for details.'
-          await sendTelegramMessage(chatId, message)
-        }
-        psitErpFailureNoticeStatus = result.status
-      }
-      if (result.status === 'partial') logEvent('WARN', `PSIT ERP automatic sync incomplete: ${result.message}`, 'errors')
-    } catch (error) {
-      logEvent('500 ERROR', `PSIT ERP automatic sync failed: ${error.message}`, 'errors')
-    } finally {
-      psitErpSyncRunning = false
-    }
-  }, 5 * 60000)
+  runPsitErpScheduledSync('startup')
+    .catch(() => logEvent('500 ERROR', 'Could not start the PSIT ERP scheduler.', 'errors'))
+  psitErpInterval = setInterval(() => {
+    runPsitErpScheduledSync('timer')
+      .catch(() => logEvent('500 ERROR', 'PSIT ERP scheduler tick failed.', 'errors'))
+  }, 30000)
   psitErpInterval.unref?.()
   const preferences = database.getAgentPreferences()
   if (preferences.autoStart) {

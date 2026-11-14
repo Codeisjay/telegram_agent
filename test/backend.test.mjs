@@ -27,7 +27,7 @@ let baseUrl
 function makeTestEnvironment(overrides = {}) {
   const environment = { ...process.env, LOCALAPPDATA: secretDirectory, AGENTFLOW_PORT: '0' }
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
-  for (const key of [...secretKeys, 'PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY', 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
+  for (const key of [...secretKeys, 'PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY', 'PSIT_ERP_BASE_URL', 'PSIT_ERP_USER_ID', 'PSIT_ERP_PASSWORD', 'PSIT_ERP_SYNC_INTERVAL_MINUTES', 'AGENTFLOW_PSIT_ERP_CRON_SECRET', 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
   environment.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY = '2a'.repeat(32)
   environment.AGENTFLOW_COMPANION_CRON_SECRET = 'test-companion-cron-secret'
@@ -159,6 +159,9 @@ test('PSIT ERP status exposes no credentials and AI requests reject credential-l
   assert.equal(state.connected, false)
   assert.equal(state.encryptionConfigured, true)
   assert.equal(state.dataRetrievalAvailable, false)
+  assert.equal(state.automaticSyncEnabled, false)
+  assert.equal(state.retrievedRecordCount, 0)
+  assert.equal(state.lastSyncError, '')
   assert.equal(JSON.stringify(state).includes('credential_ciphertext'), false)
   assert.equal(JSON.stringify(state).includes('PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY'), false)
 
@@ -1274,6 +1277,7 @@ test('production requires dashboard authentication and serves the built dashboar
     AGENTFLOW_DATA_DIR: path.join(tempRoot, 'production-data'),
     OPENROUTER_API_KEY: 'test-openrouter-key',
     TAVILY_SEARCH_KEY: 'test-tavily-key',
+    AGENTFLOW_PSIT_ERP_CRON_SECRET: 'test-psit-erp-cron-secret',
   })
   server = production.child
   try {
@@ -1312,6 +1316,15 @@ test('production requires dashboard authentication and serves the built dashboar
     })
     assert.equal(authorizedCompanionCron.status, 200)
     assert.equal((await authorizedCompanionCron.json()).status, 'completed')
+
+    const deniedPsitErpCron = await fetch(`${productionUrl}/api/cron/psit-erp`, { method: 'POST' })
+    assert.equal(deniedPsitErpCron.status, 401)
+    const authorizedPsitErpCron = await fetch(`${productionUrl}/api/cron/psit-erp`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer test-psit-erp-cron-secret' },
+    })
+    assert.equal(authorizedPsitErpCron.status, 200)
+    assert.equal((await authorizedPsitErpCron.json()).status, 'waiting_for_credentials')
 
     const invalidAuthorization = `Basic ${Buffer.from('deploy-admin:wrong-password').toString('base64')}`
     const invalidCron = await fetch(`${productionUrl}/api/cron/jobs`, {

@@ -49,48 +49,59 @@ The bot does not maintain conversation history between messages. The `/clear`
 command currently confirms that the conversation is cleared, but there is no
 stored conversation state to reset.
 
-## PSIT Student ERP foundation
+## PSIT Student ERP
 
-The **PSIT ERP** dashboard section accepts account credentials only through its
-server-backed form. The backend submits them to the official
-`https://erp.psit.ac.in/Erp/` login form, stores them only after a verified
-login, and encrypts them with AES-256-GCM. Configure
+For unattended authentication, configure `PSIT_ERP_BASE_URL`,
+`PSIT_ERP_USER_ID`, and `PSIT_ERP_PASSWORD` only in the backend environment
+(Render Environment settings or a private local `.env`). The base URL is
+restricted to the official `https://erp.psit.ac.in/Erp/` portal. Environment
+credentials are read only by the backend, used in memory, and are not written
+to SQLite, returned by APIs, or sent to Telegram or an AI model. The first
+startup sync establishes a baseline without notifying for historical records.
+
+The legacy dashboard connection remains available when environment credentials
+are absent; its credentials are encrypted with AES-256-GCM. Configure
 `PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY` as a stable, private 32-byte hex value
-before connecting. Generate one with:
+before using that form. Generate one with:
 
 ```powershell
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
 The encryption key must remain in the server environment and must not be added
-to SQLite, source control, frontend configuration, or Telegram. Disconnecting
-deletes encrypted credentials and cached academic rows. ERP intent detection and
-the `/erp`, `/attendance`, `/timetable`, `/tomorrow`, `/marks`, `/notices`, and
-`/academic_summary` shortcuts are routed locally; ERP credentials are not sent
-to Gemini, Groq, or another model. Credential-like text is rejected from the
-general AI request path.
-
-After a secure dashboard connection, the backend automatically checks the
-attendance-request, online-training, and OD-request pages every 15 minutes by
-default (configurable with `PSIT_ERP_SYNC_INTERVAL_MINUTES`, minimum 15). It
-uses the saved AES-256-GCM-encrypted credentials and sends deduplicated
-change alerts to the configured Telegram chat. The first successful scan
-establishes a baseline; only later additions or row updates trigger alerts.
-Never put the ERP user ID or password in environment variables; only the
-encryption key and optional polling interval belong there.
+to source control, frontend configuration, or Telegram. Disconnecting deletes
+encrypted dashboard credentials and cached academic rows. ERP intent detection
+and the `/erp`, `/attendance`, `/timetable`, `/tomorrow`, `/marks`, `/notices`,
+and `/academic_summary` shortcuts are routed locally. Credential-like text is
+rejected from the general AI request path.
 
 The public PSIT login page includes a portal-wide password-expiry notice; that
 generic text is not treated as an account-specific password-change requirement.
 The connector reports success only for a verified student dashboard response
 and logs sanitized HTTP status, redirect, page type, and authentication-state
-diagnostics. Manual sync reads the authenticated attendance summary, weekly
-timetable, semester and test/assignment marks, notice links, and exam calendar.
-Attendance percentages come directly from the portal summary; subject-wise
-attendance and current library dues remain unavailable because their values
-cannot be reliably mapped. The activity pages are polled on the configured
-interval; other academic pages are refreshed by manual sync. ERP questions
-return only cached verified sources and explicitly report unavailable data
-rather than guessing. No additional paid service or library is used.
+diagnostics. The scheduler authenticates at startup, reuses the in-memory
+session after validating it against the student page, and automatically
+reauthenticates on session expiry. It synchronizes the verified attendance
+request, online-training, OD-request, attendance, timetable, marks, notices,
+and exam-calendar pages every 15 minutes by default. Change notifications are
+deduplicated; removal alerts are sent only when the authenticated table
+confirms a complete listing. Temporary failures retry with bounded exponential
+backoff; invalid credentials, password changes, and security challenges pause
+automation and require action. `PSIT_ERP_SYNC_INTERVAL_MINUTES` accepts values
+from 15 to 360. ERP questions return only cached verified sources and explicitly
+report unavailable data rather than guessing. No additional paid service or
+library is used.
+
+The scheduler starts with the backend and stores its due time, change
+fingerprints, and a cross-process lease in the existing SQLite database. This
+prevents overlapping workers when they share that database file. Deploy a
+single backend instance with shared persistent storage for reliable locking and
+deduplication; independent containers with separate SQLite files cannot share
+a lock. For a sleeping Render Free service, optionally configure
+`AGENTFLOW_PSIT_ERP_CRON_SECRET` and call the authenticated
+`POST /api/cron/psit-erp` endpoint at least every 15 minutes to wake it and run
+due work. Render Free sleep and ephemeral filesystems cannot guarantee
+continuous monitoring or durable sync history.
 
 ## Autonomous personalized news
 
@@ -295,6 +306,11 @@ deploy it as a Static Site). In the service's Environment settings, add:
 - `AGENTFLOW_USERNAME`: dashboard login name; do not include a colon.
 - `AGENTFLOW_PASSWORD`: a unique random password of at least 16 characters.
 - `AGENTFLOW_DATA_DIR`: `/data`.
+- `PSIT_ERP_BASE_URL`: `https://erp.psit.ac.in/Erp/` (the backend rejects nonofficial origins).
+- `PSIT_ERP_USER_ID` and `PSIT_ERP_PASSWORD`: your authorized ERP account credentials. Set them as private Render environment secrets; do not put them in the dashboard, GitHub, Telegram, or AI settings.
+- `PSIT_ERP_SYNC_INTERVAL_MINUTES`: optional; defaults to `15` (allowed range `15`-`360`).
+- `PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY`: required only if using the legacy dashboard credential form; keep it private and stable.
+- `AGENTFLOW_PSIT_ERP_CRON_SECRET`: optional long random bearer secret for an external scheduler to wake a sleeping free instance and invoke PSIT sync.
 - Any provider or Telegram credentials you want available, such as
   `GEMINI_API_KEY`, `GROQ_API_KEY`, `TAVILY_SEARCH_KEY`, or
   `TELEGRAM_BOT_TOKEN`. Digital Footprint uses optional `GITHUB_TOKEN` and
@@ -323,6 +339,14 @@ to that health endpoint:
 The health endpoint returns HTTP 200 with `{"ok":true,"service":"agentflow-api"}`
 and does not run a job search. Do not ping `/` (dashboard Basic Auth protects it)
 or `/api/cron/jobs` (that is an authenticated job-search trigger).
+
+For PSIT monitoring on Render Free, an external HTTPS scheduler can call
+`POST https://<your-render-service>.onrender.com/api/cron/psit-erp` every
+15 minutes with `Authorization: Bearer <AGENTFLOW_PSIT_ERP_CRON_SECRET>` and
+no body. The endpoint honors the persistent due time, retry schedule, and
+manual-action pause. A health ping alone does not run ERP synchronization.
+Use one always-on backend instance with a persistent `/data` disk when durable
+monitoring and cross-process SQLite locking are required.
 
 Separately, `POST /api/cron/jobs` can trigger the daily search if desired. It uses
 the same HTTP Basic credentials as the dashboard, shares a persistent daily

@@ -1,7 +1,17 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 
-export const PSIT_ERP_URL = 'https://erp.psit.ac.in/Erp/'
-export const PSIT_ERP_PASSWORD_RESET_URL = 'https://erp.psit.ac.in/Erp/ForgetPassword'
+function resolvePortalUrl(value = process.env.PSIT_ERP_BASE_URL) {
+  const url = new URL(value || 'https://erp.psit.ac.in/Erp/')
+  if (url.protocol !== 'https:' || url.hostname !== 'erp.psit.ac.in'
+    || url.username || url.password || url.search || url.hash
+    || !/^\/(?:Erp)?\/?$/i.test(url.pathname)) {
+    throw new Error('PSIT_ERP_BASE_URL must use the official https://erp.psit.ac.in/Erp/ portal.')
+  }
+  return `${url.origin}/Erp/`
+}
+
+export const PSIT_ERP_URL = resolvePortalUrl()
+export const PSIT_ERP_PASSWORD_RESET_URL = new URL('/Erp/ForgetPassword', PSIT_ERP_URL).href
 
 export const ERP_OPERATIONS = Object.freeze([
   'status',
@@ -426,21 +436,25 @@ function parseActivityPage(html, kind) {
     }))
     const values = cells.map(({ value }) => value)
     const identity = kind === 'online-training'
-      ? values.slice(1, 3)
+      ? values.slice(0, 3)
       : values.slice(0, 1)
     const key = identity.join('|').trim()
     if (!key) return null
     const status = cells
-      .filter(({ header }) => /status|approval|coordinator|h\.?o\.?d|result/i.test(header))
+      .filter(({ header }) => /status|approval|coordinator|h\.?o\.?d|result|verify|director|marks|percentage|score/i.test(header))
       .map(({ value }) => value)
       .filter(Boolean)
       .join(' · ')
     const label = kind === 'online-training'
       ? [values[2], values[1]].filter(Boolean).join(' · ')
       : status || `${kind === 'attendance-request' ? 'Attendance' : 'OD'} request`
-    return { key, values, label: label.slice(0, 160), status: status.slice(0, 120) }
+    const timestamp = cells.find(({ header }) => /submitted|exam\s*date|request\s*date/i.test(header))?.value || ''
+    return { key, values, label: label.slice(0, 160), status: status.slice(0, 120), sourceTimestamp: timestamp }
   }).filter(Boolean)
-  return { headers: table.headers, rows }
+  const text = pageText(html)
+  const count = text.match(/showing\s+1\s+to\s+(\d+)\s+of\s+(\d+)\s+entries/i)
+  const empty = /showing\s+0\s+to\s+0\s+of\s+0\s+entries/i.test(text)
+  return { headers: table.headers, rows, complete: empty || Boolean(count && count[1] === count[2]) }
 }
 
 function findAnchorByText(html, pattern) {
@@ -467,6 +481,41 @@ function parseNotices(html, capturedAt) {
     notices.push({ fingerprint, title, publishedAt: '', url: url.href, capturedAt })
   }
   return [...new Map(notices.map((notice) => [notice.fingerprint, notice])).values()]
+}
+
+function summarizeTimetableChange(previous, current) {
+  const indexPeriods = (timetable) => new Map((timetable?.days || []).flatMap((day) => (
+    (day.periods || []).map((period) => [`${day.day}|${period.period}`, { day: day.day, ...period }])
+  )))
+  const before = indexPeriods(previous)
+  const after = indexPeriods(current)
+  const changed = []
+  for (const [key, period] of after) {
+    if (JSON.stringify(before.get(key)) === JSON.stringify(period)) continue
+    changed.push(`${period.day} ${period.startTime}-${period.endTime}${period.subject ? ` ${period.subject}` : ''}`)
+  }
+  for (const [key, period] of before) {
+    if (after.has(key)) continue
+    changed.push(`${period.day} period ${period.period} removed`)
+  }
+  return changed.length ? `Timetable changed: ${changed.slice(0, 3).join('; ')}` : 'Weekly timetable changed'
+}
+
+function summarizeMarksChange(previous, current) {
+  const before = new Map((previous?.marks?.assessments || []).map((item) => [item.test, JSON.stringify(item)]))
+  const changedTests = (current?.marks?.assessments || [])
+    .filter((item) => before.get(item.test) !== JSON.stringify(item))
+    .map((item) => item.test)
+  return changedTests.length
+    ? `Marks changed for ${changedTests.slice(0, 4).join(', ')}`
+    : 'Academic or semester marks changed'
+}
+
+function activityRowsCount(snapshots) {
+  return snapshots.reduce((count, snapshot) => {
+    const page = JSON.parse(snapshot.dataJson)
+    return count + (Array.isArray(page.rows) ? page.rows.length : 0)
+  }, 0)
 }
 
 async function requestOfficial(urlValue, options, cookies, fetchImpl, trace) {
@@ -705,10 +754,13 @@ export class PsitErpService {
     this.monitoringIntervalMinutes = monitoringIntervalMinutes
     this.notifyChanges = notifyChanges
     this.onDiagnostic = onDiagnostic
+    this.session = null
+    this.syncPromise = null
   }
 
   getState() {
-    const connection = this.database.db.prepare(`SELECT user_id_masked AS userIdMasked, status,
+    const connection = this.database.db.prepare(`SELECT user_id_masked AS userIdMasked,
+      credential_source AS credentialSource, status,
       connected_at AS connectedAt, last_sync_at AS lastSyncAt, updated_at AS updatedAt
       FROM psit_erp_connection WHERE id = 1`).get()
     const snapshots = {
@@ -724,7 +776,17 @@ export class PsitErpService {
     const history = this.database.db.prepare(`SELECT id, status, started_at AS startedAt,
       completed_at AS completedAt, message FROM psit_erp_sync_history ORDER BY id DESC LIMIT 20`).all()
     const credentialsStored = Boolean(this.getCredentialRecord()?.credentialCiphertext)
-    const connected = credentialsStored && connection?.status === 'connected'
+    const environment = this.readEnvironmentCredentials()
+    const environmentManaged = environment.configured || connection?.credentialSource === 'environment'
+    const credentialsAvailable = environmentManaged ? environment.complete : credentialsStored
+    const connected = credentialsAvailable && Boolean(this.session) && connection?.status === 'connected'
+    const scheduler = this.database.db.prepare(`SELECT next_sync_at AS nextSyncAt,
+      last_successful_sync_at AS lastSuccessfulSyncAt, status AS schedulerStatus,
+      failure_category AS failureCategory, paused, last_error AS lastError
+      FROM psit_erp_scheduler_state WHERE id = 1`).get()
+    const recentChanges = this.database.db.prepare(`SELECT source, action, summary,
+      source_timestamp AS sourceTimestamp, detected_at AS detectedAt, delivered_at AS deliveredAt
+      FROM psit_erp_detected_changes ORDER BY id DESC LIMIT 20`).all()
     const timetable = snapshots.timetable ? JSON.parse(snapshots.timetable.dataJson) : null
     const academic = snapshots.academic.reduce((result, snapshot) => (
       Object.assign(result, JSON.parse(snapshot.dataJson))
@@ -740,6 +802,14 @@ export class PsitErpService {
       }]
     }))
     const noticesData = snapshots.notices.map((notice) => JSON.parse(notice.dataJson))
+    const noticeCount = this.database.db.prepare('SELECT COUNT(*) AS count FROM psit_erp_notices').get().count
+    const retrievedRecordCount = activityRowsCount(snapshots.activity)
+      + (snapshots.attendance ? 1 : 0)
+      + (timetable?.days || []).reduce((count, day) => count + (day.periods || []).length, 0)
+      + (academic?.marks?.semesters || []).length
+      + (academic?.marks?.assessments || []).reduce((count, assessment) => count + Math.max(assessment.subjects?.length || 0, 1), 0)
+      + (academic?.examCalendar?.exams || []).length
+      + noticeCount
     const availability = {
       attendance: Boolean(snapshots.attendance),
       timetable: Boolean(timetable),
@@ -754,12 +824,27 @@ export class PsitErpService {
     return {
       connected,
       credentialsStored,
-      status: connection?.status || 'disconnected',
-      userIdMasked: connection?.userIdMasked || '',
+      credentialsAvailable,
+      environmentConfigured: environment.complete,
+      environmentCredentialsPresent: environment.configured,
+      credentialSource: environmentManaged ? 'environment' : credentialsStored ? 'dashboard' : 'none',
+      status: environmentManaged && !environment.complete
+        ? 'configuration_error'
+        : connection?.status === 'connected' && !this.session ? 'reauthentication_pending' : connection?.status || 'disconnected',
+      userIdMasked: environmentManaged ? '' : connection?.userIdMasked || '',
       connectedAt: connection?.connectedAt || null,
       lastSyncAt: connection?.lastSyncAt || null,
+      lastSuccessfulSyncAt: scheduler?.lastSuccessfulSyncAt || '',
+      lastSyncError: scheduler?.lastError || '',
+      retrievedRecordCount,
+      nextScheduledSyncAt: scheduler?.nextSyncAt || '',
+      schedulerStatus: scheduler?.schedulerStatus || 'idle',
+      failureCategory: scheduler?.failureCategory || '',
+      syncPaused: Boolean(scheduler?.paused),
+      automaticSyncEnabled: credentialsAvailable && !scheduler?.paused,
+      sessionStatus: this.session ? 'authenticated_in_memory' : credentialsAvailable ? 'authentication_required' : 'not_configured',
       monitoringIntervalMinutes: this.monitoringIntervalMinutes,
-      encryptionConfigured: this.hasEncryptionKey(),
+      encryptionConfigured: environment.complete || this.hasEncryptionKey(),
       dataRetrievalAvailable: availability.attendance || availability.timetable
         || availability.marks || availability.examCalendar || availability.notices
         || availability.attendanceRequests || availability.onlineTraining || availability.odRequests,
@@ -775,6 +860,8 @@ export class PsitErpService {
         notices: noticesData,
       },
       history,
+      recentChanges,
+      monitoredModules: ['attendance requests', 'online training', 'OD requests', 'attendance', 'timetable', 'marks', 'notices', 'exam calendar'],
       limitation: 'Overall attendance, semester and test marks, timetable, academic notices, and the exam calendar are retrieved from authenticated PSIT pages. Attendance requests, online training results, and OD requests are monitored when authenticated pages expose recognizable records. Subject-wise attendance and current library dues are not available from the mapped pages.',
     }
   }
@@ -792,16 +879,101 @@ export class PsitErpService {
     return this.database.db.prepare('SELECT credential_ciphertext AS credentialCiphertext FROM psit_erp_connection WHERE id = 1').get()
   }
 
-  updateConnection({ status, userIdMasked = '', credentialCiphertext = null, connectedAt = null }) {
+  readEnvironmentCredentials() {
+    const userId = String(process.env.PSIT_ERP_USER_ID || '').trim()
+    const password = String(process.env.PSIT_ERP_PASSWORD || '')
+    const configured = Boolean(userId || password)
+    return { configured, complete: Boolean(userId && password), userId, password }
+  }
+
+  resolveCredentials() {
+    const environment = this.readEnvironmentCredentials()
+    if (environment.configured) {
+      return environment.complete
+        ? { source: 'environment', credentials: { userId: environment.userId, password: environment.password } }
+        : { status: 'configuration_error', source: 'environment' }
+    }
+    const connection = this.database.db.prepare('SELECT credential_source AS credentialSource FROM psit_erp_connection WHERE id = 1').get()
+    if (connection?.credentialSource === 'environment') return { status: 'configuration_error', source: 'environment' }
+    const record = this.getCredentialRecord()
+    if (!record?.credentialCiphertext) return { status: 'disconnected' }
+    try {
+      return { source: 'dashboard', credentials: decryptErpCredentials(record.credentialCiphertext, this.encryptionKey) }
+    } catch {
+      return { status: 'credential_decryption_error' }
+    }
+  }
+
+  updateAuthenticationState(status, source, credentials, connectedAt = null) {
+    const stored = this.getCredentialRecord()?.credentialCiphertext || null
+    this.updateConnection({
+      status,
+      userIdMasked: source === 'environment' ? '' : maskErpUserId(credentials.userId),
+      credentialCiphertext: stored,
+      connectedAt,
+      credentialSource: source,
+    })
+  }
+
+  credentialFingerprint(credentials) {
+    return createHash('sha256').update(`${credentials.userId}\0${credentials.password}`).digest('hex')
+  }
+
+  async authenticateSession(credentials, source, force = false) {
+    const fingerprint = this.credentialFingerprint(credentials)
+    if (!force && this.session?.credentialFingerprint === fingerprint) {
+      const verified = await fetchStudentPage('/Student/', this.session.cookies, this.fetchImpl, this.onDiagnostic)
+      if (verified.status === 'connected') {
+        this.session.studentHtml = verified.html
+        return { status: 'connected', ...this.session, reused: true }
+      }
+      if (verified.status === 'network_error' || verified.status === 'unknown_response') return verified
+    }
+
+    this.session = null
+    const result = await authenticate(credentials, this.fetchImpl, this.onDiagnostic)
+    if (result.status !== 'connected') return result
+    this.session = {
+      cookies: result.cookies,
+      studentHtml: result.studentHtml,
+      credentialFingerprint: fingerprint,
+    }
+    this.updateAuthenticationState('connected', source, credentials, new Date().toISOString())
+    return { status: 'connected', ...this.session, reused: false }
+  }
+
+  async fetchAuthenticatedPage(path, credentials, source, requestOptions = {}) {
+    if (!this.session) {
+      const auth = await this.authenticateSession(credentials, source)
+      if (auth.status !== 'connected') return { status: auth.status, sessionLost: true }
+    }
+    let page = await fetchStudentPage(path, this.session.cookies, this.fetchImpl, this.onDiagnostic, requestOptions)
+    if (page.status !== 'session_expired') return page
+
+    const auth = await this.authenticateSession(credentials, source, true)
+    if (auth.status !== 'connected') return { status: auth.status, sessionLost: true }
+    page = await fetchStudentPage(path, this.session.cookies, this.fetchImpl, this.onDiagnostic, requestOptions)
+    return page
+  }
+
+  finishSyncFailure(status, source, credentials, message = authenticationMessage(status, true)) {
+    this.session = null
+    this.updateAuthenticationState(status, source, credentials)
+    this.recordSync(status, message)
+    return { status, message, retryable: status === 'network_error' }
+  }
+
+  updateConnection({ status, userIdMasked = '', credentialCiphertext = null, connectedAt = null, credentialSource = 'dashboard' }) {
     const now = new Date().toISOString()
     this.database.db.prepare(`INSERT INTO psit_erp_connection(
-      id, user_id_masked, credential_ciphertext, status, connected_at, updated_at
-    ) VALUES (1, ?, ?, ?, ?, ?)
+      id, user_id_masked, credential_ciphertext, credential_source, status, connected_at, updated_at
+    ) VALUES (1, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET user_id_masked = excluded.user_id_masked,
       credential_ciphertext = excluded.credential_ciphertext, status = excluded.status,
+      credential_source = excluded.credential_source,
       connected_at = COALESCE(excluded.connected_at, psit_erp_connection.connected_at),
       updated_at = excluded.updated_at`).run(
-      userIdMasked, credentialCiphertext, status, connectedAt, now,
+      userIdMasked, credentialCiphertext, credentialSource, status, connectedAt, now,
     )
   }
 
@@ -810,6 +982,33 @@ export class PsitErpService {
     this.database.db.prepare(`INSERT INTO psit_erp_sync_history(status, started_at, completed_at, message)
       VALUES (?, ?, ?, ?)`).run(status, now, now, message)
     this.database.db.prepare('UPDATE psit_erp_connection SET updated_at = ? WHERE id = 1').run(now)
+  }
+
+  queueDetectedChange({ source, action, label, status = '', sourceTimestamp = '' }, capturedAt) {
+    const fingerprint = createHash('sha256')
+      .update(`${source}\n${action}\n${label}\n${status}\n${sourceTimestamp}\n${capturedAt}`)
+      .digest('hex')
+    const inserted = this.database.db.prepare(`INSERT OR IGNORE INTO psit_erp_pending_notifications(
+      fingerprint, payload_json, created_at
+    ) VALUES (?, ?, ?)`).run(fingerprint, JSON.stringify({
+      page: source,
+      action,
+      label,
+      status,
+      sourceTimestamp,
+    }), capturedAt)
+    if (!inserted.changes) return false
+    this.database.db.prepare(`INSERT OR IGNORE INTO psit_erp_detected_changes(
+      fingerprint, source, action, summary, source_timestamp, detected_at
+    ) VALUES (?, ?, ?, ?, ?, ?)`).run(
+      fingerprint,
+      source,
+      action,
+      [label, status].filter(Boolean).join(' · ').slice(0, 240),
+      sourceTimestamp,
+      capturedAt,
+    )
+    return true
   }
 
   async persistActivityPages(pages, capturedAt) {
@@ -827,7 +1026,7 @@ export class PsitErpService {
           const before = previousRows.get(row.key)
           if (!before || JSON.stringify(before.values) === JSON.stringify(row.values)) continue
           const fingerprint = createHash('sha256')
-            .update(`${recordType}\n${row.key}\n${JSON.stringify(row.values)}`)
+            .update(`${recordType}\n${row.key}\n${JSON.stringify(before.values)}\n${JSON.stringify(row.values)}\n${capturedAt}`)
             .digest('hex')
           const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
             UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
@@ -838,13 +1037,14 @@ export class PsitErpService {
               action: 'updated',
               label: row.label,
               status: row.status,
+              sourceTimestamp: row.sourceTimestamp,
             })
           }
         }
         for (const row of data.rows) {
           if (previousRows.has(row.key)) continue
           const fingerprint = createHash('sha256')
-            .update(`${recordType}\n${row.key}\n${JSON.stringify(row.values)}`)
+            .update(`${recordType}\n${row.key}\n${JSON.stringify(row.values)}\n${capturedAt}`)
             .digest('hex')
           const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
             UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
@@ -855,7 +1055,29 @@ export class PsitErpService {
               action: 'new',
               label: row.label,
               status: row.status,
+              sourceTimestamp: row.sourceTimestamp,
             })
+          }
+        }
+        if (data.complete) {
+          const currentKeys = new Set(data.rows.map((row) => row.key))
+          for (const row of previousRows.values()) {
+            if (currentKeys.has(row.key)) continue
+            const fingerprint = createHash('sha256')
+              .update(`${recordType}\n${row.key}\ndeleted\n${capturedAt}`)
+              .digest('hex')
+            const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
+              UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
+            if (!alreadySent) {
+              changes.push({
+                fingerprint,
+                page: type,
+                action: 'deleted',
+                label: row.label,
+                status: row.status,
+                sourceTimestamp: row.sourceTimestamp,
+              })
+            }
           }
         }
       }
@@ -871,10 +1093,26 @@ export class PsitErpService {
           action: change.action,
           label: change.label,
           status: change.status,
+          sourceTimestamp: change.sourceTimestamp,
         }), capturedAt)
+        database.prepare(`INSERT OR IGNORE INTO psit_erp_detected_changes(
+          fingerprint, source, action, summary, source_timestamp, detected_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`).run(
+          change.fingerprint,
+          change.page,
+          change.action,
+          [change.label, change.status].filter(Boolean).join(' · ').slice(0, 240),
+          change.sourceTimestamp || '',
+          capturedAt,
+        )
       }
     }
 
+    return this.deliverPendingNotifications(capturedAt)
+  }
+
+  async deliverPendingNotifications(capturedAt) {
+    const database = this.database.db
     const pending = database.prepare(`SELECT fingerprint, payload_json AS payloadJson
       FROM psit_erp_pending_notifications ORDER BY created_at LIMIT 10`).all()
     if (!pending.length) return []
@@ -888,15 +1126,22 @@ export class PsitErpService {
         fingerprint, notification_type, created_at
       ) VALUES (?, ?, ?)`)
       const deletePending = database.prepare('DELETE FROM psit_erp_pending_notifications WHERE fingerprint = ?')
+      const markDelivered = database.prepare('UPDATE psit_erp_detected_changes SET delivered_at = ? WHERE fingerprint = ?')
       for (const change of notifications) {
         insert.run(change.fingerprint, `erp-${change.page}`, capturedAt)
         deletePending.run(change.fingerprint)
+        markDelivered.run(capturedAt, change.fingerprint)
       }
     }
     return notifications.map(({ fingerprint, ...notification }) => notification)
   }
 
   async connect(userId, password) {
+    if (this.readEnvironmentCredentials().configured) {
+      const error = new Error('PSIT credentials are managed by backend environment variables; update those variables to change the account.')
+      error.status = 409
+      throw error
+    }
     const key = getErpEncryptionKey(this.encryptionKey)
     if (typeof userId !== 'string' || !userId.trim() || userId.trim().length > 120
       || typeof password !== 'string' || !password || password.length > 1024
@@ -913,6 +1158,11 @@ export class PsitErpService {
       this.recordSync(result.status, message)
       return { status: result.status, message }
     }
+    this.session = {
+      cookies: result.cookies,
+      studentHtml: result.studentHtml,
+      credentialFingerprint: this.credentialFingerprint(credentials),
+    }
     this.updateConnection({
       status: 'connected',
       userIdMasked: maskErpUserId(credentials.userId),
@@ -925,29 +1175,44 @@ export class PsitErpService {
     }
   }
 
-  async sync({ monitorOnly = false } = {}) {
-    const key = getErpEncryptionKey(this.encryptionKey)
-    const record = this.getCredentialRecord()
-    if (!record?.credentialCiphertext) {
-      const error = new Error('Connect your PSIT ERP account from the dashboard first.')
-      error.status = 409
-      throw error
-    }
-    let credentials
-    try {
-      credentials = decryptErpCredentials(record.credentialCiphertext, key)
-    } catch {
-      const error = new Error('Stored PSIT credentials could not be decrypted. Reconnect the account with the configured encryption key.')
-      error.status = 503
-      throw error
-    }
-    const result = await authenticate(credentials, this.fetchImpl, this.onDiagnostic)
-    if (result.status !== 'connected') {
-      const status = result.status
-      const message = authenticationMessage(status, true)
-      this.updateConnection({ status, userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+  sync(options = {}) {
+    if (this.syncPromise) return this.syncPromise
+    this.syncPromise = this.performSync(options).finally(() => { this.syncPromise = null })
+    return this.syncPromise
+  }
+
+  hasCachedSession() {
+    return Boolean(this.session)
+  }
+
+  async performSync({ monitorOnly = false } = {}) {
+    const resolved = this.resolveCredentials()
+    if (!resolved.credentials) {
+      if (resolved.status === 'disconnected') {
+        const error = new Error('Configure PSIT ERP credentials in the backend environment or connect an account from the dashboard.')
+        error.status = 409
+        throw error
+      }
+      const messages = {
+        configuration_error: 'Set both PSIT_ERP_USER_ID and PSIT_ERP_PASSWORD in the backend environment.',
+        credential_decryption_error: 'Stored PSIT credentials could not be decrypted. Reconnect the account with the configured encryption key.',
+        disconnected: 'Configure PSIT ERP credentials in the backend environment or connect an account from the dashboard.',
+      }
+      const status = resolved.status || 'disconnected'
+      const message = messages[status] || messages.disconnected
+      this.updateConnection({
+        status,
+        userIdMasked: '',
+        credentialCiphertext: this.getCredentialRecord()?.credentialCiphertext || null,
+        credentialSource: resolved.source || 'dashboard',
+      })
       this.recordSync(status, message)
-      return { status, message }
+      return { status, message, retryable: false }
+    }
+    const { credentials, source } = resolved
+    const result = await this.authenticateSession(credentials, source)
+    if (result.status !== 'connected') {
+      return this.finishSyncFailure(result.status, source, credentials)
     }
     const capturedAt = new Date().toISOString()
     const activityDefinitions = [
@@ -957,54 +1222,43 @@ export class PsitErpService {
     ]
     const activityPages = []
     const activityFailures = []
+    let retryableFailure = false
     for (const definition of activityDefinitions) {
-      const page = await fetchStudentPage(definition.path, result.cookies, this.fetchImpl, this.onDiagnostic)
-      if (page.status === 'session_expired') {
-        const message = authenticationMessage('session_expired', true)
-        this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-        this.recordSync('session_expired', message)
-        return { status: 'session_expired', message }
+      const page = await this.fetchAuthenticatedPage(definition.path, credentials, source)
+      if (page.sessionLost) return this.finishSyncFailure(page.status, source, credentials)
+      if (page.status === 'network_error') retryableFailure = true
+      if (page.status !== 'connected') {
+        activityFailures.push(`${definition.type} (${page.status})`)
+        continue
       }
-      const data = page.status === 'connected' ? parseActivityPage(page.html, definition.type) : null
+      const data = parseActivityPage(page.html, definition.type)
       if (data) activityPages.push({ type: definition.type, data })
-      else activityFailures.push(definition.type)
+      else activityFailures.push(`${definition.type} (content not recognized)`)
     }
     const activityChanges = await this.persistActivityPages(activityPages, capturedAt)
     if (monitorOnly) {
       const message = activityFailures.length
         ? `Checked PSIT activity pages; could not read ${activityFailures.join(', ')}.`
         : 'Checked PSIT attendance requests, online training results, and OD requests.'
-      this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.updateAuthenticationState('connected', source, credentials)
       this.database.db.prepare('UPDATE psit_erp_connection SET last_sync_at = ? WHERE id = 1').run(capturedAt)
       this.recordSync(activityFailures.length ? 'partial' : 'completed', message)
-      return { status: activityFailures.length ? 'partial' : 'completed', message, changes: activityChanges }
+      return { status: activityFailures.length ? 'partial' : 'completed', message, changes: activityChanges, retryable: retryableFailure }
     }
     const notices = parseNotices(result.studentHtml, capturedAt)
-    const attendancePage = await fetchStudentPage('/Student/MyAttendanceDetail', result.cookies, this.fetchImpl, this.onDiagnostic)
-    if (attendancePage.status === 'session_expired') {
-      const message = authenticationMessage('session_expired', true)
-      this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-      this.recordSync('session_expired', message)
-      return { status: 'session_expired', message }
-    }
+    const attendancePage = await this.fetchAuthenticatedPage('/Student/MyAttendanceDetail', credentials, source)
+    if (attendancePage.sessionLost) return this.finishSyncFailure(attendancePage.status, source, credentials)
+    if (attendancePage.status === 'network_error') retryableFailure = true
     const attendance = attendancePage.status === 'connected' ? parseAttendance(attendancePage.html) : null
 
-    const timetablePage = await fetchStudentPage('/Student/MyTimeTable', result.cookies, this.fetchImpl, this.onDiagnostic)
-    if (timetablePage.status === 'session_expired') {
-      const message = authenticationMessage('session_expired', true)
-      this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-      this.recordSync('session_expired', message)
-      return { status: 'session_expired', message }
-    }
+    const timetablePage = await this.fetchAuthenticatedPage('/Student/MyTimeTable', credentials, source)
+    if (timetablePage.sessionLost) return this.finishSyncFailure(timetablePage.status, source, credentials)
+    if (timetablePage.status === 'network_error') retryableFailure = true
     const timetable = timetablePage.status === 'connected' ? parseTimetable(timetablePage.html) : null
 
-    const marksPage = await fetchStudentPage('/Student/TestSubjectMarksReport', result.cookies, this.fetchImpl, this.onDiagnostic)
-    if (marksPage.status === 'session_expired') {
-      const message = authenticationMessage('session_expired', true)
-      this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-      this.recordSync('session_expired', message)
-      return { status: 'session_expired', message }
-    }
+    const marksPage = await this.fetchAuthenticatedPage('/Student/TestSubjectMarksReport', credentials, source)
+    if (marksPage.sessionLost) return this.finishSyncFailure(marksPage.status, source, credentials)
+    if (marksPage.status === 'network_error') retryableFailure = true
     let marks = null
     let failedMarkReports = 0
     let missingMarkRows = 0
@@ -1014,23 +1268,18 @@ export class PsitErpService {
       const assessments = []
       skippedMarkReports = Math.max(0, parsedMarks.testOptions.length - 20)
       for (const option of parsedMarks.testOptions.slice(0, 20)) {
-        const reportPage = await fetchStudentPage(
+        const reportPage = await this.fetchAuthenticatedPage(
           '/Student/TestSubjectMarksReport',
-          result.cookies,
-          this.fetchImpl,
-          this.onDiagnostic,
+          credentials,
+          source,
           {
             method: 'POST',
             headers: { 'content-type': 'application/x-www-form-urlencoded' },
             body: new URLSearchParams({ cTest: option.value }).toString(),
           },
         )
-        if (reportPage.status === 'session_expired') {
-          const message = authenticationMessage('session_expired', true)
-          this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-          this.recordSync('session_expired', message)
-          return { status: 'session_expired', message }
-        }
+        if (reportPage.sessionLost) return this.finishSyncFailure(reportPage.status, source, credentials)
+        if (reportPage.status === 'network_error') retryableFailure = true
         if (reportPage.status !== 'connected') {
           failedMarkReports += 1
           continue
@@ -1054,13 +1303,9 @@ export class PsitErpService {
       }
       if (examUrl?.origin === new URL(PSIT_ERP_URL).origin
         && /^\/student\/examcalender\/[^/]+\/?$/i.test(examUrl.pathname)) {
-        const calendarPage = await fetchStudentPage(examUrl.href, result.cookies, this.fetchImpl, this.onDiagnostic)
-        if (calendarPage.status === 'session_expired') {
-          const message = authenticationMessage('session_expired', true)
-          this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-          this.recordSync('session_expired', message)
-          return { status: 'session_expired', message }
-        }
+        const calendarPage = await this.fetchAuthenticatedPage(examUrl.href, credentials, source)
+        if (calendarPage.sessionLost) return this.finishSyncFailure(calendarPage.status, source, credentials)
+        if (calendarPage.status === 'network_error') retryableFailure = true
         if (calendarPage.status === 'connected') examCalendar = parseExamCalendar(calendarPage.html)
       }
     }
@@ -1068,10 +1313,31 @@ export class PsitErpService {
     const database = this.database.db
     if (attendance) {
       const overallPercent = attendance.percentageWithPf ?? attendance.percentageWithoutPf
+      const previous = database.prepare(`SELECT data_json AS dataJson FROM psit_erp_attendance_snapshots
+        ORDER BY id DESC LIMIT 1`).get()
+      if (previous && JSON.stringify(JSON.parse(previous.dataJson)) !== JSON.stringify(attendance)) {
+        this.queueDetectedChange({
+          source: 'attendance',
+          action: 'updated',
+          label: `Overall attendance is now ${typeof overallPercent === 'number' ? `${overallPercent}%` : 'unavailable'}`,
+          sourceTimestamp: capturedAt,
+        }, capturedAt)
+      }
       database.prepare(`INSERT INTO psit_erp_attendance_snapshots(captured_at, overall_percent, data_json)
         VALUES (?, ?, ?)`).run(capturedAt, overallPercent, JSON.stringify(attendance))
     }
     if (timetable) {
+      const previous = database.prepare(`SELECT data_json AS dataJson FROM psit_erp_timetable_snapshots
+        ORDER BY id DESC LIMIT 1`).get()
+      const previousTimetable = previous ? JSON.parse(previous.dataJson) : null
+      if (previousTimetable && JSON.stringify(previousTimetable) !== JSON.stringify(timetable)) {
+        this.queueDetectedChange({
+          source: 'timetable',
+          action: 'updated',
+          label: summarizeTimetableChange(previousTimetable, timetable),
+          sourceTimestamp: capturedAt,
+        }, capturedAt)
+      }
       database.prepare(`INSERT INTO psit_erp_timetable_snapshots(captured_at, week_of, data_json)
         VALUES (?, ?, ?)`).run(capturedAt, '', JSON.stringify(timetable))
     }
@@ -1080,6 +1346,19 @@ export class PsitErpService {
       marks ? ['marks', { marks }] : null,
     ].filter(Boolean)
     for (const [recordType, academic] of academicRecords) {
+      const previous = database.prepare(`SELECT data_json AS dataJson FROM psit_erp_academic_records
+        WHERE record_type = ? AND source_id = 'student'`).get(recordType)
+      const previousAcademic = previous ? JSON.parse(previous.dataJson) : null
+      if (previousAcademic && JSON.stringify(previousAcademic) !== JSON.stringify(academic)) {
+        this.queueDetectedChange({
+          source: recordType === 'marks' ? 'marks' : 'exam-calendar',
+          action: 'updated',
+          label: recordType === 'marks'
+            ? summarizeMarksChange(previousAcademic, academic)
+            : `Exam calendar changed: ${(academic.examCalendar.exams || []).slice(0, 3).map((exam) => exam.Examination).filter(Boolean).join(', ') || 'review schedule'}`,
+          sourceTimestamp: capturedAt,
+        }, capturedAt)
+      }
       database.prepare(`INSERT INTO psit_erp_academic_records(record_type, source_id, data_json, updated_at)
         VALUES (?, 'student', ?, ?)
         ON CONFLICT(record_type, source_id) DO UPDATE SET data_json = excluded.data_json,
@@ -1088,9 +1367,19 @@ export class PsitErpService {
     const insertNotice = database.prepare(`INSERT OR IGNORE INTO psit_erp_notices(
       fingerprint, title, published_at, data_json
     ) VALUES (?, ?, ?, ?)`)
+    const hadNoticeBaseline = database.prepare('SELECT 1 FROM psit_erp_notices LIMIT 1').get()
     for (const notice of [...notices].reverse()) {
-      insertNotice.run(notice.fingerprint, notice.title, notice.publishedAt, JSON.stringify(notice))
+      const inserted = insertNotice.run(notice.fingerprint, notice.title, notice.publishedAt, JSON.stringify(notice))
+      if (hadNoticeBaseline && inserted.changes) {
+        this.queueDetectedChange({
+          source: 'notices',
+          action: 'new',
+          label: notice.title,
+          sourceTimestamp: notice.publishedAt || notice.capturedAt,
+        }, capturedAt)
+      }
     }
+    const academicChanges = await this.deliverPendingNotifications(capturedAt)
 
     const sources = [
       activityPages.length ? `${activityPages.length} activity pages` : null,
@@ -1103,9 +1392,9 @@ export class PsitErpService {
     ].filter(Boolean)
     if (!sources.length) {
       const message = `Login was verified, but no mapped academic data was recognized. ${activityFailures.length ? `Could not read ${activityFailures.join(', ')}.` : ''}`
-      this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.updateAuthenticationState('connected', source, credentials)
       this.recordSync('data-source-pending', message)
-      return { status: 'data-source-pending', message }
+      return { status: 'data-source-pending', message, retryable: retryableFailure, changes: academicChanges }
     }
     const unavailablePages = [
       attendance ? null : `attendance summary (${attendancePage.status === 'connected' ? 'content not recognized' : attendancePage.status})`,
@@ -1121,20 +1410,30 @@ export class PsitErpService {
       'subject-wise attendance and current library dues remain unavailable',
     ].filter(Boolean)
     const message = `Synced ${sources.join(', ')}. ${details.join('; ')}.`
-    this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+    this.updateAuthenticationState('connected', source, credentials)
     database.prepare('UPDATE psit_erp_connection SET last_sync_at = ? WHERE id = 1').run(capturedAt)
     this.recordSync('partial', message)
-    return { status: 'partial', message, changes: activityChanges }
+    return { status: 'partial', message, changes: [...activityChanges, ...academicChanges], retryable: retryableFailure }
   }
 
   disconnect() {
+    if (this.readEnvironmentCredentials().configured) {
+      const error = new Error('Remove PSIT_ERP_USER_ID and PSIT_ERP_PASSWORD from the backend environment before disconnecting this managed account.')
+      error.status = 409
+      throw error
+    }
+    this.session = null
     this.database.db.prepare('DELETE FROM psit_erp_connection WHERE id = 1').run()
     this.database.db.exec(`DELETE FROM psit_erp_attendance_snapshots;
       DELETE FROM psit_erp_timetable_snapshots;
       DELETE FROM psit_erp_academic_records;
       DELETE FROM psit_erp_notices;
       DELETE FROM psit_erp_notification_fingerprints;
-      DELETE FROM psit_erp_pending_notifications;`)
+      DELETE FROM psit_erp_pending_notifications;
+      DELETE FROM psit_erp_detected_changes;`)
+    this.database.db.prepare(`UPDATE psit_erp_scheduler_state SET next_sync_at = '',
+      last_successful_sync_at = '', status = 'idle', failure_count = 0,
+      failure_category = '', paused = 0, updated_at = ? WHERE id = 1`).run(new Date().toISOString())
     return { disconnected: true }
   }
 }

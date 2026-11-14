@@ -56,8 +56,11 @@ const authenticatedOnlineTrainingPage = `<a href="/Student/Logout">Logout</a><ta
   <tbody><tr><td>1</td><td>2026-11-12</td><td>Practice Test</td><td>1</td><td>0</td>
   <td>8 / 10</td><td>80%</td><td><a href="/Student/OnlineTrainingDetails/private-token">View</a></td></tr></tbody></table>`
 const authenticatedOdRequestPage = `<a href="/Student/Logout">Logout</a><table><thead><tr>
-  <th>Request Id</th><th>From Date</th><th>To Date</th><th>Status</th></tr></thead><tbody>
-  <tr><td>OD-200</td><td>2026-11-11</td><td>2026-11-11</td><td>Pending</td></tr></tbody></table>`
+  <th>Request-Id</th><th>Details</th><th>Proof</th><th>Request Submitted At</th>
+  <th>Assign To</th><th>Verify</th><th>HOD</th><th>Director</th></tr></thead><tbody>
+  <tr><td>OD-200</td><td>Private OD reason</td><td></td><td>2026-11-11 09:00</td>
+  <td>Coordinator A</td><td>Pending</td><td>Pending</td><td>Pending</td></tr></tbody></table>
+  <div>Showing 1 to 1 of 1 entries</div>`
 const authenticatedMarksPage = `<a href="/Student/Logout">Logout</a>
   <form action="/Student/TestSubjectMarksReport" method="post"><select name="cTest">
     <option value="">Select Test Here</option><option value="ct-2-token">CT-2</option>
@@ -142,6 +145,8 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   let timetablePageReceivedCookie = false
   let transientDataFailure = false
   let attendanceRequestUpdated = false
+  let odRequestStatus = 'Pending'
+  let odRequestDeleted = false
   const notifications = []
   const fetchImpl = async (url, options = {}) => {
     const requestUrl = new URL(url)
@@ -169,7 +174,10 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
       return new Response(authenticatedOnlineTrainingPage, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/ODRequest') {
-      return new Response(authenticatedOdRequestPage, { status: 200 })
+      const page = odRequestDeleted
+        ? authenticatedOdRequestPage.replace(/<tr><td>OD-200[\s\S]*?<\/tr>/, '').replace('Showing 1 to 1 of 1 entries', 'Showing 0 to 0 of 0 entries')
+        : authenticatedOdRequestPage.replace('<td>Pending</td><td>Pending</td><td>Pending</td></tr>', `<td>${odRequestStatus}</td><td>Pending</td><td>Pending</td></tr>`)
+      return new Response(page, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/TestSubjectMarksReport') {
       if (transientDataFailure && options.method !== 'POST') return new Response('Temporary failure', { status: 503 })
@@ -232,6 +240,9 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   const syncedState = service.getState()
   assert.equal(syncedState.history[0].status, 'partial')
   assert.equal(syncedState.lastSyncAt !== null, true)
+  assert.ok(syncedState.retrievedRecordCount > 0)
+  assert.equal(syncedState.automaticSyncEnabled, true)
+  assert.equal(syncedState.lastSyncError, '')
   assert.equal(syncedState.availability.timetable, true)
   assert.equal(syncedState.availability.examCalendar, true)
   assert.equal(syncedState.availability.notices, true)
@@ -272,6 +283,22 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(JSON.stringify(notifications).includes('Private reason'), false)
   await service.sync()
   assert.equal(notifications.length, 1)
+  odRequestStatus = 'Approved'
+  await service.sync()
+  assert.equal(notifications.length, 2)
+  assert.equal(notifications[1].page, 'od-request')
+  assert.equal(notifications[1].action, 'updated')
+  assert.match(notifications[1].status, /Approved/)
+  assert.equal(notifications[1].sourceTimestamp, '2026-11-11 09:00')
+  assert.equal(JSON.stringify(notifications).includes('Private OD reason'), false)
+  await service.sync()
+  assert.equal(notifications.length, 2)
+  odRequestDeleted = true
+  await service.sync()
+  assert.equal(notifications.length, 3)
+  assert.equal(notifications[2].action, 'deleted')
+  await service.sync()
+  assert.equal(notifications.length, 3)
   transientDataFailure = true
   await service.sync()
   assert.equal(service.getState().data.attendance.percentageWithPf, 88.5)
@@ -288,6 +315,82 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(service.getState().connected, false)
   assert.equal(service.getState().credentialsStored, false)
   assert.equal(service.getCredentialRecord(), undefined)
+})
+
+test('environment credentials stay out of SQLite and cached sessions are reused and renewed', async () => {
+  const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-environment-credentials.sqlite'))
+  databases.push(database)
+  const names = ['PSIT_ERP_USER_ID', 'PSIT_ERP_PASSWORD']
+  const originalEnvironment = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+  const userId = 'env-only-student-123'
+  const password = 'env-only-private-password'
+  let loginCount = 0
+  let monitoredPageCount = 0
+  let expireFirstSession = false
+  const diagnostics = []
+  process.env.PSIT_ERP_USER_ID = userId
+  process.env.PSIT_ERP_PASSWORD = password
+  const fetchImpl = async (url, options = {}) => {
+    const requestUrl = new URL(url)
+    if (requestUrl.pathname === '/Erp/' && options.method !== 'POST') return new Response(loginPage, { status: 200 })
+    if (options.method === 'POST' && requestUrl.pathname === '/Erp/Auth') {
+      loginCount += 1
+      return new Response('', {
+        status: 302,
+        headers: { location: '/Student/', 'set-cookie': `ci_session=env-session-${loginCount}; Path=/; HttpOnly` },
+      })
+    }
+    if (requestUrl.pathname === '/Student/') {
+      const cookie = new Headers(options.headers).get('cookie') || ''
+      if (expireFirstSession && cookie.includes('env-session-1')) return new Response(loginPage, { status: 200 })
+      return new Response(authenticatedStudentPage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/StudentAttRequest') {
+      monitoredPageCount += 1
+      return new Response(authenticatedAttendanceRequestsPage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/OnlineTraining') {
+      monitoredPageCount += 1
+      return new Response(authenticatedOnlineTrainingPage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/ODRequest') {
+      monitoredPageCount += 1
+      return new Response(authenticatedOdRequestPage, { status: 200 })
+    }
+    return new Response(loginPage, { status: 200 })
+  }
+  try {
+    const service = new PsitErpService({ database, encryptionKey: key, fetchImpl, onDiagnostic: (item) => diagnostics.push(item) })
+    assert.equal((await service.sync({ monitorOnly: true })).status, 'completed')
+    assert.equal(loginCount, 1)
+    assert.equal((await service.sync({ monitorOnly: true })).status, 'completed')
+    assert.equal(loginCount, 1)
+    const pageCountBeforeParallelSync = monitoredPageCount
+    await Promise.all([service.sync({ monitorOnly: true }), service.sync({ monitorOnly: true })])
+    assert.equal(monitoredPageCount - pageCountBeforeParallelSync, 3)
+    assert.equal(loginCount, 1)
+    expireFirstSession = true
+    assert.equal((await service.sync({ monitorOnly: true })).status, 'completed')
+    assert.equal(loginCount, 2)
+    const connection = database.db.prepare(`SELECT user_id_masked AS userIdMasked,
+      credential_ciphertext AS credentialCiphertext, credential_source AS credentialSource
+      FROM psit_erp_connection WHERE id = 1`).get()
+    assert.equal(connection.userIdMasked, '')
+    assert.equal(connection.credentialCiphertext, null)
+    assert.equal(connection.credentialSource, 'environment')
+    assert.equal(service.getState().credentialSource, 'environment')
+    assert.equal(service.getState().credentialsStored, false)
+    assert.equal(service.getState().connected, true)
+    assert.equal(JSON.stringify(service.getState()).includes(userId), false)
+    assert.equal(JSON.stringify(service.getState()).includes(password), false)
+    assert.equal(JSON.stringify(diagnostics).includes(password), false)
+    assert.equal(JSON.stringify(diagnostics).includes('env-session'), false)
+  } finally {
+    for (const name of names) {
+      if (originalEnvironment[name] === undefined) delete process.env[name]
+      else process.env[name] = originalEnvironment[name]
+    }
+  }
 })
 
 test('expired ERP passwords are not stored and get an explicit password-change state', async () => {

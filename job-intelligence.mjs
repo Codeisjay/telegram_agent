@@ -578,6 +578,7 @@ export class JobDatabase {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         user_id_masked TEXT NOT NULL DEFAULT '',
         credential_ciphertext TEXT,
+        credential_source TEXT NOT NULL DEFAULT 'dashboard',
         status TEXT NOT NULL DEFAULT 'disconnected',
         connected_at TEXT,
         last_sync_at TEXT,
@@ -627,6 +628,33 @@ export class JobDatabase {
         payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS psit_erp_detected_changes (
+        id INTEGER PRIMARY KEY,
+        fingerprint TEXT NOT NULL UNIQUE,
+        source TEXT NOT NULL,
+        action TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        source_timestamp TEXT NOT NULL DEFAULT '',
+        detected_at TEXT NOT NULL,
+        delivered_at TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_scheduler_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        next_sync_at TEXT NOT NULL DEFAULT '',
+        last_successful_sync_at TEXT NOT NULL DEFAULT '',
+        last_attempt_at TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'idle',
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        failure_category TEXT NOT NULL DEFAULT '',
+        paused INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_scheduler_lock (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        owner TEXT NOT NULL DEFAULT '',
+        lease_until INTEGER NOT NULL DEFAULT 0
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -648,6 +676,14 @@ export class JobDatabase {
         VALUES (1, '{}', 1, datetime('now'));
       INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'));
     `)
+    const erpConnectionColumns = new Set(this.db.prepare('PRAGMA table_info(psit_erp_connection)').all().map((column) => column.name))
+    if (!erpConnectionColumns.has('credential_source')) {
+      this.db.exec("ALTER TABLE psit_erp_connection ADD COLUMN credential_source TEXT NOT NULL DEFAULT 'dashboard'")
+    }
+    const erpSchedulerColumns = new Set(this.db.prepare('PRAGMA table_info(psit_erp_scheduler_state)').all().map((column) => column.name))
+    if (!erpSchedulerColumns.has('last_error')) {
+      this.db.exec("ALTER TABLE psit_erp_scheduler_state ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
+    }
     const newsSettingsColumns = new Set(this.db.prepare('PRAGMA table_info(news_settings)').all().map((column) => column.name))
     for (const [column, declaration] of [
       ['interests_json', "TEXT NOT NULL DEFAULT '[]'"],
