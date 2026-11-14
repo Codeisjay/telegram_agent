@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 
 export const PSIT_ERP_URL = 'https://erp.psit.ac.in/Erp/'
 export const PSIT_ERP_PASSWORD_RESET_URL = 'https://erp.psit.ac.in/Erp/ForgetPassword'
@@ -104,6 +104,7 @@ function decodeHtml(value) {
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&nbsp;|&#160;|&#xA0;/gi, ' ')
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
 }
@@ -164,11 +165,17 @@ const diagnosticPaths = new Map([
   ['/erp/forgetpassword', '/Erp/ForgetPassword'],
   ['/student/', '/Student/'],
   ['/student', '/Student'],
+  ['/student/myattendancedetail', '/Student/MyAttendanceDetail'],
+  ['/student/mytimetable', '/Student/MyTimeTable'],
+  ['/student/library', '/Student/Library'],
 ])
 
 function safeDiagnosticUrl(url) {
   if (url.protocol !== 'https:' || url.hostname !== 'erp.psit.ac.in') return '[external origin blocked]'
-  const pathname = diagnosticPaths.get(url.pathname.toLowerCase()) || '/<redacted>'
+  const lowerPath = url.pathname.toLowerCase()
+  const pathname = /^\/student\/examcalender\/[^/]+\/?$/.test(lowerPath)
+    ? '/Student/ExamCalender/:id'
+    : diagnosticPaths.get(lowerPath) || '/<redacted>'
   return `https://erp.psit.ac.in${pathname}`
 }
 
@@ -220,6 +227,15 @@ function hasAuthenticatedStudentPage(html, url) {
     && hasLink(/timetable|time table/)
 }
 
+function hasAuthenticatedStudentSession(html) {
+  if (readLoginForm(html) || hasSessionExpiredMessage(html)) return false
+  const anchors = [...html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)]
+  return anchors.some(([, attributes, contents]) => {
+    const href = attribute(`<a ${attributes}>`, 'href')
+    return /(?:logout|log\s*out|sign\s*out)/i.test(href) || /^(?:logout|log\s*out|sign\s*out)$/i.test(pageText(contents))
+  })
+}
+
 function detectPageType(html, url) {
   if (/<input\b[^>]*(?:captcha|one.?time|verification.?code|otp)/i.test(html)
     || /(?:captcha verification required|enter (?:the )?(?:otp|one.?time password|verification code)|two.factor authentication required)/i.test(pageText(html))) {
@@ -230,6 +246,104 @@ function detectPageType(html, url) {
   if (readLoginForm(html)) return 'login'
   if (hasAuthenticatedStudentPage(html, url)) return 'authenticated_student'
   return 'unknown'
+}
+
+function htmlLines(value) {
+  return decodeHtml(value
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<br\b[^>]*>/gi, '\n')
+    .replace(/<\/(?:h[1-6]|p|div|li)\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' '))
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+}
+
+function readTable(html, headerPattern) {
+  for (const [table] of html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<table\b[^>]*>[\s\S]*?<\/table\s*>/gi)) {
+    const header = table.match(/<thead\b[^>]*>([\s\S]*?)<\/thead\s*>/i)?.[1] || ''
+    const headerRow = header.match(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/i)?.[1] || ''
+    const headers = [...headerRow.matchAll(/<th\b[^>]*>([\s\S]*?)<\/th\s*>/gi)]
+      .map(([, contents]) => htmlLines(contents).join(' '))
+    if (!headerPattern(headers)) continue
+    const body = table.match(/<tbody\b[^>]*>([\s\S]*?)<\/tbody\s*>/i)?.[1] || ''
+    const rows = [...body.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi)].map(([, row]) => (
+      [...row.matchAll(/<(?:td|th)\b[^>]*>([\s\S]*?)<\/(?:td|th)\s*>/gi)]
+        .map(([, cell]) => htmlLines(cell))
+    ))
+    return { headers, rows }
+  }
+  return null
+}
+
+function parseTimetable(html) {
+  const table = readTable(html, (headers) => /day\s*\/?\s*lecture/i.test(headers[0] || ''))
+  if (!table || table.rows.length === 0) return null
+  const slots = table.headers.slice(1).map((header, index) => {
+    const match = header.match(/(\d+)(?:st|nd|rd|th)?\s*(\d{1,2})[.:](\d{2})-(\d{1,2})[.:](\d{2})/i)
+    if (!match) return null
+    let startHour = Number(match[2])
+    let endHour = Number(match[4])
+    if (index >= 4 && startHour < 12) startHour += 12
+    if (index >= 4 && endHour < 12) endHour += 12
+    const pad = (value) => String(value).padStart(2, '0')
+    return {
+      period: Number(match[1]),
+      startTime: `${pad(startHour)}:${match[3]}`,
+      endTime: `${pad(endHour)}:${match[5]}`,
+    }
+  })
+  const days = table.rows.map((row) => {
+    const day = row[0]?.join(' ').trim()
+    if (!day || !/^(?:mon|tue|wed|thu|fri|sat|sun)/i.test(day)) return null
+    const periods = row.slice(1).flatMap((lines, index) => {
+      if (!lines.length || !slots[index]) return []
+      return [{
+        ...slots[index],
+        subject: lines[0] || '',
+        faculty: lines[1] || '',
+        room: lines[2] || '',
+      }]
+    })
+    return { day, periods }
+  }).filter(Boolean)
+  return days.length ? { headers: table.headers, days } : null
+}
+
+function parseExamCalendar(html) {
+  const table = readTable(html, (headers) => /examination/i.test(headers[0] || ''))
+  if (!table) return null
+  const exams = table.rows.map((row) => Object.fromEntries(
+    table.headers.slice(0, row.length).map((header, index) => [header, row[index].join(' ').trim()]),
+  )).filter((row) => Object.values(row).some(Boolean))
+  return exams.length ? { headers: table.headers, exams } : null
+}
+
+function findAnchorByText(html, pattern) {
+  for (const [, attributes, contents] of html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
+    if (pattern.test(htmlLines(contents).join(' '))) return attribute(`<a ${attributes}>`, 'href')
+  }
+  return ''
+}
+
+function parseNotices(html, capturedAt) {
+  const notices = []
+  for (const [, attributes, contents] of html.replace(/<!--[\s\S]*?-->/g, '').matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
+    const title = htmlLines(contents).join(' ').slice(0, 500)
+    const href = attribute(`<a ${attributes}>`, 'href')
+    if (!title || !href || !/\/assets\/notice\//i.test(href)) continue
+    let url
+    try {
+      url = new URL(href, PSIT_ERP_URL)
+    } catch {
+      continue
+    }
+    if (url.origin !== new URL(PSIT_ERP_URL).origin || !/^\/assets\/notice\//i.test(url.pathname)) continue
+    const fingerprint = createHash('sha256').update(`${title}\n${url.pathname}`).digest('hex')
+    notices.push({ fingerprint, title, publishedAt: '', url: url.href, capturedAt })
+  }
+  return [...new Map(notices.map((notice) => [notice.fingerprint, notice])).values()]
 }
 
 async function requestOfficial(urlValue, options, cookies, fetchImpl, trace) {
@@ -286,7 +400,7 @@ async function requestOfficial(urlValue, options, cookies, fetchImpl, trace) {
   return { tooManyRedirects: true, url, trace }
 }
 
-function finishAuthentication(status, pageType, trace, onDiagnostic) {
+function finishAuthentication(status, pageType, trace, onDiagnostic, privateSession = {}) {
   const diagnostic = {
     responses: trace.map(({ method, status: httpStatus, requestUrl, redirectUrl }) => ({
       method,
@@ -298,7 +412,7 @@ function finishAuthentication(status, pageType, trace, onDiagnostic) {
     authenticationState: status,
   }
   onDiagnostic(diagnostic)
-  return { status, pageType }
+  return { status, pageType, ...privateSession }
 }
 
 function isTemporaryHttpFailure(status) {
@@ -394,7 +508,63 @@ async function authenticate(credentials, fetchImpl, onDiagnostic) {
   } else if (result.response.ok && pageType === 'authenticated_student') {
     status = 'connected'
   }
-  return finishAuthentication(status, pageType, trace, onDiagnostic)
+  return finishAuthentication(status, pageType, trace, onDiagnostic, status === 'connected'
+    ? { cookies, studentHtml: html }
+    : {})
+}
+
+function reportStudentPageDiagnostic(onDiagnostic, trace, pageType, status) {
+  onDiagnostic({
+    responses: trace.map(({ method, status: httpStatus, requestUrl, redirectUrl }) => ({
+      method,
+      httpStatus,
+      requestUrl,
+      redirectUrl,
+    })),
+    pageType,
+    authenticationState: status,
+  })
+}
+
+async function fetchStudentPage(path, cookies, fetchImpl, onDiagnostic) {
+  const trace = []
+  const result = await requestOfficial(new URL(path, PSIT_ERP_URL), {}, cookies, fetchImpl, trace)
+  if (result.networkError) {
+    reportStudentPageDiagnostic(onDiagnostic, trace, 'unreachable', 'network_error')
+    return { status: 'network_error' }
+  }
+  if (result.blockedRedirect || result.tooManyRedirects || result.invalidRedirect || !result.response) {
+    reportStudentPageDiagnostic(onDiagnostic, trace, 'unknown', 'unknown_response')
+    return { status: 'unknown_response' }
+  }
+  let html
+  try {
+    html = await result.response.text()
+  } catch {
+    reportStudentPageDiagnostic(onDiagnostic, trace, 'unreadable_response', 'network_error')
+    return { status: 'network_error' }
+  }
+  if (html.length > 2_000_000) {
+    reportStudentPageDiagnostic(onDiagnostic, trace, 'oversized_response', 'unknown_response')
+    return { status: 'unknown_response' }
+  }
+  const pageType = detectPageType(html, result.url)
+  if (pageType === 'login' || pageType === 'session_expired') {
+    reportStudentPageDiagnostic(onDiagnostic, trace, pageType, 'session_expired')
+    return { status: 'session_expired' }
+  }
+  if (isTemporaryHttpFailure(result.response.status)) {
+    reportStudentPageDiagnostic(onDiagnostic, trace, pageType, 'network_error')
+    return { status: 'network_error' }
+  }
+  const expectedPath = new URL(path, PSIT_ERP_URL).pathname.toLowerCase()
+  if (!result.response.ok || result.url.pathname.toLowerCase() !== expectedPath
+    || !hasAuthenticatedStudentSession(html)) {
+    reportStudentPageDiagnostic(onDiagnostic, trace, pageType, 'unknown_response')
+    return { status: 'unknown_response' }
+  }
+  reportStudentPageDiagnostic(onDiagnostic, trace, pageType, 'connected')
+  return { status: 'connected', html }
 }
 
 export class PsitErpService {
@@ -424,6 +594,17 @@ export class PsitErpService {
       completed_at AS completedAt, message FROM psit_erp_sync_history ORDER BY id DESC LIMIT 20`).all()
     const credentialsStored = Boolean(this.getCredentialRecord()?.credentialCiphertext)
     const connected = credentialsStored && connection?.status === 'connected'
+    const timetable = snapshots.timetable ? JSON.parse(snapshots.timetable.dataJson) : null
+    const academic = snapshots.academic ? JSON.parse(snapshots.academic.dataJson) : null
+    const noticesData = snapshots.notices.map((notice) => JSON.parse(notice.dataJson))
+    const availability = {
+      attendance: Boolean(snapshots.attendance),
+      timetable: Boolean(timetable),
+      marks: Boolean(academic?.marks),
+      examCalendar: Boolean(academic?.examCalendar),
+      notices: noticesData.length > 0,
+      library: Boolean(academic?.library),
+    }
     return {
       connected,
       credentialsStored,
@@ -432,18 +613,19 @@ export class PsitErpService {
       connectedAt: connection?.connectedAt || null,
       lastSyncAt: connection?.lastSyncAt || null,
       encryptionConfigured: this.hasEncryptionKey(),
-      dataRetrievalAvailable: false,
+      dataRetrievalAvailable: availability.timetable || availability.examCalendar || availability.notices,
+      availability,
       data: {
         attendance: snapshots.attendance ? JSON.parse(snapshots.attendance.dataJson) : null,
         attendanceUpdatedAt: snapshots.attendance?.capturedAt || null,
-        timetable: snapshots.timetable ? JSON.parse(snapshots.timetable.dataJson) : null,
+        timetable,
         timetableUpdatedAt: snapshots.timetable?.capturedAt || null,
-        academic: snapshots.academic ? JSON.parse(snapshots.academic.dataJson) : null,
+        academic,
         academicUpdatedAt: snapshots.academic?.updatedAt || null,
-        notices: snapshots.notices.map((notice) => JSON.parse(notice.dataJson)),
+        notices: noticesData,
       },
       history,
-      limitation: 'PSIT student pages and supported data endpoints have not yet been mapped. No academic records are being retrieved or inferred.',
+      limitation: 'Timetable, academic notices and the exam calendar can be synced from the authenticated student portal. Attendance percentages, internal marks and library account details remain unavailable because their values cannot yet be reliably mapped.',
     }
   }
 
@@ -533,10 +715,72 @@ export class PsitErpService {
       this.recordSync(status, message)
       return { status, message }
     }
-    const message = authenticationMessage('connected', true)
+    const capturedAt = new Date().toISOString()
+    const notices = parseNotices(result.studentHtml, capturedAt)
+    const timetablePage = await fetchStudentPage('/Student/MyTimeTable', result.cookies, this.fetchImpl, this.onDiagnostic)
+    if (timetablePage.status === 'session_expired') {
+      const message = authenticationMessage('session_expired', true)
+      this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.recordSync('session_expired', message)
+      return { status: 'session_expired', message }
+    }
+    const timetable = timetablePage.status === 'connected' ? parseTimetable(timetablePage.html) : null
+    let examCalendar = null
+    const examHref = findAnchorByText(result.studentHtml, /^Exam Calendar$/i)
+    if (examHref) {
+      let examUrl
+      try {
+        examUrl = new URL(examHref, PSIT_ERP_URL)
+      } catch {
+        examUrl = null
+      }
+      if (examUrl?.origin === new URL(PSIT_ERP_URL).origin
+        && /^\/student\/examcalender\/[^/]+\/?$/i.test(examUrl.pathname)) {
+        const calendarPage = await fetchStudentPage(examUrl.href, result.cookies, this.fetchImpl, this.onDiagnostic)
+        if (calendarPage.status === 'session_expired') {
+          const message = authenticationMessage('session_expired', true)
+          this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+          this.recordSync('session_expired', message)
+          return { status: 'session_expired', message }
+        }
+        if (calendarPage.status === 'connected') examCalendar = parseExamCalendar(calendarPage.html)
+      }
+    }
+
+    const database = this.database.db
+    if (timetable) {
+      database.prepare(`INSERT INTO psit_erp_timetable_snapshots(captured_at, week_of, data_json)
+        VALUES (?, ?, ?)`).run(capturedAt, '', JSON.stringify(timetable))
+    }
+    if (examCalendar) {
+      database.prepare(`INSERT INTO psit_erp_academic_records(record_type, source_id, data_json, updated_at)
+        VALUES ('exam-calendar', 'student', ?, ?)
+        ON CONFLICT(record_type, source_id) DO UPDATE SET data_json = excluded.data_json,
+          updated_at = excluded.updated_at`).run(JSON.stringify({ examCalendar }), capturedAt)
+    }
+    const insertNotice = database.prepare(`INSERT OR IGNORE INTO psit_erp_notices(
+      fingerprint, title, published_at, data_json
+    ) VALUES (?, ?, ?, ?)`)
+    for (const notice of [...notices].reverse()) {
+      insertNotice.run(notice.fingerprint, notice.title, notice.publishedAt, JSON.stringify(notice))
+    }
+
+    const sources = [
+      timetable ? 'weekly timetable' : null,
+      examCalendar ? 'exam calendar' : null,
+      notices.length ? `${notices.length} notices` : null,
+    ].filter(Boolean)
+    if (!sources.length) {
+      const message = 'Login was verified, but none of the mapped timetable, exam-calendar or notice pages returned recognizable data.'
+      this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.recordSync('data-source-pending', message)
+      return { status: 'data-source-pending', message }
+    }
+    const message = `Synced ${sources.join(', ')}. Attendance percentages, internal marks and library account details remain unmapped; no values were inferred.`
     this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
-    this.recordSync('data-source-pending', message)
-    return { status: 'data-source-pending', message }
+    database.prepare('UPDATE psit_erp_connection SET last_sync_at = ? WHERE id = 1').run(capturedAt)
+    this.recordSync('partial', message)
+    return { status: 'partial', message }
   }
 
   disconnect() {
@@ -566,11 +810,80 @@ export function formatErpAnswer(operation, state) {
   if (!label) return null
   if (operation === 'status') {
     return state.connected
-      ? `PSIT ERP is connected for ${state.userIdMasked}. ${state.lastSyncAt ? `Last successful data sync: ${state.lastSyncAt}.` : 'No academic data sync has completed.'} Student-data retrieval is pending page/API mapping.`
+      ? `PSIT ERP is connected for ${state.userIdMasked}. ${state.lastSyncAt ? `Last data sync: ${state.lastSyncAt}.` : 'No data sync has completed.'} Verified sources: ${['timetable', 'notices', 'examCalendar'].filter((source) => state.availability?.[source]).join(', ') || 'none synced'}.`
       : 'PSIT ERP is not connected. Connect it from the dashboard’s PSIT ERP section; never send ERP credentials in Telegram.'
   }
-  if (!state.dataRetrievalAvailable) {
-    return `I can’t provide ${label} yet: PSIT’s authenticated student pages and data endpoints have not been mapped. No academic data has been retrieved or fabricated. Check the dashboard’s PSIT ERP section for connection and sync status.`
+  const unavailable = () => `I can’t provide ${label} yet: that information has not been verified from the authenticated ERP pages. No academic data has been retrieved or fabricated.`
+  const timeTable = state.data?.timetable
+  const examCalendar = state.data?.academic?.examCalendar
+  const notices = state.data?.notices || []
+  const weekday = (offset = 0) => {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date())
+    const part = (type) => Number(parts.find((item) => item.type === type)?.value)
+    const date = new Date(Date.UTC(part('year'), part('month') - 1, part('day') + offset))
+    return new Intl.DateTimeFormat('en-US', { weekday: 'long', timeZone: 'UTC' }).format(date)
+  }
+  const formatDay = (dayName) => {
+    const day = timeTable?.days?.find((item) => item.day.toLowerCase().startsWith(dayName.toLowerCase()))
+    if (!day) return `No verified timetable entry for ${dayName}.`
+    if (!day.periods.length) return `${day.day}: no scheduled lectures were listed.`
+    return `${day.day}:\n${day.periods.map((period) => {
+      const details = [period.subject, period.faculty, period.room].filter(Boolean).join(' · ')
+      return `${period.startTime}-${period.endTime}: ${details}`
+    }).join('\n')}`
+  }
+  const minutesAfterMidnight = (value) => {
+    const match = String(value || '').match(/^(\d{2}):(\d{2})$/)
+    return match ? Number(match[1]) * 60 + Number(match[2]) : Number.POSITIVE_INFINITY
+  }
+  const formatNotices = () => notices.length
+    ? `Recent verified notices:\n${notices.slice(0, 8).map((notice) => `• ${notice.title}`).join('\n')}`
+    : unavailable()
+
+  if (operation === 'attendance') return unavailable()
+  if (operation === 'marks') return unavailable()
+  if (operation === 'student-services') return unavailable()
+  if (operation === 'notices') return formatNotices()
+  if (operation === 'timetable-today') return timeTable ? formatDay(weekday()) : unavailable()
+  if (operation === 'timetable-tomorrow') return timeTable ? formatDay(weekday(1)) : unavailable()
+  if (operation === 'timetable-week') {
+    return timeTable
+      ? timeTable.days.map((day) => formatDay(day.day)).join('\n\n')
+      : unavailable()
+  }
+  if (operation === 'next-lecture') {
+    if (!timeTable) return unavailable()
+    const nowParts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(new Date())
+    const now = Number(nowParts.find((part) => part.type === 'hour')?.value) * 60
+      + Number(nowParts.find((part) => part.type === 'minute')?.value)
+    for (let offset = 0; offset < 7; offset += 1) {
+      const dayName = weekday(offset)
+      const day = timeTable.days.find((item) => item.day.toLowerCase().startsWith(dayName.toLowerCase()))
+      const lecture = day?.periods.find((period) => offset > 0 || minutesAfterMidnight(period.startTime) > now)
+      if (lecture) return `Next lecture: ${day.day}, ${lecture.startTime}-${lecture.endTime}: ${[lecture.subject, lecture.faculty, lecture.room].filter(Boolean).join(' · ')}.`
+    }
+    return 'No upcoming lecture was listed in the verified weekly timetable.'
+  }
+  if (operation === 'academic-summary') {
+    const sections = []
+    if (timeTable) sections.push(formatDay(weekday()))
+    if (examCalendar?.exams?.length) {
+      sections.push(`Verified exam calendar:\n${examCalendar.exams.map((exam) => Object.entries(exam).map(([name, value]) => `${name}: ${value}`).join(' · ')).join('\n')}`)
+    }
+    if (notices.length) sections.push(formatNotices())
+    if (!sections.length) return unavailable()
+    sections.push('Attendance percentages and internal marks are not available from the mapped pages.')
+    return sections.join('\n\n')
   }
   return null
 }

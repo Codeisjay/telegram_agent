@@ -23,7 +23,20 @@ const loginPage = `<form action="https://erp.psit.ac.in/Erp/Auth" method="POST">
 const authenticatedStudentPage = `<html><head><title>Notice Dashboard For Student</title></head><body>
   <a href="/Student/Logout">Logout</a><a href="/Student/Profile">My Profile</a>
   <a href="/Student/Attendance">Attendance</a><a href="/Student/TimeTable">Timetable</a>
+  <a href="/Student/ExamCalender/2026">Exam Calendar</a>
+  <a href="/assets/Notice/notice-a.pdf">Important test notice</a>
 </body></html>`
+const authenticatedTimetablePage = `<a href="/Student/Logout">Logout</a><table>
+  <thead><tr><th>Day/ Lecture</th><th>1st 09.15-10.05</th><th>2nd 10.05-10.55</th></tr></thead>
+  <tbody>
+    <tr><td>Monday</td><td><h5>Subject A<br>Faculty A<br>Room 101</h5></td><td></td></tr>
+    <tr><td>Tuesday</td><td></td><td><h5>Subject B<br>Faculty B<br>Room 102</h5></td></tr>
+  </tbody>
+</table>`
+const authenticatedExamCalendarPage = `<a href="/Student/Logout">Logout</a><table>
+  <thead><tr><th>Examination</th><th>CT I</th><th>CT II</th><th>PU</th></tr></thead>
+  <tbody><tr><td>Semester Test</td><td>2026-11-20</td><td>2026-12-10</td><td>2027-01-05</td></tr></tbody>
+</table>`
 
 after(async () => {
   for (const database of databases) database.close()
@@ -55,15 +68,28 @@ test('natural-language ERP requests resolve only to validated local operations',
     connected: false,
     dataRetrievalAvailable: false,
   }), /No academic data has been retrieved or fabricated/)
+  const cachedState = {
+    connected: true,
+    availability: { timetable: true, notices: true, examCalendar: true },
+    data: {
+      timetable: { days: [{ day: 'Monday', periods: [{ startTime: '09:15', endTime: '10:05', subject: 'Computer Science', faculty: 'Faculty A', room: 'Room 101' }] }] },
+      academic: { examCalendar: { exams: [{ Examination: 'CT I', Date: '2026-11-20' }] } },
+      notices: [{ title: 'Assignment deadline notice' }],
+    },
+  }
+  assert.match(formatErpAnswer('timetable-week', cachedState), /Computer Science/)
+  assert.match(formatErpAnswer('notices', cachedState), /Assignment deadline notice/)
+  assert.match(formatErpAnswer('academic-summary', cachedState), /CT I/)
   assert.equal(resolveErpOperation('Tell me a joke'), null)
 })
 
-test('ERP connection stores encrypted credentials, reports unmapped pages, and disconnects cleanly', async () => {
+test('ERP connection stores encrypted credentials and syncs verified student pages', async () => {
   const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-connection.sqlite'))
   databases.push(database)
   const requests = []
   const diagnostics = []
   let studentPageReceivedCookie = false
+  let timetablePageReceivedCookie = false
   const fetchImpl = async (url, options = {}) => {
     const requestUrl = new URL(url)
     requests.push({ url: requestUrl, options })
@@ -72,6 +98,13 @@ test('ERP connection stores encrypted credentials, reports unmapped pages, and d
         status: 302,
         headers: { location: '/Student/', 'set-cookie': 'ci_session=verified-session; Path=/; HttpOnly' },
       })
+    }
+    if (requestUrl.pathname === '/Student/MyTimeTable') {
+      timetablePageReceivedCookie = new Headers(options.headers).get('cookie') === 'ci_session=verified-session'
+      return new Response(authenticatedTimetablePage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/ExamCalender/2026') {
+      return new Response(authenticatedExamCalendarPage, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/') {
       studentPageReceivedCookie = new Headers(options.headers).get('cookie') === 'ci_session=verified-session'
@@ -109,8 +142,20 @@ test('ERP connection stores encrypted credentials, reports unmapped pages, and d
   assert.equal(JSON.stringify(diagnostics).includes('student-12345'), false)
   assert.equal(JSON.stringify(diagnostics).includes('verified-session'), false)
   const resultSync = await service.sync()
-  assert.equal(resultSync.status, 'data-source-pending')
-  assert.equal(service.getState().history[0].status, 'data-source-pending')
+  assert.equal(resultSync.status, 'partial')
+  assert.equal(timetablePageReceivedCookie, true)
+  const syncedState = service.getState()
+  assert.equal(syncedState.history[0].status, 'partial')
+  assert.equal(syncedState.lastSyncAt !== null, true)
+  assert.equal(syncedState.availability.timetable, true)
+  assert.equal(syncedState.availability.examCalendar, true)
+  assert.equal(syncedState.availability.notices, true)
+  assert.equal(syncedState.availability.attendance, false)
+  assert.equal(syncedState.data.timetable.days[0].periods[0].subject, 'Subject A')
+  assert.equal(syncedState.data.academic.examCalendar.exams[0]['CT I'], '2026-11-20')
+  assert.equal(syncedState.data.notices.length, 1)
+  await service.sync()
+  assert.equal(database.db.prepare('SELECT COUNT(*) AS count FROM psit_erp_notices').get().count, 1)
   assert.equal(service.disconnect().disconnected, true)
   assert.equal(service.getState().connected, false)
   assert.equal(service.getState().credentialsStored, false)
