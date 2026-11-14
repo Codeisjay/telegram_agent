@@ -56,6 +56,7 @@ for (const name of [
   }
 }
 const {
+  formatErpChangeNotification,
   formatErpAnswer,
   PSIT_ERP_PASSWORD_RESET_URL,
   PsitErpService,
@@ -101,23 +102,7 @@ const psitErp = new PsitErpService({
     const secrets = await readSecrets()
     const chatId = await getCompanionNotificationChatId()
     if (!secrets.TELEGRAM_BOT_TOKEN || !chatId) return false
-    const message = `PSIT ERP update:\n${changes.map((change) => {
-      const source = {
-        'attendance-request': 'Attendance request',
-        'online-training': 'Online training result',
-        'od-request': 'OD request',
-        attendance: 'Attendance',
-        timetable: 'Timetable',
-        marks: 'Academic marks',
-        'exam-calendar': 'Exam calendar',
-        notices: 'Academic notice',
-      }[change.page] || 'Student record'
-      const action = change.action === 'new'
-        ? 'New record'
-        : change.action === 'deleted' ? 'Record removed or withdrawn' : 'Record updated'
-      const timestamp = change.sourceTimestamp ? ` [${change.sourceTimestamp}]` : ''
-      return `• ${source}: ${action}${change.label ? ` — ${change.label}` : ''}${change.status ? ` (${change.status})` : ''}${timestamp}`
-    }).join('\n')}`
+    const message = `PSIT ERP updates:\n${changes.map(formatErpChangeNotification).join('\n')}`
     await sendTelegramMessage(chatId, message)
     return true
   },

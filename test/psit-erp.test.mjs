@@ -7,6 +7,7 @@ import {
   decryptErpCredentials,
   encryptErpCredentials,
   formatErpAnswer,
+  formatErpChangeNotification,
   getErpEncryptionKey,
   PsitErpService,
   resolveErpOperation,
@@ -107,6 +108,23 @@ test('natural-language ERP requests resolve only to validated local operations',
   assert.equal(resolveErpOperation('Any attendance request updates?'), 'attendance-requests')
   assert.equal(resolveErpOperation('Give me my academic summary for this week'), 'academic-summary')
   assert.equal(resolveErpOperation('What are my outstanding library dues?'), 'student-services')
+  assert.equal(
+    formatErpChangeNotification({
+      page: 'od-request',
+      action: 'updated',
+      label: 'Request #OD-200 · Dates: 2026-11-11 to 2026-11-11',
+      status: 'Verification: Approved; HOD: Pending; Director: Pending',
+      sourceTimestamp: '2026-11-11 09:00',
+    }),
+    '• On-duty (OD) request — review status changed: Request #OD-200 · Dates: 2026-11-11 to 2026-11-11 · Verification: Approved; HOD: Pending; Director: Pending · Submitted: 2026-11-11 09:00',
+  )
+  assert.match(formatErpChangeNotification({
+    page: 'attendance-request',
+    action: 'updated',
+    label: 'Request #REQ-100 · Dates: 2026-11-10 to 2026-11-10',
+    status: 'Coordinator: Rejected; HOD: Pending',
+    sourceTimestamp: '2026-11-09',
+  }), /Coordinator: Rejected/)
   assert.equal(validateErpOperation('arbitrary-sql'), null)
   assert.match(formatErpAnswer('attendance', {
     connected: false,
@@ -288,8 +306,12 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(notifications.length, 2)
   assert.equal(notifications[1].page, 'od-request')
   assert.equal(notifications[1].action, 'updated')
-  assert.match(notifications[1].status, /Approved/)
+  assert.match(notifications[1].status, /Verification: Approved/)
+  assert.match(notifications[1].status, /HOD: Pending/)
+  assert.match(notifications[1].label, /Request #OD-200/)
   assert.equal(notifications[1].sourceTimestamp, '2026-11-11 09:00')
+  assert.match(formatErpChangeNotification(notifications[1]), /review status changed/)
+  assert.match(formatErpChangeNotification(notifications[1]), /2026-11-11 09:00/)
   assert.equal(JSON.stringify(notifications).includes('Private OD reason'), false)
   await service.sync()
   assert.equal(notifications.length, 2)

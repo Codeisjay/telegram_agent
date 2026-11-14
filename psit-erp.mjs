@@ -418,6 +418,28 @@ function parseExamCalendar(html) {
   return exams.length ? { headers: table.headers, exams } : null
 }
 
+function summarizeActivityStatus(cells) {
+  const statuses = []
+  for (const { header, value } of cells) {
+    if (!value) continue
+    const state = value.match(/\b(not\s+approved|not\s+verified|under\s+review|in\s+progress|approved|accepted|rejected|declined|denied|pending|verified|forwarded|withdrawn|cancelled)\b/i)?.[0]
+    const metric = /marks?\s*\/?\s*out\s*of/i.test(header)
+      || /percentage|score/i.test(header)
+    if (!state && !metric) continue
+    const stage = /director/i.test(header) ? 'Director'
+      : /h\.?\s*o\.?\s*d|head\s+of\s+department/i.test(header) ? 'HOD'
+        : /coordinator/i.test(header) ? 'Coordinator'
+          : /verif/i.test(header) ? 'Verification'
+            : /approval/i.test(header) ? 'Approval'
+              : /marks?\s*\/?\s*out\s*of/i.test(header) ? 'Score'
+                : /percentage/i.test(header) ? 'Percentage'
+                  : /score/i.test(header) ? 'Score'
+                    : /result/i.test(header) ? 'Result' : 'Status'
+    statuses.push(`${stage}: ${state ? state.replace(/\s+/g, ' ').replace(/\b[a-z]/g, (letter) => letter.toUpperCase()) : value}`)
+  }
+  return [...new Set(statuses)].join('; ')
+}
+
 function parseActivityPage(html, kind) {
   const table = readTable(html, (headers) => {
     if (kind === 'attendance-request') return /req\.?\s*id/i.test(headers[0] || '')
@@ -440,14 +462,22 @@ function parseActivityPage(html, kind) {
       : values.slice(0, 1)
     const key = identity.join('|').trim()
     if (!key) return null
-    const status = cells
-      .filter(({ header }) => /status|approval|coordinator|h\.?o\.?d|result|verify|director|marks|percentage|score/i.test(header))
-      .map(({ value }) => value)
-      .filter(Boolean)
-      .join(' · ')
+    const status = summarizeActivityStatus(cells)
     const label = kind === 'online-training'
-      ? [values[2], values[1]].filter(Boolean).join(' · ')
-      : status || `${kind === 'attendance-request' ? 'Attendance' : 'OD'} request`
+      ? [values[2] && `Test: ${values[2]}`, values[1] && `Exam date: ${values[1]}`].filter(Boolean).join(' · ')
+      : (() => {
+        const requestId = cells.find(({ header }) => /^(?:request|req|od)\s*[-.]?\s*(?:id|no|number)$/i.test(header.trim()))?.value || values[0]
+        const requestType = cells.find(({ header }) => /^(?:request\s*)?(?:type|category)$/i.test(header.trim()))?.value
+        const dates = cells
+          .filter(({ header, value }) => value && /date/i.test(header) && !/submitted|exam/i.test(header))
+          .map(({ value }) => value)
+        const dateSummary = [...new Set(dates)].join(' to ')
+        return [
+          requestId && `Request #${requestId}`,
+          requestType && `Type: ${requestType}`,
+          dateSummary && `Dates: ${dateSummary}`,
+        ].filter(Boolean).join(' · ') || `${kind === 'attendance-request' ? 'Attendance' : 'On-duty'} request`
+      })()
     const timestamp = cells.find(({ header }) => /submitted|exam\s*date|request\s*date/i.test(header))?.value || ''
     return { key, values, label: label.slice(0, 160), status: status.slice(0, 120), sourceTimestamp: timestamp }
   }).filter(Boolean)
@@ -1436,6 +1466,38 @@ export class PsitErpService {
       failure_category = '', paused = 0, updated_at = ? WHERE id = 1`).run(new Date().toISOString())
     return { disconnected: true }
   }
+}
+
+export function formatErpChangeNotification(change) {
+  const sources = {
+    'attendance-request': 'Attendance request',
+    'online-training': 'Online training result',
+    'od-request': 'On-duty (OD) request',
+    attendance: 'Attendance',
+    timetable: 'Timetable',
+    marks: 'Academic marks',
+    'exam-calendar': 'Exam calendar',
+    notices: 'Academic notice',
+  }
+  const source = sources[change.page] || 'Student record'
+  if (['attendance-request', 'od-request', 'online-training'].includes(change.page)) {
+    if (change.action === 'deleted') {
+      return `• ${source} no longer appears in the ERP list: ${change.label || 'record'}`
+    }
+    const action = change.page === 'online-training'
+      ? change.action === 'new' ? 'new result' : 'result updated'
+      : change.action === 'new' ? 'new request' : change.status ? 'review status changed' : 'request updated'
+    const status = change.status || 'The ERP page did not show an approval status.'
+    const submitted = change.sourceTimestamp && change.page !== 'online-training'
+      ? ` · Submitted: ${change.sourceTimestamp}`
+      : ''
+    return `• ${source} — ${action}: ${change.label || 'record'} · ${status}${submitted}`
+  }
+  const action = change.action === 'new'
+    ? 'New record'
+    : change.action === 'deleted' ? 'Record removed or withdrawn' : 'Record updated'
+  const timestamp = change.sourceTimestamp ? ` · ${change.sourceTimestamp}` : ''
+  return `• ${source}: ${action}${change.label ? ` — ${change.label}` : ''}${change.status ? ` (${change.status})` : ''}${timestamp}`
 }
 
 export function formatErpAnswer(operation, state) {
