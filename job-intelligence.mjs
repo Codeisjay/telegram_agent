@@ -574,6 +574,54 @@ export class JobDatabase {
         delivered_count INTEGER NOT NULL DEFAULT 0,
         error TEXT NOT NULL DEFAULT ''
       );
+      CREATE TABLE IF NOT EXISTS psit_erp_connection (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        user_id_masked TEXT NOT NULL DEFAULT '',
+        credential_ciphertext TEXT,
+        status TEXT NOT NULL DEFAULT 'disconnected',
+        connected_at TEXT,
+        last_sync_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_attendance_snapshots (
+        id INTEGER PRIMARY KEY,
+        captured_at TEXT NOT NULL,
+        overall_percent REAL,
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_timetable_snapshots (
+        id INTEGER PRIMARY KEY,
+        captured_at TEXT NOT NULL,
+        week_of TEXT NOT NULL DEFAULT '',
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_academic_records (
+        id INTEGER PRIMARY KEY,
+        record_type TEXT NOT NULL,
+        source_id TEXT NOT NULL DEFAULT '',
+        data_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(record_type, source_id)
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_notices (
+        id INTEGER PRIMARY KEY,
+        fingerprint TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        published_at TEXT NOT NULL DEFAULT '',
+        data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_sync_history (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_notification_fingerprints (
+        fingerprint TEXT PRIMARY KEY,
+        notification_type TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),

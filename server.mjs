@@ -25,6 +25,12 @@ import {
   parseNaturalLanguageEvent,
   toMinutesOfDay,
 } from './companion-intelligence.mjs'
+import {
+  formatErpAnswer,
+  PSIT_ERP_PASSWORD_RESET_URL,
+  PsitErpService,
+  resolveErpOperation,
+} from './psit-erp.mjs'
 
 const production = process.env.NODE_ENV === 'production'
 const host = process.env.AGENTFLOW_HOST || (production ? '0.0.0.0' : '127.0.0.1')
@@ -70,6 +76,11 @@ const defaultWhitelistId = '1207882899'
 const agent = { running: false, status: 'stopped', message: 'Agent is stopped.', events: [], controller: null, task: null, settings: null }
 const userRequests = new Map()
 const database = await JobDatabase.open(databaseFile)
+const psitErpEnvironment = await readEnvFile(projectEnvFile)
+const psitErp = new PsitErpService({
+  database,
+  encryptionKey: process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY || psitErpEnvironment.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY,
+})
 const companionStore = process.env.DATABASE_URL
   ? await PostgresCompanionStore.open(process.env.DATABASE_URL)
   : database
@@ -213,6 +224,33 @@ function isDashboardAuthorized(request) {
   if (separator < 0) return false
   return safeStringEqual(decoded.slice(0, separator), dashboardUsername)
     && safeStringEqual(decoded.slice(separator + 1), dashboardPassword)
+}
+
+function validateErpDashboardRequest(request) {
+  const origin = request.headers.origin
+  if (origin) {
+    let originUrl
+    try {
+      originUrl = new URL(origin)
+    } catch {
+      throw serviceError('Invalid request origin.', 403)
+    }
+    const dashboardUrl = process.env.AGENTFLOW_DASHBOARD_URL
+      || (production ? `https://${request.headers.host}` : 'http://localhost:5173')
+    const dashboardHost = new URL(dashboardUrl).host
+    if (![request.headers.host, dashboardHost].includes(originUrl.host)
+      || (production && originUrl.protocol !== 'https:')) {
+      throw serviceError('Cross-origin ERP requests are not allowed.', 403)
+    }
+  }
+  if (production && request.headers['x-forwarded-proto'] !== 'https') {
+    throw serviceError('PSIT credentials can only be submitted over HTTPS.', 400)
+  }
+}
+
+function isLoopbackAddress(address = '') {
+  return address === '::1' || address === '127.0.0.1' || address.startsWith('127.')
+    || address.startsWith('::ffff:127.')
 }
 
 function isNewsCronAuthorized(request) {
@@ -605,7 +643,14 @@ async function tavilySearch(query, secrets, maxResults) {
   }
 }
 
+function containsCredentialText(query) {
+  return /\b(?:password|passcode|passwd|credentials?)\s*(?:is|are|[:=])\s*\S+|\b(?:my|erp)\s+(?:login\s+)?(?:password|username|user\s*id)\s+is\b/i.test(query)
+}
+
 async function runAgentQuery(query, settings, secrets) {
+  if (containsCredentialText(query)) {
+    throw serviceError('Do not send ERP credentials to the AI assistant. Enter them only in the dashboard’s PSIT ERP form.', 400)
+  }
   const provider = settings.provider
   let sources = ''
   let answer = ''
@@ -1639,10 +1684,15 @@ async function handleTelegramUpdate(update, settings) {
   const commandText = text.split(/\s+/)[0].split('@')[0].toLowerCase()
   const username = message.from?.username ? `@${message.from.username}` : `user ${userId}`
 
-  logEvent('INFO', `Telegram message from ${username}: ${text.slice(0, 100)}`, 'webhooks')
+  logEvent('INFO', `Telegram message from ${username} (${text.length} characters)`, 'webhooks')
   if (!isTelegramUserAuthorized(settings, userId, chatId)) {
     await sendTelegramMessage(chatId, `This bot is restricted to approved users. Ask the owner to add your Telegram user ID: ${userId}`)
     logEvent('403 FORBIDDEN', `Rejected unauthorized Telegram user ${userId}`, 'errors')
+    return
+  }
+
+  if (containsCredentialText(text)) {
+    await sendTelegramMessage(chatId, 'Do not send ERP credentials in Telegram. Enter them only in the dashboard’s PSIT ERP form.')
     return
   }
 
@@ -1652,6 +1702,11 @@ async function handleTelegramUpdate(update, settings) {
 
   if (commandText === '/start') {
     await sendTelegramMessage(chatId, 'Hi! I’m your AgentFlow research assistant. Send /search followed by a question, or send me a question directly.')
+    return
+  }
+  const erpOperation = resolveErpOperation(text)
+  if (erpOperation) {
+    await sendTelegramMessage(chatId, formatErpAnswer(erpOperation, psitErp.getState()))
     return
   }
   if (commandText === '/clear') {
@@ -1999,6 +2054,13 @@ async function startTelegramAgentOnce(inputSettings, generation) {
   if (webhookInfo.url) throw serviceError('This bot has a webhook configured. Remove the webhook in Telegram before using local polling.', 409)
 
   const jobCommands = [
+    ['/erp', 'Show PSIT ERP connection status'],
+    ['/attendance', 'Show PSIT attendance'],
+    ['/timetable', "Show today's PSIT timetable"],
+    ['/tomorrow', "Show tomorrow's PSIT timetable"],
+    ['/marks', 'Show PSIT academic marks'],
+    ['/notices', 'Show PSIT academic notices'],
+    ['/academic_summary', 'Show PSIT academic summary'],
     ['/today', 'Show verified new job openings'],
     ['/eligible', 'Show jobs matching your profile'],
     ['/deadlines', 'Show job application deadlines'],
@@ -2159,6 +2221,10 @@ const server = createServer(async (request, response) => {
     }
 
     const isPublicHealthCheck = request.method === 'GET' && url.pathname === '/api/health'
+    const isPsitErpRoute = url.pathname === '/api/psit-erp' || url.pathname.startsWith('/api/psit-erp/')
+    if (isPsitErpRoute && !production && !isLoopbackAddress(request.socket.remoteAddress)) {
+      return respond(response, 403, { error: 'PSIT ERP dashboard access is restricted to local requests in development.' })
+    }
     const isYoutubeOAuthCallback = request.method === 'GET' && url.pathname === YOUTUBE_OAUTH_CALLBACK_PATH
     const isNewsCronRoute = request.method === 'POST' && url.pathname === '/api/cron/news'
     const isAuthorizedNewsCron = isNewsCronRoute && isNewsCronAuthorized(request)
@@ -2284,6 +2350,30 @@ const server = createServer(async (request, response) => {
         history: database.listNewsRuns(10),
         usage: database.getNewsUsageStats(),
       })
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/psit-erp') {
+      return respond(response, 200, psitErp.getState())
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/psit-erp/connect') {
+      validateErpDashboardRequest(request)
+      const input = await readJson(request)
+      const result = await psitErp.connect(input.userId, input.password)
+      return respond(response, 200, {
+        ...result,
+        ...(result.status === 'password-change-required' ? { passwordChangeUrl: PSIT_ERP_PASSWORD_RESET_URL } : {}),
+      })
+    }
+
+    if (request.method === 'POST' && url.pathname === '/api/psit-erp/sync') {
+      validateErpDashboardRequest(request)
+      return respond(response, 200, await psitErp.sync())
+    }
+
+    if (request.method === 'DELETE' && url.pathname === '/api/psit-erp/connection') {
+      validateErpDashboardRequest(request)
+      return respond(response, 200, psitErp.disconnect())
     }
 
     if (request.method === 'GET' && url.pathname === '/api/digital-footprint') {

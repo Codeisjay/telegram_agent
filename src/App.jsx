@@ -3,7 +3,7 @@ import {
   Activity, AlertTriangle, ArrowDown, ArrowRight, ArrowUp, ArrowUpRight, BarChart3, BellRing,
   Bot, BriefcaseBusiness, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, CircleHelp,
   Clock3, Command, Copy, Cpu, ExternalLink, Eye, EyeOff, FileText, Filter, FlaskConical,
-  Globe2, KeyRound, LayoutDashboard, LockKeyhole, Menu, MessageCircle,
+  Globe2, GraduationCap, KeyRound, LayoutDashboard, LockKeyhole, Menu, MessageCircle,
   MoreHorizontal, Newspaper, Pause, Play, Plus, Radio, RefreshCw, Search, Send, Settings2,
   Shield, SlidersHorizontal, Sparkles, Terminal, Trash2, TrendingUp, Webhook,
   X, Zap,
@@ -11,6 +11,7 @@ import {
 import JobsPage from './JobsPage.jsx'
 import PersonalAssistantPage from './PersonalAssistantPage.jsx'
 import DigitalFootprintPage from './DigitalFootprintPage.jsx'
+import PsitErpPage from './PsitErpPage.jsx'
 import { readApiResponse } from './api.js'
 
 const initialLogs = []
@@ -23,6 +24,7 @@ const navItems = [
   { id: 'news', label: 'News interests', icon: Newspaper },
   { id: 'digital-footprint', label: 'Digital Footprint', icon: Activity },
   { id: 'personal', label: 'Personal Assistant', icon: BellRing },
+  { id: 'psit-erp', label: 'PSIT ERP', icon: GraduationCap },
   { id: 'telegram', label: 'Telegram Settings', icon: Send },
 ]
 
@@ -49,6 +51,13 @@ const defaults = {
     { command: '/summary', description: 'Summarize a link or topic' },
     { command: '/rules', description: 'View active response rules' },
     { command: '/clear', description: 'Clear the current conversation' },
+    { command: '/erp', description: 'Show PSIT ERP connection status' },
+    { command: '/attendance', description: 'Show PSIT attendance' },
+    { command: '/timetable', description: 'Show today’s PSIT timetable' },
+    { command: '/tomorrow', description: 'Show tomorrow’s PSIT timetable' },
+    { command: '/marks', description: 'Show PSIT academic marks' },
+    { command: '/notices', description: 'Show PSIT academic notices' },
+    { command: '/academic_summary', description: 'Show PSIT academic summary' },
   ],
 }
 
@@ -67,6 +76,13 @@ function readSaved() {
     return {
       ...defaults,
       ...saved,
+      commands: [
+        ...(Array.isArray(saved.commands) ? saved.commands : defaults.commands),
+        ...defaults.commands.filter((command) => command.command.startsWith('/erp')
+          || ['/attendance', '/timetable', '/tomorrow', '/marks', '/notices', '/academic_summary'].includes(command.command))
+          .filter((command) => !(Array.isArray(saved.commands) ? saved.commands : [])
+            .some((savedCommand) => savedCommand.command === command.command)),
+      ],
       whitelist: [...new Set([
         '1207882899',
         ...(Array.isArray(saved.whitelist) ? saved.whitelist.filter((id) => typeof id === 'string') : []),
@@ -91,7 +107,8 @@ function Switch({ checked, onChange, label }) {
 
 function App() {
   const [config, setConfig] = useState(readSaved)
-  const [active, setActive] = useState(() => window.location.hash === '#digital-footprint' ? 'digital-footprint' : 'overview')
+  const [active, setActive] = useState(() => window.location.hash === '#digital-footprint' ? 'digital-footprint'
+    : window.location.hash === '#psit-erp' ? 'psit-erp' : 'overview')
   const [collapsed, setCollapsed] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [paused, setPaused] = useState(false)
@@ -345,7 +362,7 @@ function App() {
 
     <main className={`main-content ${collapsed ? 'main-expanded' : ''}`}>
       <div className="page-heading">
-        <div><div className="breadcrumbs">Workspace <ChevronRight size={13} /> <span>{navItems.find((item) => item.id === active)?.label}</span></div><h1>{active === 'overview' ? 'Overview' : active === 'jobs' ? 'Job intelligence' : active === 'rules' ? 'Prompt & rules' : active === 'models' ? 'LLM & web search' : active === 'news' ? 'News interests' : active === 'digital-footprint' ? 'Digital Footprint Intelligence' : active === 'personal' ? 'Personal Assistant' : 'Telegram settings'}</h1><p>{active === 'overview' ? 'Monitor your agent’s performance and recent activity.' : active === 'jobs' ? 'Find verified internship and fresher openings against your candidate profile.' : active === 'rules' ? 'Shape how your agent thinks, responds, and formats results.' : active === 'models' ? 'Manage your AI providers, search behavior, and API credentials.' : active === 'news' ? 'Choose the topics AgentFlow monitors and sends to your Telegram chat.' : active === 'digital-footprint' ? 'Monitor public activity from GitHub and YouTube independently.' : active === 'personal' ? 'Manage daily greetings, festival wishes, and automatic event reminders.' : 'Configure your Telegram connection, commands, and access.'}</p></div>
+        <div><div className="breadcrumbs">Workspace <ChevronRight size={13} /> <span>{navItems.find((item) => item.id === active)?.label}</span></div><h1>{active === 'overview' ? 'Overview' : active === 'jobs' ? 'Job intelligence' : active === 'rules' ? 'Prompt & rules' : active === 'models' ? 'LLM & web search' : active === 'news' ? 'News interests' : active === 'digital-footprint' ? 'Digital Footprint Intelligence' : active === 'personal' ? 'Personal Assistant' : active === 'psit-erp' ? 'PSIT Student ERP' : 'Telegram settings'}</h1><p>{active === 'overview' ? 'Monitor your agent’s performance and recent activity.' : active === 'jobs' ? 'Find verified internship and fresher openings against your candidate profile.' : active === 'rules' ? 'Shape how your agent thinks, responds, and formats results.' : active === 'models' ? 'Manage your AI providers, search behavior, and API credentials.' : active === 'news' ? 'Choose the topics AgentFlow monitors and sends to your Telegram chat.' : active === 'digital-footprint' ? 'Monitor public activity from GitHub and YouTube independently.' : active === 'personal' ? 'Manage daily greetings, festival wishes, and automatic event reminders.' : active === 'psit-erp' ? 'Connect your authorized account securely; academic data is shown only after verified retrieval.' : 'Configure your Telegram connection, commands, and access.'}</p></div>
         <div className="heading-actions">
           <button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={15} /><span>Search anything...</span><kbd><Command size={11} /> K</kbd></button>
           <IconButton label="Toggle theme" onClick={() => setDark(!dark)}><Sparkles size={17} /></IconButton>
@@ -360,6 +377,7 @@ function App() {
       {active === 'news' && <NewsInterestsPage onToast={setToast} />}
       {active === 'digital-footprint' && <DigitalFootprintPage onToast={setToast} />}
       {active === 'personal' && <PersonalAssistantPage onToast={setToast} />}
+      {active === 'psit-erp' && <PsitErpPage onToast={setToast} />}
       {active === 'telegram' && <TelegramPage config={config} update={update} onToast={setToast} secretStatus={secretStatus} secretDrafts={secretDrafts} setSecretDrafts={setSecretDrafts} saveSecret={saveSecret} testSecret={testSecret} secretServiceReady={secretServiceReady} agentRunning={agentStatus.running} onToggleAgent={toggleAgent} />}
       <footer className="page-footer"><span>AgentFlow AI <span className="footer-sep">/</span> Control Center</span><span>All changes saved automatically <span className="save-indicator" /></span></footer>
     </main>

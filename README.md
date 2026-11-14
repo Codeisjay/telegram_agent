@@ -49,6 +49,39 @@ The bot does not maintain conversation history between messages. The `/clear`
 command currently confirms that the conversation is cleared, but there is no
 stored conversation state to reset.
 
+## PSIT Student ERP foundation
+
+The **PSIT ERP** dashboard section accepts account credentials only through its
+server-backed form. The backend submits them to the official
+`https://erp.psit.ac.in/Erp/` login form, stores them only after a verified
+login, and encrypts them with AES-256-GCM. Configure
+`PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY` as a stable, private 32-byte hex value
+before connecting. Generate one with:
+
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
+```
+
+The encryption key must remain in the server environment and must not be added
+to SQLite, source control, frontend configuration, or Telegram. Disconnecting
+deletes encrypted credentials and cached academic rows. ERP intent detection and
+the `/erp`, `/attendance`, `/timetable`, `/tomorrow`, `/marks`, `/notices`, and
+`/academic_summary` shortcuts are routed locally; ERP credentials are not sent
+to Gemini, Groq, or another model. Credential-like text is rejected from the
+general AI request path.
+
+**Important limitation:** the public PSIT login page currently states that all
+user passwords have expired and links to the official password-change page.
+Only the login form is public; no student pages or supported data API were
+available to inspect during implementation. Consequently the integration can
+securely validate/store a login and show sync-attempt history, but attendance,
+timetable, marks, notices, scheduled sync, and academic notifications are not
+active. ERP questions explicitly report that limitation rather than returning
+guessed values. Change the password on PSIT's official portal, then provide
+access to authenticated student pages for data-source mapping before enabling
+retrieval or recurring synchronization. No additional paid service or library
+is used.
+
 ## Autonomous personalized news
 
 The **News interests** dashboard configures an autonomous Telegram news agent.

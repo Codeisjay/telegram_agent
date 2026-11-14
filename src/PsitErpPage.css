@@ -1,0 +1,48 @@
+.psit-page { display: flex; flex-direction: column; gap: 14px; }
+.psit-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.psit-heading h2 { margin: 5px 0; font-size: 18px; letter-spacing: -.4px; }
+.psit-heading p, .psit-panel p { color: #8794aa; font-size: 11px; line-height: 1.65; }
+.psit-heading p { max-width: 700px; margin: 0; }
+.psit-heading .outline-button { text-decoration: none; }
+.psit-panel { padding: 0 15px 14px; }
+.psit-panel-heading { min-height: 60px; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 -15px 14px; padding: 11px 15px; border-bottom: 1px solid var(--border-soft); }
+.psit-title-icon { display: flex; align-items: center; gap: 10px; min-width: 0; color: #74d4e4; }
+.psit-title-icon h3 { margin: 0; color: var(--text); font-size: 11px; }
+.psit-title-icon p { margin: 3px 0 0; font-size: 9px; }
+.psit-connection-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.psit-connection-form > label { display: flex; flex-direction: column; gap: 6px; color: var(--text-secondary); font-size: 10px; }
+.psit-connection-form input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--text); background: rgba(255,255,255,.025); font-size: 11px; }
+.psit-form-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; }
+.psit-form-actions button:disabled, .psit-actions button:disabled, .psit-disconnect:disabled { opacity: .5; cursor: not-allowed; }
+.psit-inline-link { color: #9c94ff; font-size: 10px; }
+.psit-security-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 15px; padding: 10px; border: 1px solid rgba(135,120,255,.12); border-radius: 7px; color: #9ca8bc; background: rgba(135,120,255,.04); font-size: 9px; line-height: 1.6; }
+.psit-security-note svg { flex: 0 0 auto; color: #aaa0ff; }
+.psit-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.psit-disconnect { height: 34px; display: inline-flex; align-items: center; gap: 7px; padding: 0 11px; border: 1px solid rgba(250,119,125,.2); border-radius: 7px; color: #fa9297; background: rgba(250,119,125,.04); font-size: 10px; cursor: pointer; }
+.psit-warning { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 13px; padding: 10px; border: 1px solid rgba(242,185,75,.16); border-radius: 7px; color: #e2bc73; background: rgba(242,185,75,.05); font-size: 10px; line-height: 1.5; }
+.psit-warning svg { flex: 0 0 auto; }
+.psit-warning code { color: #f5d894; }
+.psit-status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.psit-status-card { display: flex; flex-direction: column; gap: 8px; padding: 14px; }
+.psit-status-card > span { color: #8794aa; font-size: 9px; }
+.psit-status-card > strong { color: var(--text); font-size: 12px; font-weight: 650; }
+.psit-status-card > small { color: #68768e; font-size: 9px; }
+.psit-limitation { padding-top: 0; }
+.psit-limitation > p { margin: 7px 0; }
+.psit-data-preview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+.psit-data-preview > div { min-width: 0; display: grid; grid-template-columns: 18px 1fr; gap: 4px 7px; padding: 10px; border: 1px solid var(--border-soft); border-radius: 7px; }
+.psit-data-preview svg { grid-row: span 2; color: #a59aff; }
+.psit-data-preview span { color: #9ca8bc; font-size: 9px; }
+.psit-data-preview strong { color: #68768e; font-size: 9px; font-weight: 550; }
+.psit-history-row { display: grid; grid-template-columns: minmax(100px, .7fr) 2fr auto; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border-soft); }
+.psit-history-row:last-child { border-bottom: 0; }
+.psit-history-row strong { color: #d3d9e6; font-size: 9px; text-transform: capitalize; }
+.psit-history-row span, .psit-history-row small, .psit-empty { color: #79869b; font-size: 9px; line-height: 1.5; }
+.psit-history-row small { white-space: nowrap; }
+.psit-empty { margin: 0; }
+@media (max-width: 700px) {
+  .psit-heading { align-items: flex-start; flex-direction: column; }
+  .psit-connection-form, .psit-status-grid { grid-template-columns: 1fr; }
+  .psit-data-preview { grid-template-columns: 1fr; }
+  .psit-history-row { grid-template-columns: 1fr; gap: 4px; }
+}

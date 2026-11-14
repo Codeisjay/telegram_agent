@@ -27,8 +27,9 @@ let baseUrl
 function makeTestEnvironment(overrides = {}) {
   const environment = { ...process.env, LOCALAPPDATA: secretDirectory, AGENTFLOW_PORT: '0' }
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
-  for (const key of [...secretKeys, 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
+  for (const key of [...secretKeys, 'PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY', 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
+  environment.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY = '2a'.repeat(32)
   environment.AGENTFLOW_COMPANION_CRON_SECRET = 'test-companion-cron-secret'
   environment.GOOGLE_CLIENT_ID = 'test-youtube-client.apps.googleusercontent.com'
   environment.GOOGLE_CLIENT_SECRET = 'test-youtube-client-secret'
@@ -149,6 +150,42 @@ test('health endpoint reports status without returning credential values', async
   assert.equal(health.service, 'agentflow-api')
   assert.equal(Object.hasOwn(health, 'secrets'), false)
   assert.equal(Object.hasOwn(health, 'credentials'), false)
+})
+
+test('PSIT ERP status exposes no credentials and AI requests reject credential-like text', async () => {
+  const response = await fetch(`${baseUrl}/api/psit-erp`)
+  assert.equal(response.status, 200)
+  const state = await response.json()
+  assert.equal(state.connected, false)
+  assert.equal(state.encryptionConfigured, true)
+  assert.equal(state.dataRetrievalAvailable, false)
+  assert.equal(JSON.stringify(state).includes('credential_ciphertext'), false)
+  assert.equal(JSON.stringify(state).includes('PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY'), false)
+
+  const invalidConnect = await fetch(`${baseUrl}/api/psit-erp/connect`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ userId: '', password: '' }),
+  })
+  assert.equal(invalidConnect.status, 400)
+  const missingConnectionSync = await fetch(`${baseUrl}/api/psit-erp/sync`, { method: 'POST' })
+  assert.equal(missingConnectionSync.status, 409)
+  const crossOrigin = await fetch(`${baseUrl}/api/psit-erp/connect`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: 'https://untrusted.example' },
+    body: JSON.stringify({ userId: 'student', password: 'not-a-real-password' }),
+  })
+  assert.equal(crossOrigin.status, 403)
+
+  const credentialQuery = 'my ERP password is do-not-forward-this'
+  const blockedQuery = await fetch(`${baseUrl}/api/agent/test`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ query: credentialQuery, settings: { provider: 'openrouter' } }),
+  })
+  assert.equal(blockedQuery.status, 400)
+  const blockedBody = await blockedQuery.text()
+  assert.equal(blockedBody.includes('do-not-forward-this'), false)
 })
 
 test('news settings API persists user-selected notification topics', async () => {
