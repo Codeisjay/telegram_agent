@@ -83,14 +83,29 @@ diagnostics. The scheduler authenticates at startup, reuses the in-memory
 session after validating it against the student page, and automatically
 reauthenticates on session expiry. It synchronizes the verified attendance
 request, online-training, OD-request, attendance, timetable, marks, notices,
-and exam-calendar pages every 15 minutes by default. Change notifications are
-deduplicated; removal alerts are sent only when the authenticated table
-confirms a complete listing. Temporary failures retry with bounded exponential
+and exam-calendar pages every 15 minutes by default. Current request state is
+stored once per module and ERP request ID. Each module establishes a baseline
+without historical alerts; subsequent alerts are based on normalized status
+transitions, not table HTML or poll timestamps. Unknown statuses do not replace
+the last verified status. Request notifications include available request
+details and approval stages, and are formatted locally without AI tokens.
+Attendance data is refreshed by the normal sync, but Telegram attendance
+summaries are sent only at 09:00 and 20:00 Asia/Kolkata. Unique daily report
+slots prevent duplicate reports after retries. Notification history retention
+defaults to 90 days and is configurable with
+`PSIT_ERP_NOTIFICATION_RETENTION_DAYS` (7–365); current request state and
+undelivered notifications are preserved. Temporary failures retry with bounded
 backoff; invalid credentials, password changes, and security challenges pause
 automation and require action. `PSIT_ERP_SYNC_INTERVAL_MINUTES` accepts values
 from 15 to 360. ERP questions return only cached verified sources and explicitly
 report unavailable data rather than guessing. No additional paid service or
 library is used.
+
+Telegram confirms successful deliveries before events are marked delivered.
+Explicit Telegram failures are retried with backoff. If the connection fails
+after a send may have reached Telegram but before AgentFlow receives the
+confirmation, delivery is marked uncertain rather than blindly resent; the
+Telegram Bot API does not provide an idempotency key for `sendMessage`.
 
 The scheduler starts with the backend and stores its due time, change
 fingerprints, and a cross-process lease in the existing SQLite database. This
@@ -309,6 +324,7 @@ deploy it as a Static Site). In the service's Environment settings, add:
 - `PSIT_ERP_BASE_URL`: `https://erp.psit.ac.in/Erp/` (the backend rejects nonofficial origins).
 - `PSIT_ERP_USER_ID` and `PSIT_ERP_PASSWORD`: your authorized ERP account credentials. Set them as private Render environment secrets; do not put them in the dashboard, GitHub, Telegram, or AI settings.
 - `PSIT_ERP_SYNC_INTERVAL_MINUTES`: optional; defaults to `15` (allowed range `15`-`360`).
+- `PSIT_ERP_NOTIFICATION_RETENTION_DAYS`: optional; defaults to `90` (allowed range `7`-`365`).
 - `PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY`: required only if using the legacy dashboard credential form; keep it private and stable.
 - `AGENTFLOW_PSIT_ERP_CRON_SECRET`: optional long random bearer secret for an external scheduler to wake a sleeping free instance and invoke PSIT sync.
 - Any provider or Telegram credentials you want available, such as

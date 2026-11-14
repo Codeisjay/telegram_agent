@@ -419,25 +419,68 @@ function parseExamCalendar(html) {
 }
 
 function summarizeActivityStatus(cells) {
-  const statuses = []
+  const stages = []
   for (const { header, value } of cells) {
     if (!value) continue
-    const state = value.match(/\b(not\s+approved|not\s+verified|under\s+review|in\s+progress|approved|accepted|rejected|declined|denied|pending|verified|forwarded|withdrawn|cancelled)\b/i)?.[0]
-    const metric = /marks?\s*\/?\s*out\s*of/i.test(header)
-      || /percentage|score/i.test(header)
-    if (!state && !metric) continue
+    if (!/status|approval|verify|coordinator|h\.?\s*o\.?\s*d|head\s+of\s+department|director|result/i.test(header)) continue
     const stage = /director/i.test(header) ? 'Director'
       : /h\.?\s*o\.?\s*d|head\s+of\s+department/i.test(header) ? 'HOD'
         : /coordinator/i.test(header) ? 'Coordinator'
           : /verif/i.test(header) ? 'Verification'
             : /approval/i.test(header) ? 'Approval'
-              : /marks?\s*\/?\s*out\s*of/i.test(header) ? 'Score'
-                : /percentage/i.test(header) ? 'Percentage'
-                  : /score/i.test(header) ? 'Score'
                     : /result/i.test(header) ? 'Result' : 'Status'
-    statuses.push(`${stage}: ${state ? state.replace(/\s+/g, ' ').replace(/\b[a-z]/g, (letter) => letter.toUpperCase()) : value}`)
+    stages.push({ stage, raw: value.slice(0, 200), normalized: normalizeRequestStatus(value) })
   }
-  return [...new Set(statuses)].join('; ')
+  const normalized = stages.map(({ normalized: status }) => status)
+  const overall = normalized.includes('Rejected')
+    ? 'Rejected'
+    : normalized.length && normalized.every((status) => status === 'Accepted')
+                    ? 'Accepted'
+                    : normalized.includes('Pending') ? 'Pending' : 'Unknown'
+  return { overall, stages }
+}
+
+function normalizeRequestStatus(value) {
+  const text = String(value || '').trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ')
+  if (!text) return 'Unknown'
+  if (/\b(reject(?:ed)?|declin(?:ed|e)|denied|not approved|disapproved)\b/.test(text)) return 'Rejected'
+  if (/\b(accept(?:ed)?|approv(?:ed|al)|sanctioned)\b/.test(text)) return 'Accepted'
+  if (/\b(pending|under review|in process|in progress|awaiting|submitted|forwarded|on hold)\b/.test(text)) return 'Pending'
+  return 'Unknown'
+}
+
+function withSqliteTransaction(database, work) {
+  database.exec('BEGIN IMMEDIATE')
+  try {
+    const result = work()
+    database.exec('COMMIT')
+    return result
+  } catch (error) {
+    database.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function meaningfulRequestState(state) {
+  return {
+    requestType: state.requestType,
+    submittedAt: state.submittedAt,
+    examDate: state.examDate,
+    testName: state.testName,
+    score: state.score,
+    percentage: state.percentage,
+    purpose: state.purpose,
+    requestedDates: state.requestedDates,
+    status: state.status,
+    statusStages: state.statusStages.map(({ stage, normalized }) => ({ stage, normalized })),
+    remarks: state.remarks,
+    approver: state.approver,
+    presence: state.presence,
+  }
+}
+
+function fingerprintRequestState(state) {
+  return createHash('sha256').update(JSON.stringify(meaningfulRequestState(state))).digest('hex')
 }
 
 function parseActivityPage(html, kind) {
@@ -457,34 +500,71 @@ function parseActivityPage(html, kind) {
       value: row[index]?.join(' ').trim() || '',
     }))
     const values = cells.map(({ value }) => value)
-    const identity = kind === 'online-training'
-      ? values.slice(0, 3)
-      : values.slice(0, 1)
-    const key = identity.join('|').trim()
-    if (!key) return null
+    const idHeader = kind === 'online-training'
+      ? /^(?:serial(?:\s*(?:no|number))?|request\s*(?:id|no|number))\.?$/i
+      : /^(?:(?:request|req|od)\s*[-.]?\s*(?:id|no|number))\.?$/i
+    const requestId = (cells.find(({ header }) => idHeader.test(header.trim()))?.value || values[0]).slice(0, 120)
+    if (!requestId) return null
+    const requestType = (cells.find(({ header }) => /^(?:request\s*)?(?:type|category)$/i.test(header.trim()))?.value || '').slice(0, 120)
+    const submittedAt = (cells.find(({ header }) => /submitted|submission/i.test(header))?.value || '').slice(0, 100)
+    const updatedAt = (cells.find(({ header }) => /last\s*(?:updated|modified)|updated\s*at|modified\s*at/i.test(header))?.value || '').slice(0, 100)
+    const examDate = (cells.find(({ header }) => /exam\s*date/i.test(header))?.value || '').slice(0, 100)
+    const testName = (cells.find(({ header }) => /test\s*name|assessment/i.test(header))?.value || '').slice(0, 160)
+    const score = (cells.find(({ header }) => /marks?\s*\/?\s*out\s*of|score/i.test(header))?.value || '').slice(0, 80)
+    const percentage = (cells.find(({ header }) => /percentage/i.test(header))?.value || '').slice(0, 40)
+    const requestedDates = cells
+      .filter(({ header, value }) => value && /date/i.test(header) && !/submitted|submission|updated|modified|exam/i.test(header))
+      .map(({ header, value }) => ({ header: header.trim().slice(0, 80), value: value.slice(0, 100) }))
+    const purpose = (cells.find(({ header }) => /detail|purpose|description|reason/i.test(header) && !/remark/i.test(header))?.value || '').slice(0, 500)
+    const remarks = cells
+      .filter(({ header, value }) => value && /remark|comment|rejection\s*reason/i.test(header))
+      .map(({ value }) => value)
+      .join('; ').slice(0, 500)
+    const approver = cells
+      .filter(({ header, value }) => value && /assign\s*to|approver|approved\s*by|verified\s*by/i.test(header))
+      .map(({ header, value }) => `${header.trim()}: ${value}`)
+      .join('; ').slice(0, 200)
     const status = summarizeActivityStatus(cells)
-    const label = kind === 'online-training'
-      ? [values[2] && `Test: ${values[2]}`, values[1] && `Exam date: ${values[1]}`].filter(Boolean).join(' · ')
-      : (() => {
-        const requestId = cells.find(({ header }) => /^(?:request|req|od)\s*[-.]?\s*(?:id|no|number)$/i.test(header.trim()))?.value || values[0]
-        const requestType = cells.find(({ header }) => /^(?:request\s*)?(?:type|category)$/i.test(header.trim()))?.value
-        const dates = cells
-          .filter(({ header, value }) => value && /date/i.test(header) && !/submitted|exam/i.test(header))
-          .map(({ value }) => value)
-        const dateSummary = [...new Set(dates)].join(' to ')
-        return [
-          requestId && `Request #${requestId}`,
-          requestType && `Type: ${requestType}`,
-          dateSummary && `Dates: ${dateSummary}`,
-        ].filter(Boolean).join(' · ') || `${kind === 'attendance-request' ? 'Attendance' : 'On-duty'} request`
-      })()
-    const timestamp = cells.find(({ header }) => /submitted|exam\s*date|request\s*date/i.test(header))?.value || ''
-    return { key, values, label: label.slice(0, 160), status: status.slice(0, 120), sourceTimestamp: timestamp }
+    const label = [
+      requestId && `Request #${requestId}`,
+      requestType && `Type: ${requestType}`,
+      purpose && `Purpose: ${purpose}`,
+      requestedDates.length && `Dates: ${requestedDates.map(({ value }) => value).join(' to ')}`,
+    ].filter(Boolean).join(' · ')
+    const fields = {
+      requestId,
+      requestType,
+      submittedAt,
+      examDate,
+      testName,
+      score,
+      percentage,
+      purpose,
+      requestedDates,
+      status: status.overall,
+      statusStages: status.stages,
+      remarks,
+      updatedAt,
+      approver,
+    }
+    return {
+      key: requestId,
+      requestId,
+      ...fields,
+      values,
+      label: label.slice(0, 300),
+      sourceTimestamp: updatedAt || submittedAt,
+    }
   }).filter(Boolean)
   const text = pageText(html)
   const count = text.match(/showing\s+1\s+to\s+(\d+)\s+of\s+(\d+)\s+entries/i)
   const empty = /showing\s+0\s+to\s+0\s+of\s+0\s+entries/i.test(text)
-  return { headers: table.headers, rows, complete: empty || Boolean(count && count[1] === count[2]) }
+  return {
+    headers: table.headers,
+    rows,
+    complete: empty || Boolean(count && count[1] === count[2] && rows.length === table.rows.length),
+    unrecognizedStatusCount: rows.filter((row) => row.status === 'Unknown').length,
+  }
 }
 
 function findAnchorByText(html, pattern) {
@@ -775,6 +855,7 @@ export class PsitErpService {
     encryptionKey = process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY,
     fetchImpl = fetch,
     monitoringIntervalMinutes = 15,
+    notificationRetentionDays = 90,
     notifyChanges = async () => false,
     onDiagnostic = (diagnostic) => console.info(`[PSIT ERP auth] ${JSON.stringify(diagnostic)}`),
   }) {
@@ -782,10 +863,12 @@ export class PsitErpService {
     this.encryptionKey = encryptionKey
     this.fetchImpl = fetchImpl
     this.monitoringIntervalMinutes = monitoringIntervalMinutes
+    this.notificationRetentionDays = notificationRetentionDays
     this.notifyChanges = notifyChanges
     this.onDiagnostic = onDiagnostic
     this.session = null
     this.syncPromise = null
+    this.statusParserWarnings = new Set()
   }
 
   getState() {
@@ -805,6 +888,9 @@ export class PsitErpService {
     }
     const history = this.database.db.prepare(`SELECT id, status, started_at AS startedAt,
       completed_at AS completedAt, message FROM psit_erp_sync_history ORDER BY id DESC LIMIT 20`).all()
+    const attendanceReports = this.database.db.prepare(`SELECT report_date AS reportDate,
+      report_slot AS reportSlot, status, attempts, last_error AS lastError, delivered_at AS deliveredAt
+      FROM psit_erp_attendance_reports ORDER BY report_date DESC, report_slot DESC LIMIT 6`).all()
     const credentialsStored = Boolean(this.getCredentialRecord()?.credentialCiphertext)
     const environment = this.readEnvironmentCredentials()
     const environmentManaged = environment.configured || connection?.credentialSource === 'environment'
@@ -814,9 +900,29 @@ export class PsitErpService {
       last_successful_sync_at AS lastSuccessfulSyncAt, status AS schedulerStatus,
       failure_category AS failureCategory, paused, last_error AS lastError
       FROM psit_erp_scheduler_state WHERE id = 1`).get()
-    const recentChanges = this.database.db.prepare(`SELECT source, action, summary,
-      source_timestamp AS sourceTimestamp, detected_at AS detectedAt, delivered_at AS deliveredAt
-      FROM psit_erp_detected_changes ORDER BY id DESC LIMIT 20`).all()
+    const rawRecentChanges = this.database.db.prepare(`SELECT source, action, summary,
+      source_timestamp AS sourceTimestamp, detected_at AS detectedAt, delivered_at AS deliveredAt,
+      record_id AS recordId, previous_status AS previousStatus, current_status AS currentStatus,
+      details_json AS detailsJson, pending.delivery_status AS deliveryStatus,
+      pending.last_error AS deliveryError
+      FROM psit_erp_detected_changes
+      LEFT JOIN psit_erp_pending_notifications AS pending USING(fingerprint)
+      ORDER BY id DESC LIMIT 100`).all()
+    const groupedChanges = new Map()
+    for (const change of rawRecentChanges) {
+      const key = [change.source, change.action, change.recordId, change.previousStatus, change.currentStatus, change.summary].join('|')
+      if (groupedChanges.has(key)) {
+        groupedChanges.get(key).duplicateCount += 1
+        continue
+      }
+      const { detailsJson, ...publicChange } = change
+      groupedChanges.set(key, {
+        ...publicChange,
+        details: JSON.parse(detailsJson || '{}'),
+        duplicateCount: 1,
+      })
+    }
+    const recentChanges = [...groupedChanges.values()].slice(0, 20)
     const timetable = snapshots.timetable ? JSON.parse(snapshots.timetable.dataJson) : null
     const academic = snapshots.academic.reduce((result, snapshot) => (
       Object.assign(result, JSON.parse(snapshot.dataJson))
@@ -891,6 +997,8 @@ export class PsitErpService {
       },
       history,
       recentChanges,
+      attendanceReports,
+      notificationRetentionDays: this.notificationRetentionDays,
       monitoredModules: ['attendance requests', 'online training', 'OD requests', 'attendance', 'timetable', 'marks', 'notices', 'exam calendar'],
       limitation: 'Overall attendance, semester and test marks, timetable, academic notices, and the exam calendar are retrieved from authenticated PSIT pages. Attendance requests, online training results, and OD requests are monitored when authenticated pages expose recognizable records. Subject-wise attendance and current library dues are not available from the mapped pages.',
     }
@@ -1043,127 +1151,259 @@ export class PsitErpService {
 
   async persistActivityPages(pages, capturedAt) {
     const database = this.database.db
-    const changes = []
+    const queuedChanges = []
     for (const { type, data } of pages) {
       if (!data) continue
       const recordType = `activity-${type}`
-      const stored = database.prepare(`SELECT data_json AS dataJson
-        FROM psit_erp_academic_records WHERE record_type = ? AND source_id = 'student'`).get(recordType)
-      const previous = stored ? JSON.parse(stored.dataJson) : null
-      const previousRows = new Map((previous?.rows || []).map((row) => [row.key, row]))
-      if (previous) {
+      const baseline = database.prepare(`SELECT 1 FROM psit_erp_monitoring_baseline WHERE module = ?`).get(type)
+      withSqliteTransaction(database, () => {
         for (const row of data.rows) {
-          const before = previousRows.get(row.key)
-          if (!before || JSON.stringify(before.values) === JSON.stringify(row.values)) continue
-          const fingerprint = createHash('sha256')
-            .update(`${recordType}\n${row.key}\n${JSON.stringify(before.values)}\n${JSON.stringify(row.values)}\n${capturedAt}`)
-            .digest('hex')
-          const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
-            UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
-          if (!alreadySent) {
-            changes.push({
-              fingerprint,
-              page: type,
-              action: 'updated',
-              label: row.label,
-              status: row.status,
-              sourceTimestamp: row.sourceTimestamp,
-            })
+          const recordId = String(row.requestId || '').trim()
+          if (!recordId) continue
+          const previousRow = database.prepare(`SELECT state_fingerprint AS stateFingerprint,
+            state_json AS stateJson, revision FROM psit_erp_request_state
+            WHERE module = ? AND record_id = ?`).get(type, recordId)
+          const previous = previousRow ? JSON.parse(previousRow.stateJson) : null
+          const next = {
+            requestId: recordId,
+            requestType: row.requestType || '',
+            submittedAt: row.submittedAt || '',
+            examDate: row.examDate || '',
+            testName: row.testName || '',
+            score: row.score || '',
+            percentage: row.percentage || '',
+            purpose: row.purpose || '',
+            requestedDates: row.requestedDates || [],
+            status: row.status || 'Unknown',
+            statusStages: row.statusStages || [],
+            remarks: row.remarks || '',
+            updatedAt: row.updatedAt || '',
+            approver: row.approver || '',
+            presence: 'listed',
           }
-        }
-        for (const row of data.rows) {
-          if (previousRows.has(row.key)) continue
-          const fingerprint = createHash('sha256')
-            .update(`${recordType}\n${row.key}\n${JSON.stringify(row.values)}\n${capturedAt}`)
-            .digest('hex')
-          const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
-            UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
-          if (!alreadySent) {
-            changes.push({
-              fingerprint,
-              page: type,
-              action: 'new',
-              label: row.label,
-              status: row.status,
-              sourceTimestamp: row.sourceTimestamp,
-            })
+          if (previous && next.status === 'Unknown' && previous.status !== 'Unknown') {
+            next.status = previous.status
+            next.statusStages = previous.statusStages
           }
-        }
-        if (data.complete) {
-          const currentKeys = new Set(data.rows.map((row) => row.key))
-          for (const row of previousRows.values()) {
-            if (currentKeys.has(row.key)) continue
-            const fingerprint = createHash('sha256')
-              .update(`${recordType}\n${row.key}\ndeleted\n${capturedAt}`)
-              .digest('hex')
-            const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
-              UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
-            if (!alreadySent) {
-              changes.push({
-                fingerprint,
-                page: type,
-                action: 'deleted',
-                label: row.label,
-                status: row.status,
-                sourceTimestamp: row.sourceTimestamp,
-              })
+          const stateFingerprint = fingerprintRequestState(next)
+          if (previousRow?.stateFingerprint === stateFingerprint) {
+            if (JSON.stringify(previous) !== JSON.stringify(next)) {
+              database.prepare(`UPDATE psit_erp_request_state SET state_json = ?, updated_at = ?
+                WHERE module = ? AND record_id = ?`).run(JSON.stringify(next), capturedAt, type, recordId)
             }
+            continue
+          }
+          const revision = (previousRow?.revision || 0) + 1
+          database.prepare(`INSERT INTO psit_erp_request_state(
+            module, record_id, state_fingerprint, state_json, revision, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(module, record_id) DO UPDATE SET state_fingerprint = excluded.state_fingerprint,
+            state_json = excluded.state_json, revision = excluded.revision, updated_at = excluded.updated_at`)
+            .run(type, recordId, stateFingerprint, JSON.stringify(next), revision, capturedAt)
+
+          let action = ''
+          let previousStatus = previous?.status || ''
+          if (!previous && baseline && next.status === 'Pending') action = 'new'
+          else if (previous && previous.status !== 'Unknown'
+            && previous.status !== next.status && next.status !== 'Unknown') action = 'updated'
+          if (!action) continue
+
+          const fingerprint = createHash('sha256')
+            .update(`${type}\n${recordId}\n${revision}\n${previousStatus}\n${next.status}\n${stateFingerprint}`)
+            .digest('hex')
+          const details = {
+            requestId: recordId,
+            requestType: next.requestType,
+            submittedAt: next.submittedAt,
+            examDate: next.examDate,
+            testName: next.testName,
+            score: next.score,
+            percentage: next.percentage,
+            purpose: next.purpose,
+            requestedDates: next.requestedDates,
+            remarks: next.remarks,
+            updatedAt: next.updatedAt,
+            approver: next.approver,
+            statusStages: next.statusStages,
+          }
+          const notification = {
+            fingerprint,
+            page: type,
+            action,
+            requestId: recordId,
+            previousStatus,
+            currentStatus: next.status,
+            status: next.statusStages.map(({ stage, raw }) => `${stage}: ${raw}`).join('; ') || next.status,
+            label: row.label || '',
+            sourceTimestamp: next.updatedAt || next.submittedAt,
+            details,
+          }
+          database.prepare(`INSERT OR IGNORE INTO psit_erp_pending_notifications(
+            fingerprint, payload_json, created_at, delivery_status
+          ) VALUES (?, ?, ?, 'pending')`).run(fingerprint, JSON.stringify(notification), capturedAt)
+          database.prepare(`INSERT OR IGNORE INTO psit_erp_detected_changes(
+            fingerprint, source, action, summary, source_timestamp, detected_at, record_id,
+            previous_status, current_status, details_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+            fingerprint,
+            type,
+            action,
+            `${recordId}: ${previousStatus || 'New'} → ${next.status}${next.purpose ? ` · ${next.purpose}` : ''}`.slice(0, 400),
+            notification.sourceTimestamp,
+            capturedAt,
+            recordId,
+            previousStatus,
+            next.status,
+            JSON.stringify(details),
+          )
+          queuedChanges.push(notification)
+        }
+        if (baseline && data.complete) {
+          const listedIds = new Set(data.rows.map((row) => String(row.requestId || '').trim()).filter(Boolean))
+          const knownRecords = database.prepare(`SELECT record_id AS recordId, state_json AS stateJson,
+            revision FROM psit_erp_request_state WHERE module = ?`).all(type)
+          for (const known of knownRecords) {
+            if (listedIds.has(known.recordId)) continue
+            const previous = JSON.parse(known.stateJson)
+            if (previous.presence === 'not_listed') continue
+            const next = { ...previous, presence: 'not_listed' }
+            const revision = known.revision + 1
+            const stateFingerprint = fingerprintRequestState(next)
+            database.prepare(`UPDATE psit_erp_request_state SET state_fingerprint = ?, state_json = ?,
+              revision = ?, updated_at = ? WHERE module = ? AND record_id = ?`).run(
+              stateFingerprint, JSON.stringify(next), revision, capturedAt, type, known.recordId,
+            )
+            const fingerprint = createHash('sha256')
+              .update(`${type}\n${known.recordId}\n${revision}\nnot-listed\n${stateFingerprint}`)
+              .digest('hex')
+            const notification = {
+              fingerprint,
+              page: type,
+              action: 'deleted',
+              requestId: known.recordId,
+              previousStatus: previous.status || 'Unknown',
+              currentStatus: previous.status || 'Unknown',
+              status: 'No longer listed in the complete ERP record list',
+              label: `Request #${known.recordId}`,
+              sourceTimestamp: previous.updatedAt || previous.submittedAt || '',
+              details: {
+                requestId: known.recordId,
+                requestType: previous.requestType || '',
+                purpose: previous.purpose || '',
+                requestedDates: previous.requestedDates || [],
+                remarks: previous.remarks || '',
+              },
+            }
+            database.prepare(`INSERT OR IGNORE INTO psit_erp_pending_notifications(
+              fingerprint, payload_json, created_at, delivery_status
+            ) VALUES (?, ?, ?, 'pending')`).run(fingerprint, JSON.stringify(notification), capturedAt)
+            database.prepare(`INSERT OR IGNORE INTO psit_erp_detected_changes(
+              fingerprint, source, action, summary, source_timestamp, detected_at, record_id,
+              previous_status, current_status, details_json
+            ) VALUES (?, ?, 'deleted', ?, ?, ?, ?, ?, ?, ?)`).run(
+              fingerprint,
+              type,
+              `${known.recordId}: no longer listed in complete ERP results`,
+              notification.sourceTimestamp,
+              capturedAt,
+              known.recordId,
+              notification.previousStatus,
+              notification.currentStatus,
+              JSON.stringify(notification.details),
+            )
+            queuedChanges.push(notification)
           }
         }
-      }
-      database.prepare(`INSERT INTO psit_erp_academic_records(record_type, source_id, data_json, updated_at)
-        VALUES (?, 'student', ?, ?)
-        ON CONFLICT(record_type, source_id) DO UPDATE SET data_json = excluded.data_json,
-          updated_at = excluded.updated_at`).run(recordType, JSON.stringify(data), capturedAt)
-      for (const change of changes.filter((item) => item.page === type)) {
-        database.prepare(`INSERT OR IGNORE INTO psit_erp_pending_notifications(
-          fingerprint, payload_json, created_at
-        ) VALUES (?, ?, ?)`).run(change.fingerprint, JSON.stringify({
-          page: change.page,
-          action: change.action,
-          label: change.label,
-          status: change.status,
-          sourceTimestamp: change.sourceTimestamp,
-        }), capturedAt)
-        database.prepare(`INSERT OR IGNORE INTO psit_erp_detected_changes(
-          fingerprint, source, action, summary, source_timestamp, detected_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`).run(
-          change.fingerprint,
-          change.page,
-          change.action,
-          [change.label, change.status].filter(Boolean).join(' · ').slice(0, 240),
-          change.sourceTimestamp || '',
-          capturedAt,
-        )
-      }
+        database.prepare(`INSERT OR IGNORE INTO psit_erp_monitoring_baseline(module, established_at)
+          VALUES (?, ?)`).run(type, capturedAt)
+        database.prepare(`INSERT INTO psit_erp_academic_records(record_type, source_id, data_json, updated_at)
+          VALUES (?, 'student', ?, ?)
+          ON CONFLICT(record_type, source_id) DO UPDATE SET data_json = excluded.data_json,
+            updated_at = excluded.updated_at`).run(recordType, JSON.stringify(data), capturedAt)
+      })
     }
-
-    return this.deliverPendingNotifications(capturedAt)
+    await this.deliverPendingNotifications(capturedAt)
+    return queuedChanges
   }
 
   async deliverPendingNotifications(capturedAt) {
     const database = this.database.db
-    const pending = database.prepare(`SELECT fingerprint, payload_json AS payloadJson
-      FROM psit_erp_pending_notifications ORDER BY created_at LIMIT 10`).all()
+    const staleSendingBefore = new Date(Date.parse(capturedAt) - 5 * 60000).toISOString()
+    database.prepare(`UPDATE psit_erp_pending_notifications SET delivery_status = 'uncertain',
+      last_error = 'Previous delivery ended without a recorded Telegram response.'
+      WHERE delivery_status = 'sending' AND last_attempt_at < ?`).run(staleSendingBefore)
+    const pending = database.prepare(`SELECT fingerprint, payload_json AS payloadJson,
+      attempts, last_attempt_at AS lastAttemptAt
+      FROM psit_erp_pending_notifications WHERE delivery_status = 'pending'
+      ORDER BY created_at LIMIT 10`).all()
     if (!pending.length) return []
-    const notifications = pending.map((row) => ({
+    const retryReady = pending.filter((row) => {
+      if (!row.lastAttemptAt) return true
+      const delay = Math.min(60, 2 ** Math.max(0, row.attempts - 1)) * 60000
+      return Date.parse(capturedAt) - Date.parse(row.lastAttemptAt) >= delay
+    })
+    const notifications = retryReady.map((row) => ({
       fingerprint: row.fingerprint,
       ...JSON.parse(row.payloadJson),
     }))
-    const delivered = await this.notifyChanges(notifications.map(({ fingerprint, ...notification }) => notification))
-    if (delivered) {
+    const delivered = []
+    for (const notification of notifications) {
+      const claimed = database.prepare(`UPDATE psit_erp_pending_notifications SET
+        delivery_status = 'sending', attempts = attempts + 1, last_attempt_at = ?, last_error = ''
+        WHERE fingerprint = ? AND delivery_status = 'pending'`).run(capturedAt, notification.fingerprint).changes
+      if (!claimed) continue
+      const { fingerprint, ...payload } = notification
+      try {
+        if (!await this.notifyChanges([payload])) {
+          database.prepare(`UPDATE psit_erp_pending_notifications SET delivery_status = 'pending',
+            last_error = 'Telegram is not configured.' WHERE fingerprint = ?`).run(fingerprint)
+          continue
+        }
+      } catch (error) {
+        const uncertain = Boolean(error.deliveryUncertain)
+        database.prepare(`UPDATE psit_erp_pending_notifications SET delivery_status = ?,
+          last_error = ? WHERE fingerprint = ?`).run(
+          uncertain ? 'uncertain' : 'pending',
+          String(error.message || 'Telegram delivery failed').slice(0, 240),
+          fingerprint,
+        )
+        if (uncertain) database.prepare(`UPDATE psit_erp_detected_changes SET
+          summary = summary || ' · delivery outcome uncertain' WHERE fingerprint = ?`).run(fingerprint)
+        continue
+      }
       const insert = database.prepare(`INSERT OR IGNORE INTO psit_erp_notification_fingerprints(
         fingerprint, notification_type, created_at
       ) VALUES (?, ?, ?)`)
       const deletePending = database.prepare('DELETE FROM psit_erp_pending_notifications WHERE fingerprint = ?')
       const markDelivered = database.prepare('UPDATE psit_erp_detected_changes SET delivered_at = ? WHERE fingerprint = ?')
-      for (const change of notifications) {
-        insert.run(change.fingerprint, `erp-${change.page}`, capturedAt)
-        deletePending.run(change.fingerprint)
-        markDelivered.run(capturedAt, change.fingerprint)
-      }
+      insert.run(fingerprint, `erp-${payload.page}`, capturedAt)
+      deletePending.run(fingerprint)
+      markDelivered.run(capturedAt, fingerprint)
+      delivered.push(payload)
     }
-    return notifications.map(({ fingerprint, ...notification }) => notification)
+    return delivered
+  }
+
+  cleanupHistory(now = new Date()) {
+    const cutoff = new Date(now.getTime() - this.notificationRetentionDays * 86400000).toISOString()
+    const database = this.database.db
+    withSqliteTransaction(database, () => {
+      database.prepare(`DELETE FROM psit_erp_detected_changes
+        WHERE delivered_at != '' AND delivered_at < ?`).run(cutoff)
+      database.prepare(`DELETE FROM psit_erp_notification_fingerprints
+        WHERE created_at < ? AND fingerprint NOT IN (
+          SELECT fingerprint FROM psit_erp_pending_notifications
+        )`).run(cutoff)
+      database.prepare(`DELETE FROM psit_erp_sync_history
+        WHERE completed_at < ? AND id NOT IN (
+          SELECT id FROM psit_erp_sync_history ORDER BY id DESC LIMIT 100
+        )`).run(cutoff)
+      database.prepare(`DELETE FROM psit_erp_notices WHERE id NOT IN (
+        SELECT id FROM psit_erp_notices ORDER BY id DESC LIMIT 500
+      )`).run()
+      database.prepare(`DELETE FROM psit_erp_attendance_reports
+        WHERE status = 'delivered' AND report_date < ?`).run(cutoff.slice(0, 10))
+    })
   }
 
   async connect(userId, password) {
@@ -1245,6 +1485,7 @@ export class PsitErpService {
       return this.finishSyncFailure(result.status, source, credentials)
     }
     const capturedAt = new Date().toISOString()
+    this.cleanupHistory(new Date(capturedAt))
     const activityDefinitions = [
       { type: 'attendance-request', path: '/Student/StudentAttRequest' },
       { type: 'online-training', path: '/Student/OnlineTraining' },
@@ -1264,6 +1505,14 @@ export class PsitErpService {
       const data = parseActivityPage(page.html, definition.type)
       if (data) activityPages.push({ type: definition.type, data })
       else activityFailures.push(`${definition.type} (content not recognized)`)
+      if (data && definition.type !== 'online-training' && data.unrecognizedStatusCount) {
+        if (!this.statusParserWarnings.has(definition.type)) {
+          console.warn(`[PSIT ERP parser] Could not normalize status for ${definition.type}; preserving any previously verified status.`)
+          this.statusParserWarnings.add(definition.type)
+        }
+      } else if (data) {
+        this.statusParserWarnings.delete(definition.type)
+      }
     }
     const activityChanges = await this.persistActivityPages(activityPages, capturedAt)
     if (monitorOnly) {
@@ -1343,23 +1592,23 @@ export class PsitErpService {
     const database = this.database.db
     if (attendance) {
       const overallPercent = attendance.percentageWithPf ?? attendance.percentageWithoutPf
-      const previous = database.prepare(`SELECT data_json AS dataJson FROM psit_erp_attendance_snapshots
+      const current = database.prepare(`SELECT id FROM psit_erp_attendance_snapshots
         ORDER BY id DESC LIMIT 1`).get()
-      if (previous && JSON.stringify(JSON.parse(previous.dataJson)) !== JSON.stringify(attendance)) {
-        this.queueDetectedChange({
-          source: 'attendance',
-          action: 'updated',
-          label: `Overall attendance is now ${typeof overallPercent === 'number' ? `${overallPercent}%` : 'unavailable'}`,
-          sourceTimestamp: capturedAt,
-        }, capturedAt)
+      if (current) {
+        database.prepare(`UPDATE psit_erp_attendance_snapshots SET captured_at = ?,
+          overall_percent = ?, data_json = ? WHERE id = ?`).run(
+          capturedAt, overallPercent, JSON.stringify(attendance), current.id,
+        )
+        database.prepare('DELETE FROM psit_erp_attendance_snapshots WHERE id != ?').run(current.id)
+      } else {
+        database.prepare(`INSERT INTO psit_erp_attendance_snapshots(captured_at, overall_percent, data_json)
+          VALUES (?, ?, ?)`).run(capturedAt, overallPercent, JSON.stringify(attendance))
       }
-      database.prepare(`INSERT INTO psit_erp_attendance_snapshots(captured_at, overall_percent, data_json)
-        VALUES (?, ?, ?)`).run(capturedAt, overallPercent, JSON.stringify(attendance))
     }
     if (timetable) {
-      const previous = database.prepare(`SELECT data_json AS dataJson FROM psit_erp_timetable_snapshots
+      const current = database.prepare(`SELECT id, data_json AS dataJson FROM psit_erp_timetable_snapshots
         ORDER BY id DESC LIMIT 1`).get()
-      const previousTimetable = previous ? JSON.parse(previous.dataJson) : null
+      const previousTimetable = current ? JSON.parse(current.dataJson) : null
       if (previousTimetable && JSON.stringify(previousTimetable) !== JSON.stringify(timetable)) {
         this.queueDetectedChange({
           source: 'timetable',
@@ -1368,8 +1617,14 @@ export class PsitErpService {
           sourceTimestamp: capturedAt,
         }, capturedAt)
       }
-      database.prepare(`INSERT INTO psit_erp_timetable_snapshots(captured_at, week_of, data_json)
-        VALUES (?, ?, ?)`).run(capturedAt, '', JSON.stringify(timetable))
+      if (current) {
+        database.prepare(`UPDATE psit_erp_timetable_snapshots SET captured_at = ?,
+          week_of = '', data_json = ? WHERE id = ?`).run(capturedAt, JSON.stringify(timetable), current.id)
+        database.prepare('DELETE FROM psit_erp_timetable_snapshots WHERE id != ?').run(current.id)
+      } else {
+        database.prepare(`INSERT INTO psit_erp_timetable_snapshots(captured_at, week_of, data_json)
+          VALUES (?, '', ?)`).run(capturedAt, JSON.stringify(timetable))
+      }
     }
     const academicRecords = [
       examCalendar ? ['exam-calendar', { examCalendar }] : null,
@@ -1409,6 +1664,9 @@ export class PsitErpService {
         }, capturedAt)
       }
     }
+    database.prepare(`DELETE FROM psit_erp_notices WHERE id NOT IN (
+      SELECT id FROM psit_erp_notices ORDER BY id DESC LIMIT 500
+    )`).run()
     const academicChanges = await this.deliverPendingNotifications(capturedAt)
 
     const sources = [
@@ -1458,12 +1716,15 @@ export class PsitErpService {
       DELETE FROM psit_erp_timetable_snapshots;
       DELETE FROM psit_erp_academic_records;
       DELETE FROM psit_erp_notices;
+      DELETE FROM psit_erp_request_state;
+      DELETE FROM psit_erp_monitoring_baseline;
+      DELETE FROM psit_erp_attendance_reports;
       DELETE FROM psit_erp_notification_fingerprints;
       DELETE FROM psit_erp_pending_notifications;
       DELETE FROM psit_erp_detected_changes;`)
     this.database.db.prepare(`UPDATE psit_erp_scheduler_state SET next_sync_at = '',
       last_successful_sync_at = '', status = 'idle', failure_count = 0,
-      failure_category = '', paused = 0, updated_at = ? WHERE id = 1`).run(new Date().toISOString())
+      failure_category = '', paused = 0, last_error = '', updated_at = ? WHERE id = 1`).run(new Date().toISOString())
     return { disconnected: true }
   }
 }
@@ -1480,24 +1741,176 @@ export function formatErpChangeNotification(change) {
     notices: 'Academic notice',
   }
   const source = sources[change.page] || 'Student record'
+  if (change.action === 'deleted') {
+    const details = change.details || {}
+    const dateValues = (details.requestedDates || []).map(({ value }) => value).filter(Boolean)
+    return [
+      `${source.toUpperCase()} NO LONGER LISTED`,
+      `Request ID: #${change.requestId || details.requestId || 'Not shown'}`,
+      `Last verified status: ${change.currentStatus || 'Unknown'}`,
+      details.purpose && `Purpose: ${details.purpose}`,
+      dateValues.length && `Requested Date${dateValues.length > 1 ? 's' : ''}: ${dateValues.join(' to ')}`,
+      'It was absent from a complete ERP listing; withdrawal is not confirmed.',
+    ].filter(Boolean).join('\n')
+  }
+  if (['attendance-request', 'od-request', 'online-training'].includes(change.page) && change.currentStatus) {
+    const details = change.details || {}
+    const heading = change.page === 'od-request' ? 'OD REQUEST UPDATE'
+      : change.page === 'attendance-request' ? 'ATTENDANCE REQUEST UPDATE' : 'ONLINE TRAINING UPDATE'
+    const dateValues = (details.requestedDates || []).map(({ value }) => value).filter(Boolean)
+    const stages = (details.statusStages || [])
+      .filter(({ raw }) => raw)
+      .map(({ stage, raw }) => `${stage}: ${raw}`)
+    const lines = [
+      heading,
+      `Request ID: #${change.requestId || details.requestId || 'Not shown'}`,
+      `Previous Status: ${change.previousStatus || 'Not previously listed'}`,
+      `Current Status: ${change.currentStatus}`,
+      details.requestType && `Request Type: ${details.requestType}`,
+      details.testName && `Test: ${details.testName}`,
+      details.examDate && `Exam Date: ${details.examDate}`,
+      details.score && `Score: ${details.score}`,
+      details.percentage && `Percentage: ${details.percentage}`,
+      details.submittedAt && `Submitted: ${details.submittedAt}`,
+      dateValues.length && `Requested Date${dateValues.length > 1 ? 's' : ''}: ${dateValues.join(' to ')}`,
+      details.purpose && `Purpose: ${details.purpose}`,
+      details.remarks && `${change.currentStatus === 'Rejected' ? 'Rejection remarks' : 'Remarks'}: ${details.remarks}`,
+      stages.length > 0 && `Approval steps: ${stages.join('; ')}`,
+      details.approver && `Assigned/approver: ${details.approver}`,
+      details.updatedAt && `Updated At: ${details.updatedAt}`,
+    ].filter(Boolean)
+    const requestLabel = change.page === 'od-request' ? 'OD request'
+      : change.page === 'attendance-request' ? 'attendance request' : 'online training record'
+    if (change.currentStatus === 'Accepted') lines.push(`Your ${requestLabel} has been accepted.`)
+    else if (change.currentStatus === 'Rejected') lines.push(`Your ${requestLabel} has been rejected.`)
+    else if (change.currentStatus === 'Pending' && change.action === 'new') lines.push(`Your new ${requestLabel} is pending review.`)
+    return lines.join('\n')
+  }
   if (['attendance-request', 'od-request', 'online-training'].includes(change.page)) {
-    if (change.action === 'deleted') {
-      return `• ${source} no longer appears in the ERP list: ${change.label || 'record'}`
-    }
-    const action = change.page === 'online-training'
-      ? change.action === 'new' ? 'new result' : 'result updated'
-      : change.action === 'new' ? 'new request' : change.status ? 'review status changed' : 'request updated'
-    const status = change.status || 'The ERP page did not show an approval status.'
-    const submitted = change.sourceTimestamp && change.page !== 'online-training'
-      ? ` · Submitted: ${change.sourceTimestamp}`
-      : ''
-    return `• ${source} — ${action}: ${change.label || 'record'} · ${status}${submitted}`
+    return `• ${source}: ERP status could not be verified; no status notification was generated.`
   }
   const action = change.action === 'new'
     ? 'New record'
-    : change.action === 'deleted' ? 'Record removed or withdrawn' : 'Record updated'
+    : change.action === 'deleted' ? 'No longer listed in the complete ERP record list' : 'Record updated'
   const timestamp = change.sourceTimestamp ? ` · ${change.sourceTimestamp}` : ''
   return `• ${source}: ${action}${change.label ? ` — ${change.label}` : ''}${change.status ? ` (${change.status})` : ''}${timestamp}`
+}
+
+export function getDueAttendanceReportWindows(now = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now).map(({ type, value }) => [type, value]))
+  const minutesToday = Number(parts.hour) * 60 + Number(parts.minute)
+  return [
+    { reportDate: `${parts.year}-${parts.month}-${parts.day}`, reportSlot: '09:00', minuteOfDay: 540 },
+    { reportDate: `${parts.year}-${parts.month}-${parts.day}`, reportSlot: '20:00', minuteOfDay: 1200 },
+  ].filter(({ minuteOfDay }) => minutesToday >= minuteOfDay)
+    .map(({ reportDate, reportSlot }) => ({ reportDate, reportSlot }))
+}
+
+export function formatAttendanceReport(attendance, reportSlot, previousAttendance = null, attendanceUpdatedAt = '') {
+  const percentWithPf = attendance?.percentageWithPf
+  const percentWithoutPf = attendance?.percentageWithoutPf
+  const overall = typeof percentWithPf === 'number'
+    ? `${percentWithPf}% (with PF)`
+    : typeof percentWithoutPf === 'number' ? `${percentWithoutPf}%` : 'Not available'
+  const lines = [`PSIT attendance check-in · ${reportSlot} IST`, `Overall attendance: ${overall}`]
+  if (attendanceUpdatedAt) lines.push(`Data last fetched: ${attendanceUpdatedAt}`)
+  if (typeof percentWithPf === 'number' && typeof percentWithoutPf === 'number') {
+    lines.push(`Without PF: ${percentWithoutPf}%`)
+  }
+  if (attendance.totalLectures !== null && attendance.totalLectures !== undefined) {
+    lines.push(`Classes conducted: ${attendance.totalLectures}`)
+  }
+  if (attendance.totalAbsentPlusOaa !== null && attendance.totalAbsentPlusOaa !== undefined) {
+    lines.push(`Absent + OAA: ${attendance.totalAbsentPlusOaa}`)
+  }
+  if (attendance.subjectWise?.length) {
+    lines.push(`Subject-wise attendance: ${attendance.subjectWise.map((subject) => `${subject.subject} ${subject.percentage}%`).join('; ')}`)
+  } else {
+    lines.push('Subject-wise attendance is not available in the mapped ERP data.')
+  }
+  const previousPercent = previousAttendance?.percentageWithPf ?? previousAttendance?.percentageWithoutPf
+  const currentPercent = percentWithPf ?? percentWithoutPf
+  if (typeof previousPercent === 'number' && typeof currentPercent === 'number' && previousPercent !== currentPercent) {
+    const difference = Number((currentPercent - previousPercent).toFixed(2))
+    lines.push(`Since the previous report: ${difference > 0 ? '+' : ''}${difference} percentage points.`)
+  }
+  return lines.join('\n')
+}
+
+export async function deliverAttendanceReport({
+  database,
+  reportDate,
+  reportSlot,
+  attendance,
+  attendanceUpdatedAt = '',
+  send,
+  now = new Date(),
+}) {
+  const db = database.db
+  const previous = db.prepare(`SELECT payload_json AS payloadJson FROM psit_erp_attendance_reports
+    WHERE status = 'delivered' ORDER BY report_date DESC, report_slot DESC LIMIT 1`).get()
+  db.prepare(`INSERT OR IGNORE INTO psit_erp_attendance_reports(
+    report_date, report_slot, status, payload_json
+  ) VALUES (?, ?, 'pending', ?)`).run(reportDate, reportSlot, JSON.stringify({
+    attendance,
+    attendanceUpdatedAt,
+    previousAttendance: previous ? JSON.parse(previous.payloadJson).attendance : null,
+  }))
+  let report = db.prepare(`SELECT status, payload_json AS payloadJson, attempts,
+    last_attempt_at AS lastAttemptAt FROM psit_erp_attendance_reports
+    WHERE report_date = ? AND report_slot = ?`).get(reportDate, reportSlot)
+  const nowIso = now.toISOString()
+  if (report.status === 'sending') {
+    const staleAt = Date.parse(report.lastAttemptAt || '')
+    if (Number.isFinite(staleAt) && now.getTime() - staleAt >= 5 * 60000) {
+      db.prepare(`UPDATE psit_erp_attendance_reports SET status = 'uncertain',
+        last_error = 'Previous delivery ended without a recorded Telegram response.'
+        WHERE report_date = ? AND report_slot = ? AND status = 'sending'`).run(reportDate, reportSlot)
+      return { status: 'uncertain' }
+    }
+    return { status: 'sending' }
+  }
+  if (report.status !== 'pending') return { status: report.status }
+  const retryDelay = Math.min(60, 2 ** Math.max(0, report.attempts - 1)) * 60000
+  if (report.lastAttemptAt && now.getTime() - Date.parse(report.lastAttemptAt) < retryDelay) {
+    return { status: 'retry_wait' }
+  }
+  const claimed = db.prepare(`UPDATE psit_erp_attendance_reports SET status = 'sending',
+    attempts = attempts + 1, last_attempt_at = ?, last_error = ''
+    WHERE report_date = ? AND report_slot = ? AND status = 'pending'`).run(nowIso, reportDate, reportSlot).changes
+  if (!claimed) return { status: 'sending' }
+  const payload = JSON.parse(report.payloadJson)
+  try {
+    await send(formatAttendanceReport(
+      payload.attendance,
+      reportSlot,
+      payload.previousAttendance,
+      payload.attendanceUpdatedAt,
+    ))
+    db.prepare(`UPDATE psit_erp_attendance_reports SET status = 'delivered',
+      delivered_at = ?, last_error = '' WHERE report_date = ? AND report_slot = ?`).run(
+      nowIso, reportDate, reportSlot,
+    )
+    return { status: 'delivered' }
+  } catch (error) {
+    const status = error.deliveryUncertain ? 'uncertain' : 'pending'
+    db.prepare(`UPDATE psit_erp_attendance_reports SET status = ?, last_error = ?
+      WHERE report_date = ? AND report_slot = ?`).run(
+      status,
+      String(error.message || 'Telegram delivery failed').slice(0, 240),
+      reportDate,
+      reportSlot,
+    )
+    return { status }
+  }
 }
 
 export function formatErpAnswer(operation, state) {

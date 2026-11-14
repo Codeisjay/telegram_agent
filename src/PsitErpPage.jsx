@@ -155,6 +155,15 @@ export default function PsitErpPage({ onToast }) {
       <div className="psit-panel-heading"><div className="psit-title-icon"><AlertTriangle size={17} /><div><h3>Last synchronization issue</h3><p>{state.lastSyncError}</p></div></div></div>
     </section>}
 
+    <section className="panel psit-panel">
+      <div className="psit-panel-heading"><div className="psit-title-icon"><GraduationCap size={17} /><div><h3>Attendance briefings</h3><p>Scheduled at 09:00 and 20:00 Asia/Kolkata, separate from 15-minute ERP polling.</p></div></div></div>
+      {(state.attendanceReports || []).map((report) => <div className="psit-history-row" key={`${report.reportDate}-${report.reportSlot}`}>
+        <strong>{report.reportDate} · {report.reportSlot} IST</strong>
+        <span>{formatStatus(report.status)}{report.lastError ? ` · ${report.lastError}` : ''}</span>
+        <small>{report.deliveredAt ? formatDate(report.deliveredAt) : `${report.attempts} attempt(s)`}</small>
+      </div>)}
+    </section>
+
     <section className="panel psit-panel psit-limitation">
       <div className="psit-panel-heading"><div className="psit-title-icon"><AlertTriangle size={17} /><div><h3>{hasVerifiedData ? 'Verified ERP data' : 'Data retrieval not active yet'}</h3><p>{hasVerifiedData ? 'Only data parsed from authenticated PSIT pages is shown.' : 'Run a manual sync to retrieve data from mapped authenticated pages.'}</p></div></div></div>
       <p>{state.limitation}</p>
@@ -188,9 +197,18 @@ export default function PsitErpPage({ onToast }) {
     {state.recentChanges?.length > 0 && <section className="panel psit-panel">
       <div className="psit-panel-heading"><div className="psit-title-icon"><AlertTriangle size={17} /><div><h3>Recent detected changes</h3><p>New, updated, or reliably removed records.</p></div></div></div>
       {state.recentChanges.map((change, index) => <div className="psit-history-row" key={`${change.source}-${change.detectedAt}-${index}`}>
-        <strong>{formatStatus(change.source)} · {formatStatus(change.action)}</strong>
-        <span>{change.summary || 'Record changed'}</span>
-        <small>{change.sourceTimestamp || formatDate(change.detectedAt)}</small>
+        <strong>{change.recordId
+          ? `${formatStatus(change.source)} #${change.recordId}: ${change.previousStatus || 'New'} → ${change.currentStatus || formatStatus(change.action)}`
+          : change.duplicateCount > 1
+            ? `${formatStatus(change.source)} legacy events (${change.duplicateCount} duplicates collapsed)`
+            : `${formatStatus(change.source)} · ${formatStatus(change.action)}`}</strong>
+        <span>{change.recordId
+          ? [change.details?.requestType, change.details?.purpose && `Purpose: ${change.details.purpose}`,
+            change.details?.remarks && `Remarks: ${change.details.remarks}`,
+            change.details?.statusStages?.map(({ stage, raw }) => `${stage}: ${raw}`).join('; ')]
+            .filter(Boolean).join(' · ') || change.summary
+          : change.summary || 'Record changed'}</span>
+        <small>{change.details?.updatedAt || change.sourceTimestamp || formatDate(change.detectedAt)}{change.deliveryStatus === 'uncertain' ? ' · Telegram delivery status unknown' : ''}{change.duplicateCount > 1 && change.recordId ? ` · ${change.duplicateCount} duplicates collapsed` : ''}</small>
       </div>)}
     </section>}
 

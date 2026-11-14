@@ -5,9 +5,12 @@ import path from 'node:path'
 import { after, test } from 'node:test'
 import {
   decryptErpCredentials,
+  deliverAttendanceReport,
   encryptErpCredentials,
   formatErpAnswer,
   formatErpChangeNotification,
+  formatAttendanceReport,
+  getDueAttendanceReportWindows,
   getErpEncryptionKey,
   PsitErpService,
   resolveErpOperation,
@@ -58,9 +61,9 @@ const authenticatedOnlineTrainingPage = `<a href="/Student/Logout">Logout</a><ta
   <td>8 / 10</td><td>80%</td><td><a href="/Student/OnlineTrainingDetails/private-token">View</a></td></tr></tbody></table>`
 const authenticatedOdRequestPage = `<a href="/Student/Logout">Logout</a><table><thead><tr>
   <th>Request-Id</th><th>Details</th><th>Proof</th><th>Request Submitted At</th>
-  <th>Assign To</th><th>Verify</th><th>HOD</th><th>Director</th></tr></thead><tbody>
+  <th>Assign To</th><th>Verify</th><th>HOD</th><th>Director</th><th>Remarks</th></tr></thead><tbody>
   <tr><td>OD-200</td><td>Private OD reason</td><td></td><td>2026-11-11 09:00</td>
-  <td>Coordinator A</td><td>Pending</td><td>Pending</td><td>Pending</td></tr></tbody></table>
+  <td>Coordinator A</td><td>Pending</td><td>Pending</td><td>Pending</td><td></td></tr></tbody></table>
   <div>Showing 1 to 1 of 1 entries</div>`
 const authenticatedMarksPage = `<a href="/Student/Logout">Logout</a>
   <form action="/Student/TestSubjectMarksReport" method="post"><select name="cTest">
@@ -112,18 +115,30 @@ test('natural-language ERP requests resolve only to validated local operations',
     formatErpChangeNotification({
       page: 'od-request',
       action: 'updated',
-      label: 'Request #OD-200 · Dates: 2026-11-11 to 2026-11-11',
-      status: 'Verification: Approved; HOD: Pending; Director: Pending',
-      sourceTimestamp: '2026-11-11 09:00',
+      requestId: 'OD-200',
+      previousStatus: 'Pending',
+      currentStatus: 'Accepted',
+      details: {
+        requestedDates: [{ value: '2026-11-11' }, { value: '2026-11-11' }],
+        statusStages: [
+          { stage: 'Verification', raw: 'Approved' },
+          { stage: 'HOD', raw: 'Approved' },
+          { stage: 'Director', raw: 'Approved' },
+        ],
+        updatedAt: '2026-11-11 09:00',
+      },
     }),
-    '• On-duty (OD) request — review status changed: Request #OD-200 · Dates: 2026-11-11 to 2026-11-11 · Verification: Approved; HOD: Pending; Director: Pending · Submitted: 2026-11-11 09:00',
+    'OD REQUEST UPDATE\nRequest ID: #OD-200\nPrevious Status: Pending\nCurrent Status: Accepted\nRequested Dates: 2026-11-11 to 2026-11-11\nApproval steps: Verification: Approved; HOD: Approved; Director: Approved\nUpdated At: 2026-11-11 09:00\nYour OD request has been accepted.',
   )
   assert.match(formatErpChangeNotification({
     page: 'attendance-request',
     action: 'updated',
-    label: 'Request #REQ-100 · Dates: 2026-11-10 to 2026-11-10',
-    status: 'Coordinator: Rejected; HOD: Pending',
-    sourceTimestamp: '2026-11-09',
+    requestId: 'REQ-100',
+    previousStatus: 'Pending',
+    currentStatus: 'Rejected',
+    details: {
+      statusStages: [{ stage: 'Coordinator', raw: 'Rejected' }, { stage: 'HOD', raw: 'Pending' }],
+    },
   }), /Coordinator: Rejected/)
   assert.equal(validateErpOperation('arbitrary-sql'), null)
   assert.match(formatErpAnswer('attendance', {
@@ -154,6 +169,87 @@ test('natural-language ERP requests resolve only to validated local operations',
   assert.equal(resolveErpOperation('Tell me a joke'), null)
 })
 
+test('attendance reports are due at 09:00 and 20:00 Asia/Kolkata, not on polling intervals', () => {
+  const at0845 = new Date('2026-11-14T03:15:00.000Z')
+  const at0900 = new Date('2026-11-14T03:30:00.000Z')
+  const at2000 = new Date('2026-11-14T14:30:00.000Z')
+  assert.deepEqual(getDueAttendanceReportWindows(at0845), [])
+  assert.deepEqual(getDueAttendanceReportWindows(at0900), [
+    { reportDate: '2026-11-14', reportSlot: '09:00' },
+  ])
+  assert.deepEqual(getDueAttendanceReportWindows(at2000), [
+    { reportDate: '2026-11-14', reportSlot: '09:00' },
+    { reportDate: '2026-11-14', reportSlot: '20:00' },
+  ])
+  const report = formatAttendanceReport({
+    percentageWithPf: 87.5,
+    percentageWithoutPf: 86.5,
+    totalLectures: 200,
+    totalAbsentPlusOaa: 30,
+    subjectWise: null,
+  }, '09:00', { percentageWithPf: 87 })
+  assert.match(report, /87\.5% \(with PF\)/)
+  assert.match(report, /Classes conducted: 200/)
+  assert.match(report, /\+0\.5 percentage points/)
+})
+
+test('attendance report delivery is idempotent and explicit failures retry', async () => {
+  const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-attendance-reports.sqlite'))
+  databases.push(database)
+  const attendance = { percentageWithPf: 87.5, percentageWithoutPf: 86.5, totalLectures: 200 }
+  const morning = { reportDate: '2026-11-14', reportSlot: '09:00' }
+  let delivered = 0
+  const send = async () => { delivered += 1 }
+  assert.equal((await deliverAttendanceReport({
+    database, ...morning, attendance, send,
+    now: new Date('2026-11-14T03:30:00.000Z'),
+  })).status, 'delivered')
+  assert.equal((await deliverAttendanceReport({
+    database, ...morning, attendance, send,
+    now: new Date('2026-11-14T03:45:00.000Z'),
+  })).status, 'delivered')
+  assert.equal(delivered, 1)
+
+  const evening = { reportDate: '2026-11-14', reportSlot: '20:00' }
+  const failed = await deliverAttendanceReport({
+    database, ...evening, attendance,
+    send: async () => { throw new Error('Telegram rejected message') },
+    now: new Date('2026-11-14T14:30:00.000Z'),
+  })
+  assert.equal(failed.status, 'pending')
+  assert.equal(database.db.prepare(`SELECT delivered_at FROM psit_erp_attendance_reports
+    WHERE report_date = ? AND report_slot = ?`).get(evening.reportDate, evening.reportSlot).delivered_at, '')
+  database.db.prepare(`UPDATE psit_erp_attendance_reports SET last_attempt_at = '2000-01-01T00:00:00.000Z'
+    WHERE report_date = ? AND report_slot = ?`).run(evening.reportDate, evening.reportSlot)
+  assert.equal((await deliverAttendanceReport({
+    database, ...evening, attendance, send,
+    now: new Date('2026-11-14T14:45:00.000Z'),
+  })).status, 'delivered')
+  assert.equal((await deliverAttendanceReport({
+    database, ...evening, attendance, send,
+    now: new Date('2026-11-14T15:00:00.000Z'),
+  })).status, 'delivered')
+  assert.equal(delivered, 2)
+
+  const uncertain = { reportDate: '2026-11-15', reportSlot: '09:00' }
+  let uncertainAttempts = 0
+  const uncertainSend = async () => {
+    uncertainAttempts += 1
+    const error = new Error('Telegram response timed out')
+    error.deliveryUncertain = true
+    throw error
+  }
+  assert.equal((await deliverAttendanceReport({
+    database, ...uncertain, attendance, send: uncertainSend,
+    now: new Date('2026-11-15T03:30:00.000Z'),
+  })).status, 'uncertain')
+  assert.equal((await deliverAttendanceReport({
+    database, ...uncertain, attendance, send: uncertainSend,
+    now: new Date('2026-11-15T03:45:00.000Z'),
+  })).status, 'uncertain')
+  assert.equal(uncertainAttempts, 1)
+})
+
 test('ERP connection stores encrypted credentials and syncs verified student pages', async () => {
   const database = await JobDatabase.open(path.join(temporaryDirectory, 'erp-connection.sqlite'))
   databases.push(database)
@@ -163,7 +259,13 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   let timetablePageReceivedCookie = false
   let transientDataFailure = false
   let attendanceRequestUpdated = false
-  let odRequestStatus = 'Pending'
+  let odRequestStatus = ['Pending', 'Pending', 'Pending']
+  let odRejectionRemark = ''
+  let onlineTrainingScore = '8 / 10'
+  let additionalPendingOdRequest = false
+  let secondPendingOdRequest = false
+  let partialOdListing = false
+  let failNotifications = false
   let odRequestDeleted = false
   const notifications = []
   const fetchImpl = async (url, options = {}) => {
@@ -189,12 +291,21 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
         : authenticatedAttendanceRequestsPage, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/OnlineTraining') {
-      return new Response(authenticatedOnlineTrainingPage, { status: 200 })
+      return new Response(authenticatedOnlineTrainingPage.replace('8 / 10', onlineTrainingScore), { status: 200 })
     }
     if (requestUrl.pathname === '/Student/ODRequest') {
       const page = odRequestDeleted
         ? authenticatedOdRequestPage.replace(/<tr><td>OD-200[\s\S]*?<\/tr>/, '').replace('Showing 1 to 1 of 1 entries', 'Showing 0 to 0 of 0 entries')
-        : authenticatedOdRequestPage.replace('<td>Pending</td><td>Pending</td><td>Pending</td></tr>', `<td>${odRequestStatus}</td><td>Pending</td><td>Pending</td></tr>`)
+        : authenticatedOdRequestPage
+          .replace('<td>Pending</td><td>Pending</td><td>Pending</td><td></td></tr>',
+            `<td>${odRequestStatus[0]}</td><td>${odRequestStatus[1]}</td><td>${odRequestStatus[2]}</td><td>${odRejectionRemark}</td></tr>`)
+          .replace('</tbody>', `${additionalPendingOdRequest
+            ? '<tr><td>OD-201</td><td>Medical appointment</td><td></td><td>2026-11-13 10:00</td><td>Coordinator B</td><td>Pending</td><td>Pending</td><td>Pending</td><td></td></tr>'
+            : ''}${secondPendingOdRequest
+            ? '<tr><td>OD-202</td><td>Sports event</td><td></td><td>2026-11-14 08:00</td><td>Coordinator C</td><td>Pending</td><td>Pending</td><td>Pending</td><td></td></tr>'
+            : ''}</tbody>`)
+          .replace('Showing 1 to 1 of 1 entries',
+            `Showing 1 to ${1 + Number(additionalPendingOdRequest) + Number(secondPendingOdRequest)} of ${1 + Number(additionalPendingOdRequest) + Number(secondPendingOdRequest) + Number(partialOdListing)} entries`)
       return new Response(page, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/TestSubjectMarksReport') {
@@ -223,7 +334,11 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
     database,
     encryptionKey: key,
     fetchImpl,
-    notifyChanges: async (changes) => { notifications.push(...changes); return true },
+    notifyChanges: async (changes) => {
+      if (failNotifications) throw new Error('Telegram test delivery failed')
+      notifications.push(...changes)
+      return true
+    },
     onDiagnostic: (entry) => diagnostics.push(entry),
   })
   const result = await service.connect('student-12345', 'private-test-password')
@@ -290,37 +405,103 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(database.db.prepare('SELECT overall_percent FROM psit_erp_attendance_snapshots ORDER BY id DESC LIMIT 1').get().overall_percent, 88.5)
   assert.equal(syncedState.data.academic.examCalendar.exams[0]['CT I'], '2026-11-20')
   assert.equal(syncedState.data.notices.length, 1)
+  assert.equal(database.db.prepare(`SELECT COUNT(*) AS count FROM psit_erp_request_state
+    WHERE module = 'od-request' AND record_id = 'OD-200'`).get().count, 1)
+  assert.equal(JSON.parse(database.db.prepare(`SELECT state_json AS stateJson FROM psit_erp_request_state
+    WHERE module = 'online-training' AND record_id = '1'`).get().stateJson).score, '8 / 10')
   assert.equal(notifications.length, 0)
+  for (let poll = 0; poll < 20; poll += 1) await service.sync()
+  onlineTrainingScore = '9 / 10'
   await service.sync()
+  assert.equal(notifications.length, 0)
+  assert.equal(database.db.prepare('SELECT COUNT(*) AS count FROM psit_erp_attendance_snapshots').get().count, 1)
+  assert.equal(database.db.prepare('SELECT COUNT(*) AS count FROM psit_erp_timetable_snapshots').get().count, 1)
   assert.equal(notifications.length, 0)
   attendanceRequestUpdated = true
   await service.sync()
   assert.equal(notifications.length, 1)
   assert.equal(notifications[0].page, 'attendance-request')
   assert.equal(notifications[0].action, 'updated')
-  assert.equal(JSON.stringify(notifications).includes('Private reason'), false)
-  await service.sync()
+  assert.equal(JSON.stringify(notifications).includes('Private reason'), true)
+  for (let poll = 0; poll < 20; poll += 1) await service.sync()
   assert.equal(notifications.length, 1)
-  odRequestStatus = 'Approved'
+  odRequestStatus = ['Approved', 'Approved', 'Approved']
   await service.sync()
   assert.equal(notifications.length, 2)
   assert.equal(notifications[1].page, 'od-request')
   assert.equal(notifications[1].action, 'updated')
+  assert.equal(notifications[1].currentStatus, 'Accepted')
   assert.match(notifications[1].status, /Verification: Approved/)
-  assert.match(notifications[1].status, /HOD: Pending/)
+  assert.match(notifications[1].status, /HOD: Approved/)
   assert.match(notifications[1].label, /Request #OD-200/)
   assert.equal(notifications[1].sourceTimestamp, '2026-11-11 09:00')
-  assert.match(formatErpChangeNotification(notifications[1]), /review status changed/)
+  assert.match(formatErpChangeNotification(notifications[1]), /Previous Status: Pending/)
+  assert.match(formatErpChangeNotification(notifications[1]), /Current Status: Accepted/)
   assert.match(formatErpChangeNotification(notifications[1]), /2026-11-11 09:00/)
-  assert.equal(JSON.stringify(notifications).includes('Private OD reason'), false)
+  assert.match(formatErpChangeNotification(notifications[1]), /Purpose: Private OD reason/)
+  assert.equal(JSON.stringify(notifications).includes('Private OD reason'), true)
+  for (let poll = 0; poll < 20; poll += 1) await service.sync()
+  assert.equal(notifications.length, 2)
+  odRequestStatus = ['Unrecognized', 'Unrecognized', 'Unrecognized']
   await service.sync()
   assert.equal(notifications.length, 2)
+  assert.equal(JSON.parse(database.db.prepare(`SELECT state_json AS stateJson
+    FROM psit_erp_request_state WHERE module = 'od-request' AND record_id = 'OD-200'`).get().stateJson).status, 'Accepted')
+  odRequestStatus = ['Pending', 'Pending', 'Pending']
+  await service.sync()
+  assert.equal(notifications.length, 3)
+  assert.equal(notifications[2].currentStatus, 'Pending')
+  odRequestStatus = ['Rejected', 'Rejected', 'Rejected']
+  odRejectionRemark = 'Insufficient supporting proof'
+  await service.sync()
+  assert.equal(notifications.length, 4)
+  assert.equal(notifications[3].previousStatus, 'Pending')
+  assert.equal(notifications[3].currentStatus, 'Rejected')
+  assert.match(formatErpChangeNotification(notifications[3]), /Rejection remarks: Insufficient supporting proof/)
+  for (let poll = 0; poll < 20; poll += 1) await service.sync()
+  assert.equal(notifications.length, 4)
   odRequestDeleted = true
   await service.sync()
-  assert.equal(notifications.length, 3)
-  assert.equal(notifications[2].action, 'deleted')
+  assert.equal(notifications.length, 5)
+  assert.equal(notifications[4].action, 'deleted')
+  assert.match(formatErpChangeNotification(notifications[4]), /absent from a complete ERP listing; withdrawal is not confirmed/i)
+  for (let poll = 0; poll < 20; poll += 1) await service.sync()
+  assert.equal(notifications.length, 5)
+  assert.equal(database.db.prepare(`SELECT COUNT(*) AS count FROM psit_erp_request_state
+    WHERE module = 'od-request' AND record_id = 'OD-200'`).get().count, 1)
+  odRequestDeleted = false
+  additionalPendingOdRequest = true
   await service.sync()
-  assert.equal(notifications.length, 3)
+  assert.equal(notifications.length, 6)
+  assert.equal(notifications[5].requestId, 'OD-201')
+  assert.equal(notifications[5].action, 'new')
+  assert.equal(notifications[5].currentStatus, 'Pending')
+  failNotifications = true
+  secondPendingOdRequest = true
+  await service.sync()
+  assert.equal(notifications.length, 6)
+  assert.equal(database.db.prepare(`SELECT delivery_status FROM psit_erp_pending_notifications
+    WHERE json_extract(payload_json, '$.requestId') = 'OD-202'`).get().delivery_status, 'pending')
+  assert.equal(database.db.prepare(`SELECT delivered_at FROM psit_erp_detected_changes
+    WHERE record_id = 'OD-202'`).get().delivered_at, '')
+  secondPendingOdRequest = false
+  partialOdListing = true
+  await service.sync()
+  assert.equal(JSON.parse(database.db.prepare(`SELECT state_json AS stateJson
+    FROM psit_erp_request_state WHERE module = 'od-request' AND record_id = 'OD-202'`).get().stateJson).presence, 'listed')
+  service.cleanupHistory(new Date(Date.now() + 365 * 86400000))
+  assert.equal(database.db.prepare(`SELECT COUNT(*) AS count FROM psit_erp_request_state
+    WHERE module = 'od-request' AND record_id = 'OD-202'`).get().count, 1)
+  assert.equal(database.db.prepare(`SELECT COUNT(*) AS count FROM psit_erp_pending_notifications
+    WHERE json_extract(payload_json, '$.requestId') = 'OD-202'`).get().count, 1)
+  failNotifications = false
+  database.db.prepare(`UPDATE psit_erp_pending_notifications SET last_attempt_at = '2000-01-01T00:00:00.000Z'
+    WHERE json_extract(payload_json, '$.requestId') = 'OD-202'`).run()
+  await service.sync()
+  assert.equal(notifications.length, 7)
+  assert.equal(notifications[6].requestId, 'OD-202')
+  assert.equal(database.db.prepare(`SELECT delivery_status FROM psit_erp_pending_notifications
+    WHERE json_extract(payload_json, '$.requestId') = 'OD-202'`).get(), undefined)
   transientDataFailure = true
   await service.sync()
   assert.equal(service.getState().data.attendance.percentageWithPf, 88.5)

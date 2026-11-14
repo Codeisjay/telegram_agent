@@ -626,7 +626,11 @@ export class JobDatabase {
       CREATE TABLE IF NOT EXISTS psit_erp_pending_notifications (
         fingerprint TEXT PRIMARY KEY,
         payload_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT ''
       );
       CREATE TABLE IF NOT EXISTS psit_erp_detected_changes (
         id INTEGER PRIMARY KEY,
@@ -636,7 +640,35 @@ export class JobDatabase {
         summary TEXT NOT NULL DEFAULT '',
         source_timestamp TEXT NOT NULL DEFAULT '',
         detected_at TEXT NOT NULL,
-        delivered_at TEXT NOT NULL DEFAULT ''
+        delivered_at TEXT NOT NULL DEFAULT '',
+        record_id TEXT NOT NULL DEFAULT '',
+        previous_status TEXT NOT NULL DEFAULT '',
+        current_status TEXT NOT NULL DEFAULT '',
+        details_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_request_state (
+        module TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        state_fingerprint TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(module, record_id)
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_monitoring_baseline (
+        module TEXT PRIMARY KEY,
+        established_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS psit_erp_attendance_reports (
+        report_date TEXT NOT NULL,
+        report_slot TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        payload_json TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        delivered_at TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(report_date, report_slot)
       );
       CREATE TABLE IF NOT EXISTS psit_erp_scheduler_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -683,6 +715,29 @@ export class JobDatabase {
     const erpSchedulerColumns = new Set(this.db.prepare('PRAGMA table_info(psit_erp_scheduler_state)').all().map((column) => column.name))
     if (!erpSchedulerColumns.has('last_error')) {
       this.db.exec("ALTER TABLE psit_erp_scheduler_state ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
+    }
+    for (const [table, columns] of [
+      ['psit_erp_pending_notifications', [
+        ['delivery_status', "TEXT NOT NULL DEFAULT 'pending'"],
+        ['attempts', 'INTEGER NOT NULL DEFAULT 0'],
+        ['last_attempt_at', "TEXT NOT NULL DEFAULT ''"],
+        ['last_error', "TEXT NOT NULL DEFAULT ''"],
+      ]],
+      ['psit_erp_detected_changes', [
+        ['record_id', "TEXT NOT NULL DEFAULT ''"],
+        ['previous_status', "TEXT NOT NULL DEFAULT ''"],
+        ['current_status', "TEXT NOT NULL DEFAULT ''"],
+        ['details_json', "TEXT NOT NULL DEFAULT '{}'"],
+      ]],
+      ['psit_erp_attendance_reports', [
+        ['last_attempt_at', "TEXT NOT NULL DEFAULT ''"],
+        ['last_error', "TEXT NOT NULL DEFAULT ''"],
+      ]],
+    ]) {
+      const columnsPresent = new Set(this.db.prepare(`PRAGMA table_info(${table})`).all().map((column) => column.name))
+      for (const [column, declaration] of columns) {
+        if (!columnsPresent.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`)
+      }
     }
     const newsSettingsColumns = new Set(this.db.prepare('PRAGMA table_info(news_settings)').all().map((column) => column.name))
     for (const [column, declaration] of [

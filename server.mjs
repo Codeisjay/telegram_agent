@@ -50,12 +50,15 @@ for (const name of [
   'PSIT_ERP_USER_ID',
   'PSIT_ERP_PASSWORD',
   'PSIT_ERP_SYNC_INTERVAL_MINUTES',
+  'PSIT_ERP_NOTIFICATION_RETENTION_DAYS',
 ]) {
   if (process.env[name] === undefined && psitErpEnvironment[name] !== undefined) {
     process.env[name] = psitErpEnvironment[name]
   }
 }
 const {
+  deliverAttendanceReport,
+  getDueAttendanceReportWindows,
   formatErpChangeNotification,
   formatErpAnswer,
   PSIT_ERP_PASSWORD_RESET_URL,
@@ -94,9 +97,16 @@ const psitErpSyncIntervalMinutes = readPositiveInteger(
   15,
   360,
 )
+const psitErpNotificationRetentionDays = readPositiveInteger(
+  process.env.PSIT_ERP_NOTIFICATION_RETENTION_DAYS,
+  90,
+  7,
+  365,
+)
 const psitErp = new PsitErpService({
   database,
   monitoringIntervalMinutes: psitErpSyncIntervalMinutes,
+  notificationRetentionDays: psitErpNotificationRetentionDays,
   encryptionKey: process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY || psitErpEnvironment.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY,
   notifyChanges: async (changes) => {
     const secrets = await readSecrets()
@@ -1616,13 +1626,17 @@ async function telegramRequest(method, payload = {}, signal) {
     const message = error.name === 'TimeoutError' || error.name === 'AbortError'
       ? `Telegram ${method} request timed out.`
       : `Could not reach Telegram for ${method}.`
-    throw serviceError(message, 502)
+    const failure = serviceError(message, 502)
+    failure.deliveryUncertain = true
+    throw failure
   }
   let result
   try {
     result = await response.json()
   } catch {
-    throw serviceError(`Telegram ${method} returned an invalid response (HTTP ${response.status}).`, 502)
+    const failure = serviceError(`Telegram ${method} returned an invalid response (HTTP ${response.status}).`, 502)
+    failure.deliveryUncertain = true
+    throw failure
   }
   if (!response.ok || !result.ok) {
     throw serviceError(`Telegram ${method} failed: ${result.description || `HTTP ${response.status}`}`, 502)
@@ -2446,6 +2460,31 @@ async function runPsitErpScheduledSync(trigger = 'timer', force = false) {
   }
 }
 
+async function runPsitAttendanceReports(now = new Date()) {
+  const state = psitErp.getState()
+  const attendance = state.data?.attendance
+  if (!state.credentialsAvailable || !attendance) return { status: 'attendance_unavailable' }
+  const chatId = await getCompanionNotificationChatId()
+  const secrets = await readSecrets()
+  if (!chatId || !secrets.TELEGRAM_BOT_TOKEN) return { status: 'telegram_not_configured' }
+  const windows = getDueAttendanceReportWindows(now)
+  let deliveredCount = 0
+
+  for (const { reportDate, reportSlot } of windows) {
+    const result = await deliverAttendanceReport({
+      database,
+      reportDate,
+      reportSlot,
+      attendance,
+      attendanceUpdatedAt: state.data.attendanceUpdatedAt || '',
+      now,
+      send: (message) => sendTelegramMessage(chatId, message),
+    })
+    if (result.status === 'delivered') deliveredCount += 1
+  }
+  return { status: deliveredCount ? 'delivered' : 'no_due_report', deliveredCount }
+}
+
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${host}:${port}`)
   try {
@@ -2598,7 +2637,9 @@ const server = createServer(async (request, response) => {
 
     if (isPsitErpCronRoute) {
       if (!isAuthorizedPsitErpCron) return respond(response, 401, { error: 'Authorized PSIT ERP cron access is required.' })
-      return respond(response, 200, await runPsitErpScheduledSync('external'))
+      const sync = await runPsitErpScheduledSync('external')
+      const attendanceReports = await runPsitAttendanceReports()
+      return respond(response, 200, { ...sync, attendanceReports })
     }
 
     if (request.method === 'POST' && url.pathname === '/api/psit-erp/connect') {
@@ -2910,10 +2951,15 @@ server.listen(port, host, () => {
   }, 60000)
   companionInterval.unref?.()
   runPsitErpScheduledSync('startup')
+    .then(() => runPsitAttendanceReports())
     .catch(() => logEvent('500 ERROR', 'Could not start the PSIT ERP scheduler.', 'errors'))
-  psitErpInterval = setInterval(() => {
-    runPsitErpScheduledSync('timer')
-      .catch(() => logEvent('500 ERROR', 'PSIT ERP scheduler tick failed.', 'errors'))
+  psitErpInterval = setInterval(async () => {
+    try {
+      await runPsitErpScheduledSync('timer')
+      await runPsitAttendanceReports()
+    } catch {
+      logEvent('500 ERROR', 'PSIT ERP scheduler tick failed.', 'errors')
+    }
   }, 30000)
   psitErpInterval.unref?.()
   const preferences = database.getAgentPreferences()
