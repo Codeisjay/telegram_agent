@@ -101,8 +101,8 @@ function Badge({ children, tone = 'green', className = '' }) {
   return <span className={`badge badge-${tone} ${className}`}>{children}</span>
 }
 
-function Switch({ checked, onChange, label }) {
-  return <button type="button" role="switch" aria-checked={checked} aria-label={label} className={`switch ${checked ? 'is-on' : ''}`} onClick={() => onChange(!checked)}><span /></button>
+function Switch({ checked, onChange, label, disabled = false }) {
+  return <button type="button" role="switch" aria-checked={checked} aria-label={label} disabled={disabled} className={`switch ${checked ? 'is-on' : ''}`} onClick={() => onChange(!checked)}><span /></button>
 }
 
 function App() {
@@ -543,18 +543,19 @@ function NewsInterestsPage({ onToast }) {
     interests.splice(to, 0, moved)
     updateSettings({ interests: interests.map((interest, order) => ({ ...interest, order })) })
   }
-  const saveSettings = async () => {
+  const saveSettings = async (snapshot = settings, successMessage = 'News monitoring settings saved.') => {
+    if (!snapshot) return
     setSaving(true)
     try {
       const response = await fetch('/api/news/settings', {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(settings),
+        body: JSON.stringify(snapshot),
       })
       const result = await readApiResponse(response)
       if (!response.ok) throw new Error(result.error || 'Could not save news settings.')
       setSettings(result.settings)
-      onToast('News monitoring settings saved.')
+      onToast(successMessage)
     } catch (error) {
       onToast(error.message || 'Could not save news settings.')
     } finally {
@@ -567,13 +568,13 @@ function NewsInterestsPage({ onToast }) {
     : 'Not yet'
 
   return <div className="settings-page">
-    <SectionHeader eyebrow="PERSONALIZED MONITORING" title="News interests" description="Configure once. AgentFlow scans automatically and sends only new, relevant briefings to Telegram." action={<button className="primary-button" disabled={loading || saving || !settings} onClick={saveSettings}>{saving ? <RefreshCw size={14} className="spin" /> : <Check size={15} />}{saving ? 'Saving…' : 'Save settings'}</button>} />
+    <SectionHeader eyebrow="PERSONALIZED MONITORING" title="News interests" description="Configure once. AgentFlow scans automatically and sends only new, relevant briefings to Telegram." action={<button className="primary-button" disabled={loading || saving || !settings} onClick={() => saveSettings()}>{saving ? <RefreshCw size={14} className="spin" /> : <Check size={15} />}{saving ? 'Saving…' : 'Save settings'}</button>} />
     {loading && <section className="panel settings-panel"><p className="news-loading">Loading your saved news settings…</p></section>}
     {!loading && settings && <>
       <section className="panel settings-panel news-monitor-panel">
         <div className="panel-heading"><div><div className="panel-title-icon search-config-icon"><Newspaper size={16} /></div><div><h2>Proactive news monitoring</h2><p>Search recent news and notify your Telegram chat when a story matches your interests.</p></div></div><Badge tone={settings.enabled ? 'green' : 'subtle'}>{settings.enabled ? 'MONITORING ON' : 'MONITORING OFF'}</Badge></div>
         <div className="news-monitor-controls">
-          <div className="news-monitor-toggle"><div><strong>Enable monitoring</strong><span>Runs automatically while your AgentFlow service is online.</span></div><Switch checked={settings.enabled} label="Enable proactive news monitoring" onChange={(enabled) => updateSettings({ enabled })} /></div>
+          <div className="news-monitor-toggle"><div><strong>Enable monitoring</strong><span>Runs automatically while your AgentFlow service is online. This switch saves immediately.</span></div><Switch checked={settings.enabled} disabled={saving} label="Enable proactive news monitoring" onChange={(enabled) => saveSettings({ ...settings, enabled }, enabled ? 'News monitoring enabled.' : 'News monitoring disabled.')} /></div>
           <label className="news-interval-field">Search interval <span>hours</span><input type="number" min="1" max="24" step="1" value={settings.intervalHours} onChange={(event) => updateSettings({ intervalHours: Math.max(1, Math.min(24, Number(event.target.value) || 1)) })} /></label>
           <div className="news-schedule-status"><div className="news-next-run"><Clock3 size={15} /><span>Next scheduled scan (Asia/Kolkata)</span><strong>{settings.nextRunAt ? formatDate(settings.nextRunAt) : 'Set when monitoring is enabled'}</strong></div><div className="news-next-run"><CheckCheck size={15} /><span>Last successful search (Asia/Kolkata)</span><strong>{formatDate(settings.lastSuccessfulAt)}</strong></div></div>
         </div>

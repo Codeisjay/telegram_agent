@@ -234,6 +234,24 @@ test('news settings API persists user-selected notification topics', async () =>
   }).then((result) => result.json())
   assert.equal(interests.settings.interests[0].priority, 'high')
   assert.deepEqual(interests.settings.categories, ['Generative AI'])
+
+  const enabledUpdate = await fetch(`${baseUrl}/api/news/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...interests.settings, enabled: true }),
+  })
+  assert.equal(enabledUpdate.status, 200)
+  const enabled = (await enabledUpdate.json()).settings
+  assert.equal(enabled.enabled, true)
+  assert.ok(enabled.nextRunAt)
+  const reloaded = await fetch(`${baseUrl}/api/news`).then((result) => result.json())
+  assert.equal(reloaded.settings.enabled, true)
+  assert.equal(reloaded.settings.nextRunAt, enabled.nextRunAt)
+  await fetch(`${baseUrl}/api/news/settings`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...reloaded.settings, enabled: false }),
+  })
 })
 
 test('digital footprint API persists isolated settings, polls official endpoints, and excludes credentials', async () => {
