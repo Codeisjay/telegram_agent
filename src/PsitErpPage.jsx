@@ -133,6 +133,7 @@ export default function PsitErpPage({ onToast }) {
         <button className="outline-button" type="button" disabled={working} onClick={sync}><RefreshCw size={14} className={working ? 'spin' : ''} />Sync verified academic data</button>
         <button className="psit-disconnect" type="button" disabled={working} onClick={disconnect}><Trash2 size={14} />Disconnect &amp; delete data</button>
       </div>}
+      {state.credentialsStored && <p className="psit-security-note">Automatic monitoring checks attendance requests, online training results, and OD requests every {state.monitoringIntervalMinutes} minutes. Change alerts go to your configured Telegram chat. Credentials stay encrypted in the backend database; do not put your ERP password in environment variables.</p>}
     </section>
 
     <div className="psit-status-grid">
@@ -148,8 +149,27 @@ export default function PsitErpPage({ onToast }) {
         <div><GraduationCap size={15} /><span>Attendance</span><strong>{state.availability.attendance ? 'Cached' : 'Not mapped'}</strong></div>
         <div><CalendarDays size={15} /><span>Timetable</span><strong>{state.availability.timetable ? 'Cached' : 'Not synced'}</strong></div>
         <div><BookOpen size={15} /><span>Marks &amp; notices</span><strong>{state.availability.marks ? 'Marks cached' : state.availability.notices ? 'Notices cached' : 'Not mapped'}</strong></div>
+        <div><GraduationCap size={15} /><span>Attendance requests</span><strong>{state.availability.attendanceRequests ? 'Monitored' : 'Not synced'}</strong></div>
+        <div><BookOpen size={15} /><span>Online training</span><strong>{state.availability.onlineTraining ? 'Monitored' : 'Not synced'}</strong></div>
+        <div><CalendarDays size={15} /><span>OD requests</span><strong>{state.availability.odRequests ? 'Monitored' : 'Not synced'}</strong></div>
       </div>
     </section>
+
+    {state.data.activity && Object.values(state.data.activity).some(Boolean) && <section className="panel psit-panel">
+      <div className="psit-panel-heading"><div className="psit-title-icon"><RefreshCw size={17} /><div><h3>Student activity monitoring</h3><p>Change alerts are deduplicated and sent to the configured Telegram chat.</p></div></div></div>
+      {[
+        ['attendance-request', 'Attendance requests'],
+        ['online-training', 'Online training results'],
+        ['od-request', 'OD requests'],
+      ].filter(([key]) => state.data.activity[key]).map(([key, title]) => {
+        const activity = state.data.activity[key]
+        return <div className="psit-history-row" key={key}>
+          <strong>{title}</strong>
+          <span>{activity.rowCount} records{activity.latestLabel ? ` · Listed: ${activity.latestLabel}` : ''}{activity.latestStatus ? ` · ${activity.latestStatus}` : ''}</span>
+          <small>{formatDate(activity.updatedAt)}</small>
+        </div>
+      })}
+    </section>}
 
     {state.data.attendance && <section className="panel psit-panel">
       <div className="psit-panel-heading"><div className="psit-title-icon"><GraduationCap size={17} /><div><h3>Attendance summary</h3><p>Official totals from the authenticated PSIT attendance page.</p></div></div></div>

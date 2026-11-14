@@ -45,6 +45,19 @@ const authenticatedAttendancePage = `<a href="/Student/Logout">Logout</a>
   <strong>Total Lecture : 200</strong><strong>Total Absent + OAA: 30</strong>
   <strong>O.A. Attendance : 5</strong><strong>Attendance % without PF : 87.5 %</strong>
   <strong>Total PF : 2</strong><strong>Attendance % with PF : 88.5 %</strong>`
+const authenticatedAttendanceRequestsPage = `<a href="/Student/Logout">Logout</a><table><thead><tr>
+  <th>Req.Id</th><th>Details</th><th>Proof</th><th>From Date</th><th>To Date</th>
+  <th>Submitted At</th><th>Coordinator</th><th>H.o.D</th></tr></thead><tbody>
+  <tr><td>REQ-100</td><td>Private reason</td><td></td><td>2026-11-10</td><td>2026-11-10</td>
+  <td>2026-11-09</td><td>Approved</td><td>Pending</td></tr></tbody></table>`
+const authenticatedOnlineTrainingPage = `<a href="/Student/Logout">Logout</a><table><thead><tr>
+  <th>Serial No.</th><th>Exam Date</th><th>Test Name</th><th>Marks Per Ques.</th>
+  <th>Negative Marks</th><th>Marks / Out of</th><th>Percentage</th><th>Action</th></tr></thead>
+  <tbody><tr><td>1</td><td>2026-11-12</td><td>Practice Test</td><td>1</td><td>0</td>
+  <td>8 / 10</td><td>80%</td><td><a href="/Student/OnlineTrainingDetails/private-token">View</a></td></tr></tbody></table>`
+const authenticatedOdRequestPage = `<a href="/Student/Logout">Logout</a><table><thead><tr>
+  <th>Request Id</th><th>From Date</th><th>To Date</th><th>Status</th></tr></thead><tbody>
+  <tr><td>OD-200</td><td>2026-11-11</td><td>2026-11-11</td><td>Pending</td></tr></tbody></table>`
 const authenticatedMarksPage = `<a href="/Student/Logout">Logout</a>
   <form action="/Student/TestSubjectMarksReport" method="post"><select name="cTest">
     <option value="">Select Test Here</option><option value="ct-2-token">CT-2</option>
@@ -86,6 +99,9 @@ test('natural-language ERP requests resolve only to validated local operations',
   assert.equal(resolveErpOperation('When is my next lecture?'), 'next-lecture')
   assert.equal(resolveErpOperation('Show my internal marks'), 'marks')
   assert.equal(resolveErpOperation('Any important academic notices?'), 'notices')
+  assert.equal(resolveErpOperation('Check my OD request status'), 'od-requests')
+  assert.equal(resolveErpOperation('Show online training results'), 'online-training')
+  assert.equal(resolveErpOperation('Any attendance request updates?'), 'attendance-requests')
   assert.equal(resolveErpOperation('Give me my academic summary for this week'), 'academic-summary')
   assert.equal(resolveErpOperation('What are my outstanding library dues?'), 'student-services')
   assert.equal(validateErpOperation('arbitrary-sql'), null)
@@ -109,6 +125,9 @@ test('natural-language ERP requests resolve only to validated local operations',
   assert.match(formatErpAnswer('attendance', cachedState), /85\.5%/)
   assert.match(formatErpAnswer('timetable-week', cachedState), /Computer Science/)
   assert.match(formatErpAnswer('marks', cachedState), /BCS-072 17/)
+  assert.match(formatErpAnswer('od-requests', {
+    data: { activity: { 'od-request': { rowCount: 1, latestLabel: 'Approved', latestStatus: 'Approved' } } },
+  }), /OD requests: 1 records found/)
   assert.match(formatErpAnswer('notices', cachedState), /Assignment deadline notice/)
   assert.match(formatErpAnswer('academic-summary', cachedState), /CT I/)
   assert.equal(resolveErpOperation('Tell me a joke'), null)
@@ -122,6 +141,8 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   let studentPageReceivedCookie = false
   let timetablePageReceivedCookie = false
   let transientDataFailure = false
+  let attendanceRequestUpdated = false
+  const notifications = []
   const fetchImpl = async (url, options = {}) => {
     const requestUrl = new URL(url)
     requests.push({ url: requestUrl, options })
@@ -138,6 +159,17 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
     if (requestUrl.pathname === '/Student/MyAttendanceDetail') {
       if (transientDataFailure) return new Response('Temporary failure', { status: 503 })
       return new Response(authenticatedAttendancePage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/StudentAttRequest') {
+      return new Response(attendanceRequestUpdated
+        ? authenticatedAttendanceRequestsPage.replace('<td>Pending</td></tr>', '<td>Approved</td></tr>')
+        : authenticatedAttendanceRequestsPage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/OnlineTraining') {
+      return new Response(authenticatedOnlineTrainingPage, { status: 200 })
+    }
+    if (requestUrl.pathname === '/Student/ODRequest') {
+      return new Response(authenticatedOdRequestPage, { status: 200 })
     }
     if (requestUrl.pathname === '/Student/TestSubjectMarksReport') {
       if (transientDataFailure && options.method !== 'POST') return new Response('Temporary failure', { status: 503 })
@@ -161,7 +193,13 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
       headers: { 'set-cookie': 'ci_session=login-session; Path=/; HttpOnly' },
     })
   }
-  const service = new PsitErpService({ database, encryptionKey: key, fetchImpl, onDiagnostic: (entry) => diagnostics.push(entry) })
+  const service = new PsitErpService({
+    database,
+    encryptionKey: key,
+    fetchImpl,
+    notifyChanges: async (changes) => { notifications.push(...changes); return true },
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  })
   const result = await service.connect('student-12345', 'private-test-password')
   assert.equal(result.status, 'connected')
   assert.equal(result.message.includes('private-test-password'), false)
@@ -199,6 +237,9 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(syncedState.availability.notices, true)
   assert.equal(syncedState.availability.attendance, true)
   assert.equal(syncedState.availability.marks, true)
+  assert.equal(syncedState.availability.attendanceRequests, true)
+  assert.equal(syncedState.availability.onlineTraining, true)
+  assert.equal(syncedState.availability.odRequests, true)
   assert.equal(syncedState.data.attendance.percentageWithoutPf, 87.5)
   assert.equal(syncedState.data.attendance.percentageWithPf, 88.5)
   assert.equal(syncedState.data.attendance.subjectWise, null)
@@ -220,11 +261,29 @@ test('ERP connection stores encrypted credentials and syncs verified student pag
   assert.equal(database.db.prepare('SELECT overall_percent FROM psit_erp_attendance_snapshots ORDER BY id DESC LIMIT 1').get().overall_percent, 88.5)
   assert.equal(syncedState.data.academic.examCalendar.exams[0]['CT I'], '2026-11-20')
   assert.equal(syncedState.data.notices.length, 1)
+  assert.equal(notifications.length, 0)
+  await service.sync()
+  assert.equal(notifications.length, 0)
+  attendanceRequestUpdated = true
+  await service.sync()
+  assert.equal(notifications.length, 1)
+  assert.equal(notifications[0].page, 'attendance-request')
+  assert.equal(notifications[0].action, 'updated')
+  assert.equal(JSON.stringify(notifications).includes('Private reason'), false)
+  await service.sync()
+  assert.equal(notifications.length, 1)
   transientDataFailure = true
   await service.sync()
   assert.equal(service.getState().data.attendance.percentageWithPf, 88.5)
   assert.equal(service.getState().data.academic.marks.assessments[0].subjects[0].score, '17')
   assert.equal(database.db.prepare('SELECT COUNT(*) AS count FROM psit_erp_notices').get().count, 1)
+  const monitorRequestStart = requests.length
+  assert.equal((await service.sync({ monitorOnly: true })).status, 'completed')
+  const monitorRoutes = requests.slice(monitorRequestStart).map(({ url }) => url.pathname)
+  assert.ok(monitorRoutes.includes('/Student/StudentAttRequest'))
+  assert.ok(monitorRoutes.includes('/Student/OnlineTraining'))
+  assert.ok(monitorRoutes.includes('/Student/ODRequest'))
+  assert.equal(monitorRoutes.includes('/Student/MyTimeTable'), false)
   assert.equal(service.disconnect().disconnected, true)
   assert.equal(service.getState().connected, false)
   assert.equal(service.getState().credentialsStored, false)

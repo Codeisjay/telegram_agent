@@ -622,6 +622,11 @@ export class JobDatabase {
         notification_type TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS psit_erp_pending_notifications (
+        fingerprint TEXT PRIMARY KEY,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS job_applications (
         id INTEGER PRIMARY KEY,
         job_id INTEGER NOT NULL REFERENCES jobs(id),

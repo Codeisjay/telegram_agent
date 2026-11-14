@@ -14,6 +14,9 @@ export const ERP_OPERATIONS = Object.freeze([
   'notices',
   'academic-summary',
   'student-services',
+  'attendance-requests',
+  'online-training',
+  'od-requests',
 ])
 
 const operationCommands = new Map([
@@ -24,6 +27,9 @@ const operationCommands = new Map([
   ['/marks', 'marks'],
   ['/notices', 'notices'],
   ['/academic_summary', 'academic-summary'],
+  ['/student_attendance', 'attendance-requests'],
+  ['/online_training', 'online-training'],
+  ['/od', 'od-requests'],
 ])
 
 export function validateErpOperation(operation) {
@@ -36,8 +42,11 @@ export function resolveErpOperation(text) {
   if (operationCommands.has(command)) return operationCommands.get(command)
 
   const query = input.toLowerCase()
-  if (!/\b(attendance|timetable|lecture|class|classes|marks|internal|exam|examination|notice|academic|subject|free period|assignment|fee|library|dues|profile)\b/.test(query)) return null
+  if (!/\b(attendance|timetable|lecture|class|classes|marks|internal|exam|examination|notice|academic|subject|free period|assignment|fee|library|dues|profile|od|training|request|requests)\b/.test(query)) return null
   if (/\b(next lecture|next class|upcoming lecture)\b/.test(query)) return 'next-lecture'
+  if (/\b(?:attendance|att)\s+requests?\b|\battendance application\b/.test(query)) return 'attendance-requests'
+  if (/\b(?:online training|online exam|online test)\b/.test(query)) return 'online-training'
+  if (/\b(?:od|on duty|out.?station duty)\s+requests?\b/.test(query)) return 'od-requests'
   if (/\b(tomorrow|next day)\b/.test(query) && /\b(timetable|class|classes|lecture)\b/.test(query)) return 'timetable-tomorrow'
   if (/\b(week|weekly)\b/.test(query) && /\b(timetable|class|classes|lecture)\b/.test(query)) return 'timetable-week'
   if (/\b(attendance|attend|miss|shortage)\b/.test(query)) return 'attendance'
@@ -168,6 +177,9 @@ const diagnosticPaths = new Map([
   ['/student/myattendancedetail', '/Student/MyAttendanceDetail'],
   ['/student/mytimetable', '/Student/MyTimeTable'],
   ['/student/testsubjectmarksreport', '/Student/TestSubjectMarksReport'],
+  ['/student/studentattrequest', '/Student/StudentAttRequest'],
+  ['/student/onlinetraining', '/Student/OnlineTraining'],
+  ['/student/odrequest', '/Student/ODRequest'],
   ['/student/library', '/Student/Library'],
 ])
 
@@ -394,6 +406,41 @@ function parseExamCalendar(html) {
     table.headers.slice(0, row.length).map((header, index) => [header, row[index].join(' ').trim()]),
   )).filter((row) => Object.values(row).some(Boolean))
   return exams.length ? { headers: table.headers, exams } : null
+}
+
+function parseActivityPage(html, kind) {
+  const table = readTable(html, (headers) => {
+    if (kind === 'attendance-request') return /req\.?\s*id/i.test(headers[0] || '')
+    if (kind === 'online-training') {
+      return /serial/i.test(headers[0] || '')
+        && /exam\s*date/i.test(headers[1] || '')
+        && /test\s*name/i.test(headers[2] || '')
+    }
+    return headers.length >= 2 && headers.some((header) => /request|req\.?\s*id|od\s*id|date|status|approval/i.test(header))
+  })
+  if (!table) return null
+  const rows = table.rows.map((row) => {
+    const cells = table.headers.map((header, index) => ({
+      header,
+      value: row[index]?.join(' ').trim() || '',
+    }))
+    const values = cells.map(({ value }) => value)
+    const identity = kind === 'online-training'
+      ? values.slice(1, 3)
+      : values.slice(0, 1)
+    const key = identity.join('|').trim()
+    if (!key) return null
+    const status = cells
+      .filter(({ header }) => /status|approval|coordinator|h\.?o\.?d|result/i.test(header))
+      .map(({ value }) => value)
+      .filter(Boolean)
+      .join(' · ')
+    const label = kind === 'online-training'
+      ? [values[2], values[1]].filter(Boolean).join(' · ')
+      : status || `${kind === 'attendance-request' ? 'Attendance' : 'OD'} request`
+    return { key, values, label: label.slice(0, 160), status: status.slice(0, 120) }
+  }).filter(Boolean)
+  return { headers: table.headers, rows }
 }
 
 function findAnchorByText(html, pattern) {
@@ -648,11 +695,15 @@ export class PsitErpService {
     database,
     encryptionKey = process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY,
     fetchImpl = fetch,
+    monitoringIntervalMinutes = 15,
+    notifyChanges = async () => false,
     onDiagnostic = (diagnostic) => console.info(`[PSIT ERP auth] ${JSON.stringify(diagnostic)}`),
   }) {
     this.database = database
     this.encryptionKey = encryptionKey
     this.fetchImpl = fetchImpl
+    this.monitoringIntervalMinutes = monitoringIntervalMinutes
+    this.notifyChanges = notifyChanges
     this.onDiagnostic = onDiagnostic
   }
 
@@ -666,6 +717,8 @@ export class PsitErpService {
       academic: this.database.db.prepare(`SELECT updated_at AS updatedAt, data_json AS dataJson
         FROM psit_erp_academic_records WHERE record_type IN ('academic', 'exam-calendar', 'marks')
         ORDER BY updated_at`).all(),
+      activity: this.database.db.prepare(`SELECT record_type AS recordType, updated_at AS updatedAt, data_json AS dataJson
+        FROM psit_erp_academic_records WHERE record_type LIKE 'activity-%' ORDER BY updated_at`).all(),
       notices: this.database.db.prepare('SELECT published_at AS publishedAt, data_json AS dataJson FROM psit_erp_notices ORDER BY id DESC LIMIT 10').all(),
     }
     const history = this.database.db.prepare(`SELECT id, status, started_at AS startedAt,
@@ -676,6 +729,16 @@ export class PsitErpService {
     const academic = snapshots.academic.reduce((result, snapshot) => (
       Object.assign(result, JSON.parse(snapshot.dataJson))
     ), {})
+    const activity = Object.fromEntries(snapshots.activity.map((snapshot) => {
+      const page = JSON.parse(snapshot.dataJson)
+      const latestRow = page.rows.at(-1)
+      return [snapshot.recordType.slice('activity-'.length), {
+        rowCount: page.rows.length,
+        updatedAt: snapshot.updatedAt,
+        latestLabel: latestRow?.label || '',
+        latestStatus: latestRow?.status || '',
+      }]
+    }))
     const noticesData = snapshots.notices.map((notice) => JSON.parse(notice.dataJson))
     const availability = {
       attendance: Boolean(snapshots.attendance),
@@ -684,6 +747,9 @@ export class PsitErpService {
       examCalendar: Boolean(academic?.examCalendar),
       notices: noticesData.length > 0,
       library: Boolean(academic?.library),
+      attendanceRequests: Boolean(activity['attendance-request']),
+      onlineTraining: Boolean(activity['online-training']),
+      odRequests: Boolean(activity['od-request']),
     }
     return {
       connected,
@@ -692,9 +758,11 @@ export class PsitErpService {
       userIdMasked: connection?.userIdMasked || '',
       connectedAt: connection?.connectedAt || null,
       lastSyncAt: connection?.lastSyncAt || null,
+      monitoringIntervalMinutes: this.monitoringIntervalMinutes,
       encryptionConfigured: this.hasEncryptionKey(),
       dataRetrievalAvailable: availability.attendance || availability.timetable
-        || availability.marks || availability.examCalendar || availability.notices,
+        || availability.marks || availability.examCalendar || availability.notices
+        || availability.attendanceRequests || availability.onlineTraining || availability.odRequests,
       availability,
       data: {
         attendance: snapshots.attendance ? JSON.parse(snapshots.attendance.dataJson) : null,
@@ -703,10 +771,11 @@ export class PsitErpService {
         timetableUpdatedAt: snapshots.timetable?.capturedAt || null,
         academic: Object.keys(academic).length ? academic : null,
         academicUpdatedAt: snapshots.academic.at(-1)?.updatedAt || null,
+        activity,
         notices: noticesData,
       },
       history,
-      limitation: 'Overall attendance, semester and test marks, timetable, academic notices, and the exam calendar are retrieved from authenticated PSIT pages. Subject-wise attendance and current library dues are not available from the mapped pages.',
+      limitation: 'Overall attendance, semester and test marks, timetable, academic notices, and the exam calendar are retrieved from authenticated PSIT pages. Attendance requests, online training results, and OD requests are monitored when authenticated pages expose recognizable records. Subject-wise attendance and current library dues are not available from the mapped pages.',
     }
   }
 
@@ -743,6 +812,90 @@ export class PsitErpService {
     this.database.db.prepare('UPDATE psit_erp_connection SET updated_at = ? WHERE id = 1').run(now)
   }
 
+  async persistActivityPages(pages, capturedAt) {
+    const database = this.database.db
+    const changes = []
+    for (const { type, data } of pages) {
+      if (!data) continue
+      const recordType = `activity-${type}`
+      const stored = database.prepare(`SELECT data_json AS dataJson
+        FROM psit_erp_academic_records WHERE record_type = ? AND source_id = 'student'`).get(recordType)
+      const previous = stored ? JSON.parse(stored.dataJson) : null
+      const previousRows = new Map((previous?.rows || []).map((row) => [row.key, row]))
+      if (previous) {
+        for (const row of data.rows) {
+          const before = previousRows.get(row.key)
+          if (!before || JSON.stringify(before.values) === JSON.stringify(row.values)) continue
+          const fingerprint = createHash('sha256')
+            .update(`${recordType}\n${row.key}\n${JSON.stringify(row.values)}`)
+            .digest('hex')
+          const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
+            UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
+          if (!alreadySent) {
+            changes.push({
+              fingerprint,
+              page: type,
+              action: 'updated',
+              label: row.label,
+              status: row.status,
+            })
+          }
+        }
+        for (const row of data.rows) {
+          if (previousRows.has(row.key)) continue
+          const fingerprint = createHash('sha256')
+            .update(`${recordType}\n${row.key}\n${JSON.stringify(row.values)}`)
+            .digest('hex')
+          const alreadySent = database.prepare(`SELECT 1 FROM psit_erp_notification_fingerprints WHERE fingerprint = ?
+            UNION ALL SELECT 1 FROM psit_erp_pending_notifications WHERE fingerprint = ?`).get(fingerprint, fingerprint)
+          if (!alreadySent) {
+            changes.push({
+              fingerprint,
+              page: type,
+              action: 'new',
+              label: row.label,
+              status: row.status,
+            })
+          }
+        }
+      }
+      database.prepare(`INSERT INTO psit_erp_academic_records(record_type, source_id, data_json, updated_at)
+        VALUES (?, 'student', ?, ?)
+        ON CONFLICT(record_type, source_id) DO UPDATE SET data_json = excluded.data_json,
+          updated_at = excluded.updated_at`).run(recordType, JSON.stringify(data), capturedAt)
+      for (const change of changes.filter((item) => item.page === type)) {
+        database.prepare(`INSERT OR IGNORE INTO psit_erp_pending_notifications(
+          fingerprint, payload_json, created_at
+        ) VALUES (?, ?, ?)`).run(change.fingerprint, JSON.stringify({
+          page: change.page,
+          action: change.action,
+          label: change.label,
+          status: change.status,
+        }), capturedAt)
+      }
+    }
+
+    const pending = database.prepare(`SELECT fingerprint, payload_json AS payloadJson
+      FROM psit_erp_pending_notifications ORDER BY created_at LIMIT 10`).all()
+    if (!pending.length) return []
+    const notifications = pending.map((row) => ({
+      fingerprint: row.fingerprint,
+      ...JSON.parse(row.payloadJson),
+    }))
+    const delivered = await this.notifyChanges(notifications.map(({ fingerprint, ...notification }) => notification))
+    if (delivered) {
+      const insert = database.prepare(`INSERT OR IGNORE INTO psit_erp_notification_fingerprints(
+        fingerprint, notification_type, created_at
+      ) VALUES (?, ?, ?)`)
+      const deletePending = database.prepare('DELETE FROM psit_erp_pending_notifications WHERE fingerprint = ?')
+      for (const change of notifications) {
+        insert.run(change.fingerprint, `erp-${change.page}`, capturedAt)
+        deletePending.run(change.fingerprint)
+      }
+    }
+    return notifications.map(({ fingerprint, ...notification }) => notification)
+  }
+
   async connect(userId, password) {
     const key = getErpEncryptionKey(this.encryptionKey)
     if (typeof userId !== 'string' || !userId.trim() || userId.trim().length > 120
@@ -772,7 +925,7 @@ export class PsitErpService {
     }
   }
 
-  async sync() {
+  async sync({ monitorOnly = false } = {}) {
     const key = getErpEncryptionKey(this.encryptionKey)
     const record = this.getCredentialRecord()
     if (!record?.credentialCiphertext) {
@@ -797,6 +950,35 @@ export class PsitErpService {
       return { status, message }
     }
     const capturedAt = new Date().toISOString()
+    const activityDefinitions = [
+      { type: 'attendance-request', path: '/Student/StudentAttRequest' },
+      { type: 'online-training', path: '/Student/OnlineTraining' },
+      { type: 'od-request', path: '/Student/ODRequest' },
+    ]
+    const activityPages = []
+    const activityFailures = []
+    for (const definition of activityDefinitions) {
+      const page = await fetchStudentPage(definition.path, result.cookies, this.fetchImpl, this.onDiagnostic)
+      if (page.status === 'session_expired') {
+        const message = authenticationMessage('session_expired', true)
+        this.updateConnection({ status: 'session_expired', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+        this.recordSync('session_expired', message)
+        return { status: 'session_expired', message }
+      }
+      const data = page.status === 'connected' ? parseActivityPage(page.html, definition.type) : null
+      if (data) activityPages.push({ type: definition.type, data })
+      else activityFailures.push(definition.type)
+    }
+    const activityChanges = await this.persistActivityPages(activityPages, capturedAt)
+    if (monitorOnly) {
+      const message = activityFailures.length
+        ? `Checked PSIT activity pages; could not read ${activityFailures.join(', ')}.`
+        : 'Checked PSIT attendance requests, online training results, and OD requests.'
+      this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
+      this.database.db.prepare('UPDATE psit_erp_connection SET last_sync_at = ? WHERE id = 1').run(capturedAt)
+      this.recordSync(activityFailures.length ? 'partial' : 'completed', message)
+      return { status: activityFailures.length ? 'partial' : 'completed', message, changes: activityChanges }
+    }
     const notices = parseNotices(result.studentHtml, capturedAt)
     const attendancePage = await fetchStudentPage('/Student/MyAttendanceDetail', result.cookies, this.fetchImpl, this.onDiagnostic)
     if (attendancePage.status === 'session_expired') {
@@ -911,6 +1093,7 @@ export class PsitErpService {
     }
 
     const sources = [
+      activityPages.length ? `${activityPages.length} activity pages` : null,
       attendance ? 'attendance summary' : null,
       timetable ? 'weekly timetable' : null,
       marks?.semesters.length ? 'semester marks' : null,
@@ -919,7 +1102,7 @@ export class PsitErpService {
       notices.length ? `${notices.length} notices` : null,
     ].filter(Boolean)
     if (!sources.length) {
-      const message = 'Login was verified, but none of the mapped attendance, timetable, marks, exam-calendar, or notice pages returned recognizable data.'
+      const message = `Login was verified, but no mapped academic data was recognized. ${activityFailures.length ? `Could not read ${activityFailures.join(', ')}.` : ''}`
       this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
       this.recordSync('data-source-pending', message)
       return { status: 'data-source-pending', message }
@@ -930,6 +1113,7 @@ export class PsitErpService {
       marks ? null : `marks (${marksPage.status === 'connected' ? 'content not recognized' : marksPage.status})`,
     ].filter(Boolean)
     const details = [
+      activityFailures.length ? `Could not read activity pages: ${activityFailures.join(', ')}` : null,
       failedMarkReports ? `${failedMarkReports} selected mark reports could not be fetched` : null,
       missingMarkRows ? `${missingMarkRows} selected mark reports had no verified row for this account` : null,
       skippedMarkReports ? `${skippedMarkReports} additional mark reports were skipped at the safety limit` : null,
@@ -940,7 +1124,7 @@ export class PsitErpService {
     this.updateConnection({ status: 'connected', userIdMasked: maskErpUserId(credentials.userId), credentialCiphertext: record.credentialCiphertext })
     database.prepare('UPDATE psit_erp_connection SET last_sync_at = ? WHERE id = 1').run(capturedAt)
     this.recordSync('partial', message)
-    return { status: 'partial', message }
+    return { status: 'partial', message, changes: activityChanges }
   }
 
   disconnect() {
@@ -949,7 +1133,8 @@ export class PsitErpService {
       DELETE FROM psit_erp_timetable_snapshots;
       DELETE FROM psit_erp_academic_records;
       DELETE FROM psit_erp_notices;
-      DELETE FROM psit_erp_notification_fingerprints;`)
+      DELETE FROM psit_erp_notification_fingerprints;
+      DELETE FROM psit_erp_pending_notifications;`)
     return { disconnected: true }
   }
 }
@@ -966,6 +1151,9 @@ export function formatErpAnswer(operation, state) {
     notices: 'academic notices',
     'academic-summary': 'academic summary',
     'student-services': 'student-service information',
+    'attendance-requests': 'attendance request status',
+    'online-training': 'online training results',
+    'od-requests': 'OD request status',
   }[validateErpOperation(operation)]
   if (!label) return null
   if (operation === 'status') {
@@ -979,6 +1167,7 @@ export function formatErpAnswer(operation, state) {
   const marks = state.data?.academic?.marks
   const attendance = state.data?.attendance
   const notices = state.data?.notices || []
+  const activity = state.data?.activity || {}
   const formatAttendance = () => {
     if (!attendance) return ''
     const percent = (value) => typeof value === 'number' ? `${value}%` : null
@@ -1038,6 +1227,15 @@ export function formatErpAnswer(operation, state) {
   if (operation === 'attendance') return formatAttendance() || unavailable()
   if (operation === 'marks') return formatMarks() || unavailable()
   if (operation === 'student-services') return unavailable()
+  const formatActivity = (type, label) => {
+    const data = activity[type]
+    return data
+      ? `Verified PSIT ${label}: ${data.rowCount} records found.${data.latestLabel ? ` Listed entry: ${data.latestLabel}.` : ''}${data.latestStatus ? ` Status: ${data.latestStatus}.` : ''}`
+      : unavailable()
+  }
+  if (operation === 'attendance-requests') return formatActivity('attendance-request', 'attendance requests')
+  if (operation === 'online-training') return formatActivity('online-training', 'online training results')
+  if (operation === 'od-requests') return formatActivity('od-request', 'OD requests')
   if (operation === 'notices') return formatNotices()
   if (operation === 'timetable-today') return timeTable ? formatDay(weekday()) : unavailable()
   if (operation === 'timetable-tomorrow') return timeTable ? formatDay(weekday(1)) : unavailable()

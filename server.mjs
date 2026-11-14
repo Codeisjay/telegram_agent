@@ -77,9 +77,32 @@ const agent = { running: false, status: 'stopped', message: 'Agent is stopped.',
 const userRequests = new Map()
 const database = await JobDatabase.open(databaseFile)
 const psitErpEnvironment = await readEnvFile(projectEnvFile)
+const psitErpSyncIntervalMinutes = readPositiveInteger(
+  process.env.PSIT_ERP_SYNC_INTERVAL_MINUTES,
+  15,
+  15,
+  360,
+)
 const psitErp = new PsitErpService({
   database,
+  monitoringIntervalMinutes: psitErpSyncIntervalMinutes,
   encryptionKey: process.env.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY || psitErpEnvironment.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY,
+  notifyChanges: async (changes) => {
+    const secrets = await readSecrets()
+    const chatId = await getCompanionNotificationChatId()
+    if (!secrets.TELEGRAM_BOT_TOKEN || !chatId) return false
+    const message = `PSIT ERP update:\n${changes.map((change) => {
+      const source = {
+        'attendance-request': 'Attendance request',
+        'online-training': 'Online training result',
+        'od-request': 'OD request',
+      }[change.page] || 'Student record'
+      const action = change.action === 'new' ? 'New record' : 'Record updated'
+      return `• ${source}: ${action}${change.label ? ` — ${change.label}` : ''}${change.status ? ` (${change.status})` : ''}`
+    }).join('\n')}`
+    await sendTelegramMessage(chatId, message)
+    return true
+  },
 })
 const companionStore = process.env.DATABASE_URL
   ? await PostgresCompanionStore.open(process.env.DATABASE_URL)
@@ -2207,7 +2230,11 @@ async function testCredential(name, secrets, draftValue) {
 let scheduler
 let newsScheduler
 let companionInterval
+let psitErpInterval
 let lastCompanionCheck = 0
+let lastPsitErpSyncAt = 0
+let psitErpSyncRunning = false
+let psitErpFailureNoticeStatus = ''
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, `http://${host}:${port}`)
   try {
@@ -2657,6 +2684,34 @@ server.listen(port, host, () => {
     }
   }, 60000)
   companionInterval.unref?.()
+  psitErpInterval = setInterval(async () => {
+    if (psitErpSyncRunning || Date.now() - lastPsitErpSyncAt < psitErpSyncIntervalMinutes * 60000) return
+    if (!psitErp.getState().credentialsStored) return
+    lastPsitErpSyncAt = Date.now()
+    psitErpSyncRunning = true
+    try {
+      const result = await psitErp.sync({ monitorOnly: true })
+      if (result.status === 'completed') {
+        psitErpFailureNoticeStatus = ''
+      } else if (psitErpFailureNoticeStatus !== result.status) {
+        const secrets = await readSecrets()
+        const chatId = await getCompanionNotificationChatId()
+        if (secrets.TELEGRAM_BOT_TOKEN && chatId) {
+          const message = result.status === 'session_expired'
+            ? 'PSIT ERP session expired. Reconnect your account from the dashboard to resume automatic updates.'
+            : 'PSIT ERP automatic sync could not read all monitored pages. Check the PSIT ERP dashboard sync history for details.'
+          await sendTelegramMessage(chatId, message)
+        }
+        psitErpFailureNoticeStatus = result.status
+      }
+      if (result.status === 'partial') logEvent('WARN', `PSIT ERP automatic sync incomplete: ${result.message}`, 'errors')
+    } catch (error) {
+      logEvent('500 ERROR', `PSIT ERP automatic sync failed: ${error.message}`, 'errors')
+    } finally {
+      psitErpSyncRunning = false
+    }
+  }, 5 * 60000)
+  psitErpInterval.unref?.()
   const preferences = database.getAgentPreferences()
   if (preferences.autoStart) {
     startTelegramAgentAutomatically(preferences.settings)
@@ -2670,6 +2725,7 @@ const shutdown = () => {
     newsScheduler?.stop()
     digitalFootprint.stop()
     if (companionInterval) clearInterval(companionInterval)
+    if (psitErpInterval) clearInterval(psitErpInterval)
     if (companionStore !== database) await companionStore.close()
     database.close()
     process.exit(0)

@@ -70,6 +70,15 @@ the `/erp`, `/attendance`, `/timetable`, `/tomorrow`, `/marks`, `/notices`, and
 to Gemini, Groq, or another model. Credential-like text is rejected from the
 general AI request path.
 
+After a secure dashboard connection, the backend automatically checks the
+attendance-request, online-training, and OD-request pages every 15 minutes by
+default (configurable with `PSIT_ERP_SYNC_INTERVAL_MINUTES`, minimum 15). It
+uses the saved AES-256-GCM-encrypted credentials and sends deduplicated
+change alerts to the configured Telegram chat. The first successful scan
+establishes a baseline; only later additions or row updates trigger alerts.
+Never put the ERP user ID or password in environment variables; only the
+encryption key and optional polling interval belong there.
+
 The public PSIT login page includes a portal-wide password-expiry notice; that
 generic text is not treated as an account-specific password-change requirement.
 The connector reports success only for a verified student dashboard response
@@ -78,10 +87,10 @@ diagnostics. Manual sync reads the authenticated attendance summary, weekly
 timetable, semester and test/assignment marks, notice links, and exam calendar.
 Attendance percentages come directly from the portal summary; subject-wise
 attendance and current library dues remain unavailable because their values
-cannot be reliably mapped. Scheduled synchronization and academic Telegram
-notifications are not enabled. ERP questions return only cached verified
-sources and explicitly report unavailable data rather than guessing. No
-additional paid service or library is used.
+cannot be reliably mapped. The activity pages are polled on the configured
+interval; other academic pages are refreshed by manual sync. ERP questions
+return only cached verified sources and explicitly report unavailable data
+rather than guessing. No additional paid service or library is used.
 
 ## Autonomous personalized news
 
