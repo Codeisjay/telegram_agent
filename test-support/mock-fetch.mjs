@@ -41,9 +41,15 @@ globalThis.fetch = async (input, init) => {
     }
   }
 
-  if (url.hostname === 'calendarific.com') {
-    if (url.searchParams.get('api_key') !== 'test-calendar-key' || url.searchParams.get('location') !== 'in-up') {
-      return Response.json({ meta: { code: 401 }, response: { holidays: [] } }, { status: 401 })
+  if (url.hostname === 'api.lifeastroapi.com' && url.pathname === '/v1/festivals/month') {
+    const query = url.searchParams
+    const authorization = new Headers(init?.headers).get('authorization')
+    if (authorization !== 'Bearer test-lifeastro-key'
+      || query.get('lat') !== '26.8467'
+      || query.get('lon') !== '80.9462'
+      || query.get('tz') !== 'Asia/Kolkata'
+      || query.get('locale') !== 'en') {
+      return Response.json({ error: { code: 'unauthorized', message: 'invalid test request' } }, { status: 401 })
     }
     const parts = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Kolkata',
@@ -52,16 +58,15 @@ globalThis.fetch = async (input, init) => {
       day: '2-digit',
     }).formatToParts(new Date())
     const date = `${parts.find((part) => part.type === 'year').value}-${parts.find((part) => part.type === 'month').value}-${parts.find((part) => part.type === 'day').value}`
+    if (query.get('year') !== date.slice(0, 4) || query.get('month') !== String(Number(date.slice(5, 7)))) {
+      return Response.json({ error: { code: 'invalid_param', message: 'calendar month does not match test date' } }, { status: 400 })
+    }
     return Response.json({
       meta: { code: 200 },
-      response: {
-        holidays: [{
-          name: 'Verified Test Festival',
-          date: { iso: date },
-          type: ['Religious holiday'],
-          locations: ['Uttar Pradesh'],
-        }],
-      },
+      festivals: [
+        { name_en: 'Verified Test Festival', date, type: 'tithi', importance: 'major' },
+        { name_en: 'Ignored Minor Test Observance', date, type: 'vrat', importance: 'minor' },
+      ],
     })
   }
 

@@ -80,6 +80,7 @@ const secretNames = new Set([
   'GITHUB_TOKEN',
   'YOUTUBE_API_KEY',
   'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY',
+  'LIFEASTRO_API_KEY',
 ])
 
 function readPositiveInteger(value, fallback, minimum, maximum) {
@@ -459,64 +460,83 @@ async function runCompanionScheduler(schedulerName, trigger, work) {
   }
 }
 
-function calendarificRegion(region) {
-  const regions = {
-    'Uttar Pradesh': 'IN-UP',
-    'North India': 'IN-UP',
-    'Delhi': 'IN-DL',
-    'Punjab': 'IN-PB',
-    'Haryana': 'IN-HR',
-    'Uttarakhand': 'IN-UT',
-    'Bihar': 'IN-BR',
-    'Rajasthan': 'IN-RJ',
-    'Madhya Pradesh': 'IN-MP',
-    'Himachal Pradesh': 'IN-HP',
-    'Jammu and Kashmir': 'IN-JK',
+function festivalLocation(region) {
+  const locations = {
+    'Uttar Pradesh': { city: 'Lucknow', lat: 26.8467, lon: 80.9462 },
+    'North India': { city: 'New Delhi', lat: 28.6139, lon: 77.2090 },
+    'Delhi': { city: 'New Delhi', lat: 28.6139, lon: 77.2090 },
+    'Punjab': { city: 'Chandigarh', lat: 30.7333, lon: 76.7794 },
+    'Haryana': { city: 'Chandigarh', lat: 30.7333, lon: 76.7794 },
+    'Uttarakhand': { city: 'Dehradun', lat: 30.3165, lon: 78.0322 },
+    'Bihar': { city: 'Patna', lat: 25.5941, lon: 85.1376 },
+    'Rajasthan': { city: 'Jaipur', lat: 26.9124, lon: 75.7873 },
+    'Madhya Pradesh': { city: 'Bhopal', lat: 23.2599, lon: 77.4126 },
+    'Himachal Pradesh': { city: 'Shimla', lat: 31.1048, lon: 77.1734 },
+    'Jammu and Kashmir': { city: 'Srinagar', lat: 34.0837, lon: 74.7973 },
   }
-  return regions[region] || ''
+  return locations[region] || null
 }
 
 async function getFestivalCalendar(settings, year, now) {
   const region = settings.festivalRegion || 'Uttar Pradesh'
-  const cached = await companionStore.getFestivalCalendar(region, year, now)
+  const location = festivalLocation(region)
+  if (!location) throw new Error('The selected region is not supported by the festival calendar.')
+  const dateParts = getLocalDateParts(now, settings.timezone)
+  const month = dateParts.month
+  const calendarCacheKey = `${region}:${month}:${location.lat},${location.lon}:Asia/Kolkata`
+  const cached = await companionStore.getFestivalCalendar(calendarCacheKey, year, now)
   if (cached) return cached.events
   const projectEnv = await readEnvFile(projectEnvFile)
   const secretEnv = await readEnvFile(secretFile)
-  const apiKey = process.env.CALENDARIFIC_API_KEY || secretEnv.CALENDARIFIC_API_KEY || projectEnv.CALENDARIFIC_API_KEY
+  const apiKey = process.env.LIFEASTRO_API_KEY || secretEnv.LIFEASTRO_API_KEY || projectEnv.LIFEASTRO_API_KEY
   if (!apiKey) return null
-  const location = calendarificRegion(region)
-  if (!location) throw new Error('The selected region is not supported by the configured Indian holiday calendar.')
-  const query = new URLSearchParams({ api_key: apiKey, country: 'IN', year: String(year), location: location.toLowerCase() })
+  const query = new URLSearchParams({
+    year: String(year),
+    month: String(month),
+    lat: String(location.lat),
+    lon: String(location.lon),
+    tz: 'Asia/Kolkata',
+    locale: 'en',
+  })
   let response
   try {
-    response = await fetch(`https://calendarific.com/api/v2/holidays?${query}`, { signal: AbortSignal.timeout(10000) })
+    response = await fetch(`https://api.lifeastroapi.com/v1/festivals/month?${query}`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(10000),
+    })
   } catch {
-    throw new Error('Could not reach the Indian festival calendar provider.')
+    throw new Error('Could not reach LifeAstro festival calendar.')
   }
-  if (!response.ok) throw new Error(`Indian festival calendar returned HTTP ${response.status}.`)
   let payload
   try {
     payload = await response.json()
   } catch {
-    throw new Error('Indian festival calendar returned an invalid response.')
+    throw new Error('LifeAstro festival calendar returned an invalid response.')
   }
-  if (payload?.meta?.code !== 200 || !Array.isArray(payload?.response?.holidays)) {
-    throw new Error('Indian festival calendar did not return verified festival dates.')
+  if (!response.ok) {
+    const errorCode = typeof payload?.error?.code === 'string' ? ` (${payload.error.code})` : ''
+    throw new Error(`LifeAstro festival calendar returned HTTP ${response.status}${errorCode}.`)
   }
-  const events = payload.response.holidays
-    .filter((holiday) => {
-      const types = Array.isArray(holiday.type) ? holiday.type : []
-      return typeof holiday.name === 'string'
-        && /^\d{4}-\d{2}-\d{2}$/.test(holiday.date?.iso || '')
-        && types.some((type) => /national holiday|local holiday|religious holiday/i.test(type))
+  if (!Array.isArray(payload?.festivals)) {
+    throw new Error('LifeAstro festival calendar did not return a valid festival list.')
+  }
+  const events = payload.festivals
+    .filter((festival) => {
+      const importance = String(festival.importance || '').toLowerCase()
+      return typeof festival.date === 'string'
+        && /^\d{4}-\d{2}-\d{2}$/.test(festival.date)
+        && (importance === 'major' || importance === 'regional' || festival.type === 'national')
+        && typeof (festival.name_en || festival.name) === 'string'
+        && (festival.name_en || festival.name).trim().length > 0
     })
-    .map((holiday) => ({
-      name: holiday.name.trim().slice(0, 120),
-      date: holiday.date.iso,
-      type: Array.isArray(holiday.type) ? holiday.type : [],
-      locations: Array.isArray(holiday.locations) ? holiday.locations : [],
+    .map((festival) => ({
+      name: (festival.name_en || festival.name).trim().slice(0, 120),
+      date: festival.date,
+      type: [festival.type, festival.importance].filter((value) => typeof value === 'string'),
+      locations: [location.city],
     }))
-  await companionStore.saveFestivalCalendar(region, year, events, now)
+    .sort((left, right) => left.date.localeCompare(right.date) || left.name.localeCompare(right.name))
+  await companionStore.saveFestivalCalendar(calendarCacheKey, year, events, now)
   return events
 }
 
@@ -2543,9 +2563,9 @@ const server = createServer(async (request, response) => {
         notifications: await companionStore.listCompanionNotifications(30),
         scheduler: await companionStore.getCompanionSchedulerStatus(),
         chatId: await getCompanionNotificationChatId(),
-        calendarConfigured: Boolean(process.env.CALENDARIFIC_API_KEY
-          || (await readEnvFile(secretFile)).CALENDARIFIC_API_KEY
-          || (await readEnvFile(projectEnvFile)).CALENDARIFIC_API_KEY),
+        calendarConfigured: Boolean(process.env.LIFEASTRO_API_KEY
+          || (await readEnvFile(secretFile)).LIFEASTRO_API_KEY
+          || (await readEnvFile(projectEnvFile)).LIFEASTRO_API_KEY),
         persistentStorage: Boolean(process.env.DATABASE_URL),
       })
     }

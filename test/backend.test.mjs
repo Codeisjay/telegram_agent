@@ -27,7 +27,7 @@ let baseUrl
 function makeTestEnvironment(overrides = {}) {
   const environment = { ...process.env, LOCALAPPDATA: secretDirectory, AGENTFLOW_PORT: '0' }
   environment.AGENTFLOW_ENV_FILE = path.join(tempRoot, 'empty-project.env')
-  for (const key of [...secretKeys, 'PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY', 'PSIT_ERP_BASE_URL', 'PSIT_ERP_USER_ID', 'PSIT_ERP_PASSWORD', 'PSIT_ERP_SYNC_INTERVAL_MINUTES', 'PSIT_ERP_NOTIFICATION_RETENTION_DAYS', 'AGENTFLOW_PSIT_ERP_CRON_SECRET', 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'CALENDARIFIC_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
+  for (const key of [...secretKeys, 'PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY', 'PSIT_ERP_BASE_URL', 'PSIT_ERP_USER_ID', 'PSIT_ERP_PASSWORD', 'PSIT_ERP_SYNC_INTERVAL_MINUTES', 'PSIT_ERP_NOTIFICATION_RETENTION_DAYS', 'AGENTFLOW_PSIT_ERP_CRON_SECRET', 'AGENTFLOW_NEWS_CRON_SECRET', 'AGENTFLOW_COMPANION_CRON_SECRET', 'LIFEASTRO_API_KEY', 'DATABASE_URL', 'MOCK_TELEGRAM_UPDATE_TEXT', 'NODE_ENV', 'AGENTFLOW_HOST', 'AGENTFLOW_USERNAME', 'AGENTFLOW_PASSWORD', 'AGENTFLOW_DATA_DIR', 'AGENTFLOW_SECRET_FILE', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REDIRECT_URI', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'YOUTUBE_OAUTH_TOKEN_ENCRYPTION_KEY', 'YOUTUBE_OAUTH_REDIRECT_URI', 'RENDER_EXTERNAL_HOSTNAME']) delete environment[key]
   environment.GROQ_API_KEY = 'environment-stale-test-key'
   environment.PSIT_ERP_CREDENTIAL_ENCRYPTION_KEY = '2a'.repeat(32)
   environment.AGENTFLOW_COMPANION_CRON_SECRET = 'test-companion-cron-secret'
@@ -107,6 +107,26 @@ test('companion greeting schedule and natural language parsing work as expected'
     eventTime: '10:00', timezone: 'Asia/Kolkata', reminderMinutes: [1440, 0],
   }, new Date('2026-03-11T04:30:00Z'))
   assert.deepEqual(due.map((reminder) => reminder.reminderMinutes), [1440])
+})
+
+test('LifeAstro festival calendars are cached per region and month beyond daily refreshes', async () => {
+  const store = await JobDatabase.open(path.join(tempRoot, 'lifeastro-calendar-cache.sqlite'))
+  const fetchedAt = new Date('2026-11-16T00:00:00.000Z')
+  const cacheKey = 'Delhi:11:28.6139,77.209:Asia/Kolkata'
+  const festivals = [{ name: 'Cached Festival', date: '2026-11-20' }]
+  try {
+    store.saveFestivalCalendar(cacheKey, 2026, festivals, fetchedAt)
+    assert.equal(
+      store.getFestivalCalendar('Delhi:12:28.6139,77.209:Asia/Kolkata', 2026, new Date('2026-12-16T00:00:00.000Z')),
+      null,
+    )
+    assert.deepEqual(
+      store.getFestivalCalendar(cacheKey, 2026, new Date('2026-12-16T00:00:00.000Z')).events,
+      festivals,
+    )
+  } finally {
+    store.close()
+  }
 })
 
 test('companion scheduler records interrupted runs after restart', async () => {
@@ -426,7 +446,7 @@ test('authenticated companion cron delivers deduplicated greetings, festivals, a
   assert.equal(token.status, 200)
   const secretPath = path.join(secretDirectory, 'AgentFlow', '.env')
   await mkdir(path.dirname(secretPath), { recursive: true })
-  await writeFile(secretPath, 'TELEGRAM_BOT_TOKEN="test-telegram-token"\nCALENDARIFIC_API_KEY="test-calendar-key"\n')
+  await writeFile(secretPath, 'TELEGRAM_BOT_TOKEN="test-telegram-token"\nLIFEASTRO_API_KEY="test-lifeastro-key"\n')
 
   const now = new Date()
   const local = getLocalDateParts(now, 'Asia/Kolkata')
@@ -476,6 +496,7 @@ test('authenticated companion cron delivers deduplicated greetings, festivals, a
   const history = await fetch(`${baseUrl}/api/companion`).then((response) => response.json())
   assert.equal(history.notifications.some((item) => item.type === 'greeting' && item.status === 'delivered'), true)
   assert.equal(history.notifications.some((item) => item.type === 'festival' && item.title === 'Verified Test Festival' && item.status === 'delivered'), true)
+  assert.equal(history.notifications.some((item) => item.title === 'Ignored Minor Test Observance'), false)
   assert.equal(history.notifications.some((item) => item.type === 'event' && item.title === 'Automatic test reminder' && item.status === 'delivered'), true)
   assert.equal(history.calendarConfigured, true)
   const secondResponse = await fetch(`${baseUrl}/api/cron/companion`, { method: 'POST', headers })

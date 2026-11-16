@@ -1093,7 +1093,7 @@ export class JobDatabase {
   getFestivalCalendar(region, year, now = new Date()) {
     const row = this.db.prepare(`SELECT events_json, fetched_at FROM companion_calendar_cache
       WHERE region = ? AND year = ?`).get(region, year)
-    if (!row || now.getTime() - Date.parse(row.fetched_at) > 86400000) return null
+    if (!row || now.getTime() - Date.parse(row.fetched_at) > 365 * 86400000) return null
     return { events: JSON.parse(row.events_json), fetchedAt: row.fetched_at }
   }
 

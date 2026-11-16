@@ -176,14 +176,14 @@ export default function PersonalAssistantPage({ onToast }) {
     </section>
 
     <section className="panel pa-panel">
-      <div className="pa-panel-heading"><div><div className="pa-calendar-icon"><CalendarDays size={17} /></div><div><h3>Indian festival wishes</h3><p>Dates are fetched from Calendarific and are never inferred from memory.</p></div></div><span className={`pa-status ${data.calendarConfigured ? 'pa-status-ok' : 'pa-status-warning'}`}>{data.calendarConfigured ? 'CALENDAR CONNECTED' : 'API KEY REQUIRED'}</span></div>
+      <div className="pa-panel-heading"><div><div className="pa-calendar-icon"><CalendarDays size={17} /></div><div><h3>Indian festival wishes</h3><p>Dates are fetched from LifeAstro and are never inferred from memory.</p></div></div><span className={`pa-status ${data.calendarConfigured ? 'pa-status-ok' : 'pa-status-warning'}`}>{data.calendarConfigured ? 'CALENDAR CONNECTED' : 'API KEY REQUIRED'}</span></div>
       <div className="pa-settings-grid">
         <label className="pa-check-field"><input type="checkbox" checked={Boolean(settings.festivalEnabled)} onChange={(event) => updateSettings({ festivalEnabled: event.target.checked })} />Send festival wishes</label>
         <label>Region<select value={settings.festivalRegion || 'Uttar Pradesh'} onChange={(event) => updateSettings({ festivalRegion: event.target.value })}>
           {['Uttar Pradesh', 'North India', 'Delhi', 'Punjab', 'Haryana', 'Uttarakhand', 'Bihar', 'Rajasthan', 'Madhya Pradesh', 'Himachal Pradesh', 'Jammu and Kashmir'].map((region) => <option key={region}>{region}</option>)}
         </select></label>
       </div>
-      <p className="pa-note">Calendarific’s India holiday calendar supplies verified national, local, and religious dates. Configure <code>CALENDARIFIC_API_KEY</code> in Render to enable this feature.</p>
+      <p className="pa-note">LifeAstro supplies major and regional festivals for a representative city in each region. Configure <code>LIFEASTRO_API_KEY</code> on the server to enable this feature.</p>
     </section>
 
     <section className="panel pa-panel">

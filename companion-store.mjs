@@ -217,7 +217,7 @@ export class PostgresCompanionStore {
     const { rows } = await this.pool.query(`SELECT events_json AS events, fetched_at AS "fetchedAt"
       FROM companion_calendar_cache WHERE region = $1 AND year = $2`, [region, year])
     const row = rows[0]
-    if (!row || now.getTime() - Date.parse(row.fetchedAt) > 86400000) return null
+    if (!row || now.getTime() - Date.parse(row.fetchedAt) > 365 * 86400000) return null
     return { events: row.events, fetchedAt: row.fetchedAt }
   }
 

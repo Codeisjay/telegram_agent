@@ -166,11 +166,13 @@ dashboard to override it.
 - **Greetings:** Good morning, afternoon, evening, and night notifications use
   the configured local times, Jay as the default name, Asia/Kolkata, quiet
   hours, and a database-backed once-per-day key.
-- **Festivals:** dates and names come from Calendarific's India holidays API,
-  filtered to national, local, and religious holidays for the selected region.
-  The service refreshes its calendar cache daily and sends only dates returned by
-  that provider. Configure `CALENDARIFIC_API_KEY`; without it, festival wishes
-  remain disabled rather than guessed. Calendarific requires an API account/key.
+- **Festivals:** dates and names come from LifeAstro's location-aware Hindu
+  festival calendar for the selected region. Major and regional festivals and
+  national dates are sent only when returned by the API. Each region uses a
+  representative city (for example Lucknow for Uttar Pradesh), with results
+  cached by region and month. Configure `LIFEASTRO_API_KEY`; without it,
+  festival wishes remain disabled rather than guessed. LifeAstro requires an API
+  account/key.
 - **Events:** create, edit, and delete events in the dashboard, or send messages
   such as “my interview is on 12 March at 10 am, one day before” or
   “remember my birthday on 12 March every year” to the authorized Telegram bot.
@@ -203,8 +205,8 @@ Set these Render environment variables:
 - `AGENTFLOW_COMPANION_CRON_SECRET`: a long random secret, sent as
   `Authorization: Bearer <secret>`. Do not put this value in the dashboard or
   commit it to source control.
-- `CALENDARIFIC_API_KEY`: API key from
-  [Calendarific](https://calendarific.com/register). It is only read by the
+- `LIFEASTRO_API_KEY`: API key from
+  [LifeAstro](https://lifeastroapi.com/dashboard/api-keys/). It is only read by the
   backend and is never returned by dashboard APIs.
 - `TELEGRAM_BOT_TOKEN` if not already saved in Telegram Settings, and the
   dashboard `AGENTFLOW_USERNAME` / `AGENTFLOW_PASSWORD`.
